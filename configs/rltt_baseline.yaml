@@ -1,0 +1,84 @@
+# RLTT baseline (Williams & Tureci 2026, arXiv 2602.10520), paper Table 6 settings.
+# Launcher: python -m rltt_baseline.launch --config <this file> [overrides]
+# Overrides use dot-list syntax, e.g. args.learning_rate=2e-6 wandb.mode=online
+# Values follow RLTT rltt_experiments/run_rltt.slurm and the paper's Table 6. Paths come from
+# environment variables so the same file works on any cluster.
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  # model: Ouro-2.6B-Thinking, full-parameter, fixed 4 loops
+  model_path: ${oc.env:OURO_THINKING_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:RLTT_MODEL_DIR}        # built by rltt_baseline.prepare_model
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false
+  ref_offload: true
+
+  # data: MATH train (7,500 problems), MATH-500 for optional validation
+  train_file: ${oc.env:RLTT_MATH_TRAIN_JSONL}
+  math500_test_file: ${oc.env:RLTT_MATH500_JSONL}
+  max_prompt_length: 1024
+  max_completion_length: 2048
+
+  # RLTT objective
+  loop_weighting: exit_pdf      # uniform | progressive | exit_pdf | learned
+  progressive_alpha: 1.0
+  beta: 0.001                   # KL coefficient, final loop only
+  num_generations: 8
+  num_prompts_per_batch: 32
+  temperature: 1.0
+
+  # optimisation
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant
+  gradient_accumulation_steps: 2
+  num_train_epochs: 5
+  max_steps: 140                # paper Table 6; -1 = run all epochs
+  seed: 42
+
+  # memory / rollout
+  ppo_max_token_len: 8192
+  log_prob_max_token_len: 8192
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.45
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  # resources and outputs
+  n_gpus: 4
+  nnodes: 1
+  output_dir: ${oc.env:RLTT_OUTPUT_DIR}
+  save_steps: 10
+  logging_steps: 1
+
+  # validation (off in the paper runs; MATH-500 at 3,072 tokens when enabled)
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 3072
+
+wandb:
+  enabled: true
+  mode: offline                 # compute nodes: offline, then `wandb sync` from a login node
+  project: rltt-ouro-baseline
+  entity: null
+  run_name: null                # null = vendor name RLTT-<model>-<loop_weighting>
+  tags: [rltt, baseline, ouro-2.6b-thinking]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides: {}
+  # Any verl key, merged last. Examples:
+  # trainer: {save_freq: 20, logger: [wandb, console]}
+  # actor_rollout_ref: {rollout: {top_p: 1.0}}
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
