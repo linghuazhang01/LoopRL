@@ -1,7 +1,12 @@
 # GRPO baseline on Ouro-2.6B-Thinking, one node with 8 GPUs (stage 1 of the loop-gradient study).
+# Hyperparameters follow the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
+# trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml:
+#   32 prompts x 8 rollouts per step, 2048-token generations, gradient accumulation 2 (one optimizer
+#   update per 64 prompts), 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+#   weight decay 0.1, grad clip 0.1, KL 1e-3, BF16, binary reward, group-normalised advantage.
 # Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
-#   (group-normalised advantage, PPO clip 0.2, token-mean, KL to the reference added to the
-#    reward with a fixed coefficient beta; AdamW8bit). Ouro runs a fixed 4 loops.
+#   (PPO clip 0.2, token-mean). Ouro runs a fixed 4 loops. The vendor script differs from the
+#   paper in four places, fixed in verl_overrides below.
 # Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
 # Paths come from environment variables (see scripts/prepare_*.sh).
 
@@ -15,37 +20,37 @@ args:  # keys = dest names of grpo_train.py argparse options
   no_lora: true
   no_sft_checkpoint: true
 
-  # data: MATH train (7,500 problems), MATH-500 for validation
+  # data: MATH train (7,500 problems), MATH-500 for optional validation
   train_file: ${oc.env:LOOPRL_MATH_TRAIN_JSONL}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
   max_prompt_length: 1024
-  max_completion_length: 8192
+  max_completion_length: 2048
 
   # GRPO
   use_ppo: false
   num_generations: 8          # rollouts per prompt (group size)
-  num_prompts_per_batch: 8    # vendor sets data.train_batch_size = this x num_generations;
+  num_prompts_per_batch: 32   # vendor sets data.train_batch_size = this x num_generations;
                               # the real batch is set explicitly in verl_overrides below
   temperature: 1.0
-  beta: 0.001                 # KL coefficient (KL added to the reward, fixed)
+  beta: 0.001                 # KL coefficient (applied as a loss term, see verl_overrides)
 
   # optimisation
   learning_rate: 1.0e-6
   weight_decay: 0.1
-  max_grad_norm: 0.1          # RLTT paper setting
+  max_grad_norm: 0.1          # vendor only passes this to the (unused) critic; see verl_overrides
   warmup_ratio: 0.1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   num_train_epochs: 5
-  max_steps: 200
+  max_steps: 140              # paper Table 6; one step = one 32-prompt rollout batch
   seed: 42
 
   # memory / rollout
-  ppo_max_token_len: 16384
-  log_prob_max_token_len: 32768
+  ppo_max_token_len: 8192
+  log_prob_max_token_len: 8192
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false
-  vllm_gpu_memory_utilization: 0.5
+  vllm_gpu_memory_utilization: 0.45
   vllm_tensor_parallel_size: 1
   vllm_enforce_eager: false
 
@@ -53,15 +58,15 @@ args:  # keys = dest names of grpo_train.py argparse options
   n_gpus: 8
   nnodes: 1
   output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
-  save_steps: 20              # checkpoints feed the per-loop gradient probe (condition B)
+  save_steps: 10              # checkpoints feed the per-loop gradient probe (condition B)
   logging_steps: 1
 
-  # validation on MATH-500 at the training generation limit
-  no_validation: false
-  skip_initial_validation: false
-  eval_steps: 20
+  # validation (off in the paper runs; MATH-500 at 3,072 tokens when enabled)
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
   val_batch_size: 64
-  val_max_new_tokens: 8192
+  val_max_new_tokens: 3072
 
 wandb:
   enabled: true
@@ -74,12 +79,21 @@ wandb:
 
 verl_overrides:
   data:
-    train_batch_size: 64      # prompts per step -> 64 x 8 = 512 rollouts per step
+    train_batch_size: 32      # prompts per rollout batch -> 32 x 8 = 256 rollouts
+  algorithm:
+    use_kl_in_reward: false   # vendor GRPO adds KL to the reward; RLTT uses a KL loss
   actor_rollout_ref:
     actor:
-      ppo_mini_batch_size: 64 # one optimizer update per step (on-policy)
+      ppo_mini_batch_size: 64 # = 32 prompts x 2 accumulated batches -> one update per 2 steps
+      grad_clip: 0.1          # vendor leaves the verl default 1.0
+      use_kl_loss: true       # low_var_kl, coefficient args.beta (as in RLTT)
+      optim:
+        betas: [0.9, 0.99]    # paper Table 6; both vendor scripts use (0.9, 0.999)
       checkpoint:
         save_contents: [model, optimizer, extra, hf_model]  # hf_model: loadable by the probe
+    ref:
+      fsdp_config:
+        param_offload: true   # RLTT ref_offload
   trainer:
     logger: [wandb, console]
 

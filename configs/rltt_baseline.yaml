@@ -77,10 +77,18 @@ wandb:
   notes: null
   dir: ${args.output_dir}
 
-verl_overrides: {}
-  # Any verl key, merged last. Examples:
-  # trainer: {save_freq: 20, logger: [wandb, console]}
-  # actor_rollout_ref: {rollout: {top_p: 1.0}}
+# Any verl key, merged last. The vendor script differs from the paper in two places:
+# - it sets data.train_batch_size = num_prompts_per_batch x num_generations (256), which verl
+#   reads as a prompt count, and ppo_mini_batch_size = min(128, that);
+# - Adam betas are (0.9, 0.999); Table 6 lists (0.9, 0.99).
+verl_overrides:
+  data:
+    train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
+  actor_rollout_ref:
+    actor:
+      ppo_mini_batch_size: 64   # = 32 prompts x 2 accumulated batches -> one update per 2 steps
+      optim:
+        betas: [0.9, 0.99]
 
 env:
   TOKENIZERS_PARALLELISM: "false"

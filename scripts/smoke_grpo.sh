@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # GRPO smoke run on the visible GPUs (CUDA_VISIBLE_DEVICES): 2 steps, 2 x n_gpu prompts x 4
-# rollouts, 512-token generations, checkpoint (incl. hf_model) at step 2, no validation.
+# rollouts, 512-token generations; the two steps are accumulated into one optimizer update as
+# in the full config; checkpoint (incl. hf_model) at step 2, no validation.
 # Only checks that the pipeline runs end to end; not a result.
 #   CUDA_VISIBLE_DEVICES=0,1 LOOPRL_VENV=... LOOPRL_MODEL_DIR=... LOOPRL_MATH_TRAIN_JSONL=... \
 #   LOOPRL_MATH500_JSONL=... LOOPRL_OUTPUT_DIR=... bash smoke_grpo.sh [extra overrides]
@@ -21,5 +22,5 @@ LOOPRL_MATH_TRAIN_JSONL="$SMOKE_TRAIN" exec timeout 5400 bash "$HERE/run_train.s
   args.vllm_gpu_memory_utilization=0.3 args.ppo_max_token_len=4096 \
   args.log_prob_max_token_len=4096 args.dataloader_num_workers=2 \
   verl_overrides.data.train_batch_size=$PROMPTS \
-  verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size=$PROMPTS \
+  verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size=$((2 * PROMPTS)) \
   wandb.run_name=grpo_smoke "$@"

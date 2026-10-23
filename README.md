@@ -89,12 +89,28 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 
 ### GRPO 8 卡配置要点（`configs/grpo_baseline_8gpu.yaml`）
 
-- 每步 64 题 × 8 条 = 512 条 rollout，生成上限 8,192 tokens；一次更新（mini-batch = 64 题）。
-- clip 0.2，token-mean，KL（β = 0.001）加在 reward 上（原作 GRPO 对照的做法），AdamW8bit，lr 1e-6，
-  梯度裁剪 0.1（RLTT 论文设置），200 步，每 20 步存 checkpoint（含 `hf_model`，供逐轮梯度探测）
-  并在 MATH-500 上验证。
-- 原作 `grpo_train.py` 把 `data.train_batch_size` 设为 `num_prompts_per_batch × num_generations`，
-  verl 又把它当作题数，所以配置里用 `verl_overrides` 显式写出每步题数。
+超参数按 RLTT 论文 Table 6（论文中 GRPO 与 RLTT 共用同一套设置），与 `configs/rltt_baseline.yaml` 一致：
+
+- 模型 Ouro-2.6B-Thinking 全参数，4 次循环；数据 MATH 训练集 7,500 题。
+- 每步 32 题 × 8 条 = 256 条 rollout，生成上限 2,048 tokens，temperature 1.0；梯度累积 2，
+  即每 64 题做一次优化器更新（mini-batch = 64 题），共 140 步（70 次更新）。
+- AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
+  梯度裁剪 0.1；KL β = 0.001，按 RLTT 的方式作为 `low_var_kl` loss；clip 0.2，token-mean。
+- 每 10 步存 checkpoint（含 `hf_model`，供逐轮梯度探测）；训练中不做验证（论文如此），
+  需要时加 `args.no_validation=false`（MATH-500，3,072 tokens）。
+
+原作 `grpo_train.py` 与论文有四处不一致，配置里用 `verl_overrides` 改正：
+
+| 项 | 原作脚本 | 本配置 |
+|---|---|---|
+| 每步题数 | `data.train_batch_size = 题数 × 8`，verl 当作题数（256 题） | 32 题 |
+| 梯度裁剪 | `max_grad_norm` 只传给未启用的 critic，actor 用 verl 默认 1.0 | 0.1 |
+| Adam betas | (0.9, 0.999)（RLTT 脚本相同） | (0.9, 0.99) |
+| KL | 加在 reward 上；组内奖励全同时，KL 噪声会给这组产生非零 advantage | `low_var_kl` loss，与 RLTT 相同 |
+
+`configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1 和 KL loss）。
+注意 warmup 长度按步数算（140 × 10% = 14），但 verl 的学习率调度器每次更新才前进一次，
+梯度累积 2 时共 70 次更新，所以实际 warmup 占前 14 次更新（20%）。原作也是这样，这里不改。
 - 原作 `grpo_train.py` 会**原地修改**模型目录里的 `modeling_ouro.py`。launcher 只接受
   `prepare_model` 生成的目录，拒绝官方目录，避免改动共享的模型文件。
 

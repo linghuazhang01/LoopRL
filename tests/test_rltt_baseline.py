@@ -219,7 +219,10 @@ def test_cli_overrides_win(env):
     args = rcfg.build_args(cfg, _defaults())
     assert args.learning_rate == 2e-6 and args.max_steps == 10
     assert rcfg.wandb_env(cfg)["WANDB_MODE"] == "online"
-    assert rcfg.verl_overrides(cfg) == {"trainer": {"save_freq": 20, "experiment_name": "try1"}}
+    overrides = rcfg.verl_overrides(cfg)
+    assert overrides["trainer"] == {"save_freq": 20, "experiment_name": "try1"}
+    assert overrides["data"] == {"train_batch_size": 32}  # paper: 32 prompts per rollout batch
+    assert overrides["actor_rollout_ref"]["actor"]["optim"]["betas"] == [0.9, 0.99]
 
 
 def test_unknown_or_mistyped_args_fail(env):
@@ -321,8 +324,15 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["model_path"] == ENV["LOOPRL_MODEL_DIR"] and vendor["use_ppo"] is False
     assert vendor["max_steps"] == 3 and vendor["n_gpus"] == 8
     assert vendor["ppo_epochs"] == 4  # vendor default, unused when use_ppo is false
-    assert resolved["verl_overrides"]["data"]["train_batch_size"] == 64
-    assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 64
+    # RLTT paper Table 6 settings shared with the RLTT config
+    assert vendor["num_prompts_per_batch"] == 32 and vendor["num_generations"] == 8
+    assert vendor["max_completion_length"] == 2048 and vendor["gradient_accumulation_steps"] == 2
+    assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 1e-3
+    over = resolved["verl_overrides"]
+    actor = over["actor_rollout_ref"]["actor"]
+    assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 64
+    assert actor["grad_clip"] == 0.1 and actor["optim"]["betas"] == [0.9, 0.99]
+    assert actor["use_kl_loss"] is True and over["algorithm"]["use_kl_in_reward"] is False
 
 
 def test_grpo_rejects_ppo_and_rltt_only_keys(env):
