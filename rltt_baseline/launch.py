@@ -37,6 +37,7 @@ from omegaconf import OmegaConf
 from rltt_baseline.config import (
     apply_verl_overrides,
     build_args,
+    check_kl_not_in_reward,
     load_config,
     verl_overrides,
     wandb_env,
@@ -137,6 +138,7 @@ def main(argv=None) -> int:
     args = build_args(cfg, vendor_defaults(vendor))
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
     overrides = verl_overrides(cfg)
+    check_kl_not_in_reward(cfg.trainer, overrides)
 
     resolved = {
         "trainer": cfg.trainer,

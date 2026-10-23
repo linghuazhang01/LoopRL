@@ -35,6 +35,9 @@ DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
+# Vendor default of verl ``algorithm.use_kl_in_reward``: the GRPO script adds the KL to the
+# reward, the RLTT script uses a KL loss. This project never puts the KL in the reward.
+VENDOR_KL_IN_REWARD = {"rltt": False, "grpo": True}
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
@@ -142,6 +145,16 @@ def verl_overrides(cfg: DictConfig) -> dict:
     if cfg.wandb.get("run_name"):
         overrides.setdefault("trainer", {})["experiment_name"] = str(cfg.wandb.run_name)
     return overrides
+
+
+def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:
+    """Refuse a run whose final verl config would add the KL to the reward."""
+    in_reward = (overrides.get("algorithm") or {}).get("use_kl_in_reward",
+                                                        VENDOR_KL_IN_REWARD[trainer])
+    if in_reward:
+        raise ValueError("KL must not be added to the reward: set "
+                         "verl_overrides.algorithm.use_kl_in_reward=false "
+                         "(the KL is a loss term, actor.use_kl_loss=true)")
 
 
 def apply_verl_overrides(config, overrides: dict):

@@ -335,6 +335,22 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert actor["use_kl_loss"] is True and over["algorithm"]["use_kl_in_reward"] is False
 
 
+def test_kl_in_reward_is_refused(env, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    with pytest.raises(ValueError, match="KL must not be added to the reward"):
+        launch.main(["--config", str(GRPO_CONFIG), "--dry-run",
+                     "verl_overrides.algorithm.use_kl_in_reward=true"])
+    # the GRPO vendor default puts the KL in the reward, so the override must stay explicit
+    with pytest.raises(ValueError, match="KL must not be added"):
+        rcfg.check_kl_not_in_reward("grpo", {})
+    rcfg.check_kl_not_in_reward("rltt", {})
+    rcfg.check_kl_not_in_reward("grpo", {"algorithm": {"use_kl_in_reward": False}})
+
+
 def test_grpo_rejects_ppo_and_rltt_only_keys(env):
     cfg = rcfg.load_config(str(GRPO_CONFIG), ["args.use_ppo=true"])
     defaults = types.SimpleNamespace(**{k: v for k, v in vars(_defaults()).items()

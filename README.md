@@ -108,6 +108,9 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | Adam betas | (0.9, 0.999)（RLTT 脚本相同） | (0.9, 0.99) |
 | KL | 加在 reward 上；组内奖励全同时，KL 噪声会给这组产生非零 advantage | `low_var_kl` loss，与 RLTT 相同 |
 
+KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` 为 true 时，launcher 拒绝启动
+（GRPO 原作默认就是 true，所以配置里必须显式写 `false`）。
+
 `configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1 和 KL loss）。
 注意 warmup 长度按步数算（140 × 10% = 14），但 verl 的学习率调度器每次更新才前进一次，
 梯度累积 2 时共 70 次更新，所以实际 warmup 占前 14 次更新（20%）。原作也是这样，这里不改。
