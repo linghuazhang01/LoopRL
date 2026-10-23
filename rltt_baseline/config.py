@@ -1,11 +1,14 @@
-"""YAML configuration for the RLTT baseline, with command-line overrides.
+"""YAML configuration for the RLTT / GRPO baselines, with command-line overrides.
 
-A config file has four top-level sections:
+A config file has these top-level keys:
 
+``trainer``
+    ``rltt`` (``rltt_experiments/rltt_train.py``, default) or ``grpo``
+    (``grpo_experiments/grpo_train.py``, the GRPO baseline of the RLTT repository).
 ``args``
-    Keys are the ``dest`` names of the vendor ``rltt_train.py`` argparse options (for example
-    ``learning_rate``, ``max_completion_length``, ``loop_weighting``). Unlisted options keep the
-    vendor default. Unknown keys and type mismatches are errors.
+    Keys are the ``dest`` names of the chosen vendor script's argparse options (for example
+    ``learning_rate``, ``max_completion_length``). Unlisted options keep the vendor default.
+    Unknown keys and type mismatches are errors.
 ``wandb``
     ``enabled``, ``mode`` (online / offline / disabled), ``project``, ``entity``,
     ``run_name``, ``tags``, ``notes``, ``dir``. Mapped to the vendor ``--no_wandb`` /
@@ -27,7 +30,9 @@ from typing import Dict, List, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
-SECTIONS = ("args", "wandb", "verl_overrides", "env")
+SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env")
+DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env")
+TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
 
@@ -37,9 +42,13 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
     unknown = set(cfg.keys()) - set(SECTIONS)
     if unknown:
         raise KeyError(f"unknown top-level config keys {sorted(unknown)}; allowed {SECTIONS}")
-    for section in SECTIONS:
+    for section in DICT_SECTIONS:
         if section not in cfg or cfg[section] is None:
             cfg[section] = {}
+    if cfg.get("trainer") is None:
+        cfg.trainer = "rltt"
+    if cfg.trainer not in TRAINERS:
+        raise ValueError(f"trainer must be one of {TRAINERS}, got {cfg.trainer!r}")
     bad = set(cfg.wandb.keys()) - WANDB_KEYS
     if bad:
         raise KeyError(f"unknown wandb keys {sorted(bad)}; allowed {sorted(WANDB_KEYS)}")
@@ -75,7 +84,7 @@ def build_args(cfg: DictConfig, defaults: argparse.Namespace) -> argparse.Namesp
     for name, value in OmegaConf.to_container(cfg.args, resolve=True).items():
         if name not in values:
             close = difflib.get_close_matches(name, values, n=3)
-            raise KeyError(f"args.{name} is not a vendor rltt_train.py option; close: {close}")
+            raise KeyError(f"args.{name} is not a {cfg.trainer} trainer option; close: {close}")
         values[name] = _coerce(name, value, values[name])
 
     wandb = cfg.wandb
@@ -87,15 +96,18 @@ def build_args(cfg: DictConfig, defaults: argparse.Namespace) -> argparse.Namesp
         values["wandb_project"] = str(wandb.project)
 
     args = argparse.Namespace(**values)
-    validate_args(args)
+    validate_args(args, cfg.trainer)
     return args
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.loop_weighting not in LOOP_WEIGHTINGS:
-        raise ValueError(f"loop_weighting must be one of {sorted(LOOP_WEIGHTINGS)}")
-    if args.loop_weighting == "exit_pdf" and not args.use_rltt_model:
-        raise ValueError("loop_weighting=exit_pdf needs use_rltt_model=true (per-loop model)")
+def validate_args(args: argparse.Namespace, trainer: str = "rltt") -> None:
+    if trainer == "rltt":
+        if args.loop_weighting not in LOOP_WEIGHTINGS:
+            raise ValueError(f"loop_weighting must be one of {sorted(LOOP_WEIGHTINGS)}")
+        if args.loop_weighting == "exit_pdf" and not args.use_rltt_model:
+            raise ValueError("loop_weighting=exit_pdf needs use_rltt_model=true (per-loop model)")
+    if trainer == "grpo" and args.use_ppo:
+        raise ValueError("trainer=grpo with use_ppo=true would run PPO with a critic")
     if args.temperature <= 0:
         raise ValueError("temperature must be positive")
     for name in ("max_prompt_length", "max_completion_length", "num_generations",

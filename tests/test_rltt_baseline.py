@@ -14,11 +14,11 @@ from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates, per_loop_
 
 CONFIG = paths.config_file("rltt_baseline.yaml")
 ENV = {
-    "OURO_THINKING_DIR": "/models/Ouro-2.6B-Thinking",
-    "RLTT_MODEL_DIR": "/models/Ouro-2.6B-Thinking-RLTT",
-    "RLTT_MATH_TRAIN_JSONL": "/data/math_train.jsonl",
-    "RLTT_MATH500_JSONL": "/data/math500.jsonl",
-    "RLTT_OUTPUT_DIR": "/out/rltt",
+    "LOOPRL_OURO_DIR": "/models/Ouro-2.6B-Thinking",
+    "LOOPRL_MODEL_DIR": "/models/Ouro-2.6B-Thinking-RLTT",
+    "LOOPRL_MATH_TRAIN_JSONL": "/data/math_train.jsonl",
+    "LOOPRL_MATH500_JSONL": "/data/math500.jsonl",
+    "LOOPRL_OUTPUT_DIR": "/out/rltt",
 }
 
 
@@ -200,7 +200,7 @@ def _defaults():
 def test_default_config_resolves_to_paper_settings(env):
     cfg = rcfg.load_config(str(CONFIG))
     args = rcfg.build_args(cfg, _defaults())
-    assert args.model_path == ENV["OURO_THINKING_DIR"]
+    assert args.model_path == ENV["LOOPRL_OURO_DIR"]
     assert args.use_rltt_model and args.loop_weighting == "exit_pdf"
     assert args.max_completion_length == 2048 and args.max_steps == 140
     assert args.num_prompts_per_batch == 32
@@ -208,7 +208,7 @@ def test_default_config_resolves_to_paper_settings(env):
     assert args.no_wandb is False and args.wandb_project == "rltt-ouro-baseline"
     env_vars = rcfg.wandb_env(cfg)
     assert env_vars["WANDB_MODE"] == "offline"
-    assert env_vars["WANDB_DIR"] == ENV["RLTT_OUTPUT_DIR"]
+    assert env_vars["WANDB_DIR"] == ENV["LOOPRL_OUTPUT_DIR"]
     assert env_vars["WANDB_TAGS"] == "rltt,baseline,ouro-2.6b-thinking"
 
 
@@ -228,7 +228,9 @@ def test_unknown_or_mistyped_args_fail(env):
     with pytest.raises(TypeError):
         rcfg.build_args(rcfg.load_config(str(CONFIG), ["args.max_steps=1.5"]), _defaults())
     with pytest.raises(KeyError):
-        rcfg.load_config(str(CONFIG), ["trainer.foo=1"])
+        rcfg.load_config(str(CONFIG), ["nosuchsection.foo=1"])
+    with pytest.raises(ValueError, match="trainer must be"):
+        rcfg.load_config(str(CONFIG), ["trainer=ppo"])
     with pytest.raises(ValueError, match="exit_pdf"):
         rcfg.build_args(rcfg.load_config(str(CONFIG), ["args.use_rltt_model=false"]), _defaults())
 
@@ -256,7 +258,7 @@ def test_launch_dry_run_uses_vendor_defaults(env, capsys, monkeypatch):
     assert launch.main(["--config", str(CONFIG), "--dry-run", "args.seed=7"]) == 0
     resolved = json.loads(capsys.readouterr().out)
     vendor = resolved["vendor_args"]
-    assert vendor["seed"] == 7 and vendor["rltt_model_path"] == ENV["RLTT_MODEL_DIR"]
+    assert vendor["seed"] == 7 and vendor["rltt_model_path"] == ENV["LOOPRL_MODEL_DIR"]
     assert vendor["forward_batch_size"] == 2  # vendor default for a key not in the YAML
     assert resolved["env"]["TOKENIZERS_PARALLELISM"] == "false"
 
@@ -299,3 +301,50 @@ def test_prepare_model_rejects_unknown_modeling_file(tmp_path):
     (src / "modeling_ouro.py").write_text("# changed\n")
     with pytest.raises(ValueError, match="not in the allowed set"):
         prepare_model.build(src, tmp_path / "rltt", {"0" * 64}, 2048, False, False)
+
+
+# ---------- GRPO trainer ----------
+
+GRPO_CONFIG = paths.config_file("grpo_baseline_8gpu.yaml")
+
+
+def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(GRPO_CONFIG), "--dry-run", "args.max_steps=3"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    vendor = resolved["vendor_args"]
+    assert resolved["trainer"] == "grpo"
+    assert vendor["model_path"] == ENV["LOOPRL_MODEL_DIR"] and vendor["use_ppo"] is False
+    assert vendor["max_steps"] == 3 and vendor["n_gpus"] == 8
+    assert vendor["ppo_epochs"] == 4  # vendor default, unused when use_ppo is false
+    assert resolved["verl_overrides"]["data"]["train_batch_size"] == 64
+    assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 64
+
+
+def test_grpo_rejects_ppo_and_rltt_only_keys(env):
+    cfg = rcfg.load_config(str(GRPO_CONFIG), ["args.use_ppo=true"])
+    defaults = types.SimpleNamespace(**{k: v for k, v in vars(_defaults()).items()
+                                        if k not in ("loop_weighting", "use_rltt_model")},
+                                     use_ppo=False)
+    with pytest.raises(ValueError, match="PPO"):
+        rcfg.build_args(cfg, defaults)
+
+
+def test_check_grpo_model_dir_refuses_official_modeling(tmp_path):
+    from rltt_baseline.launch import check_grpo_model_dir
+
+    official = tmp_path / "official"
+    official.mkdir()
+    (official / "modeling_ouro.py").write_text(
+        (paths.ouro_source_dir() / "modeling_ouro.py").read_text())
+    with pytest.raises(SystemExit, match="edit in place"):
+        check_grpo_model_dir(str(official))
+    built = tmp_path / "built"
+    allowed = {prepare_model.sha256(prepare_model.vendor_modeling())}
+    src = _fake_source(tmp_path)
+    prepare_model.build(src, built, allowed, 2048, False, False)
+    check_grpo_model_dir(str(built))  # our shim has no decorator: accepted

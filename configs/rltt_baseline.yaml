@@ -4,11 +4,13 @@
 # Values follow RLTT rltt_experiments/run_rltt.slurm and the paper's Table 6. Paths come from
 # environment variables so the same file works on any cluster.
 
+trainer: rltt
+
 args:  # keys = dest names of the vendor rltt_train.py argparse options
   # model: Ouro-2.6B-Thinking, full-parameter, fixed 4 loops
-  model_path: ${oc.env:OURO_THINKING_DIR}
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
   use_rltt_model: true
-  rltt_model_path: ${oc.env:RLTT_MODEL_DIR}        # built by rltt_baseline.prepare_model
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model
   rltt_logprob_chunk_size: 2048
   total_ut_steps: 4
   no_lora: true
@@ -17,8 +19,8 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   ref_offload: true
 
   # data: MATH train (7,500 problems), MATH-500 for optional validation
-  train_file: ${oc.env:RLTT_MATH_TRAIN_JSONL}
-  math500_test_file: ${oc.env:RLTT_MATH500_JSONL}
+  train_file: ${oc.env:LOOPRL_MATH_TRAIN_JSONL}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
   max_prompt_length: 1024
   max_completion_length: 2048
 
@@ -54,7 +56,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   # resources and outputs
   n_gpus: 4
   nnodes: 1
-  output_dir: ${oc.env:RLTT_OUTPUT_DIR}
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
   save_steps: 10
   logging_steps: 1
 

@@ -1,0 +1,87 @@
+# GRPO baseline on Ouro-2.6B-Thinking, one node with 8 GPUs (stage 1 of the loop-gradient study).
+# Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
+#   (group-normalised advantage, PPO clip 0.2, token-mean, KL to the reference added to the
+#    reward with a fixed coefficient beta; AdamW8bit). Ouro runs a fixed 4 loops.
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+# Paths come from environment variables (see scripts/prepare_*.sh).
+
+trainer: grpo
+
+args:  # keys = dest names of grpo_train.py argparse options
+  # model: directory built by rltt_baseline.prepare_model (official weights + compat edit);
+  # grpo_train.py edits <model>/modeling_ouro.py in place, so never point at the official dir.
+  model_path: ${oc.env:LOOPRL_MODEL_DIR}
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+
+  # data: MATH train (7,500 problems), MATH-500 for validation
+  train_file: ${oc.env:LOOPRL_MATH_TRAIN_JSONL}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 1024
+  max_completion_length: 8192
+
+  # GRPO
+  use_ppo: false
+  num_generations: 8          # rollouts per prompt (group size)
+  num_prompts_per_batch: 8    # vendor sets data.train_batch_size = this x num_generations;
+                              # the real batch is set explicitly in verl_overrides below
+  temperature: 1.0
+  beta: 0.001                 # KL coefficient (KL added to the reward, fixed)
+
+  # optimisation
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1          # RLTT paper setting
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  num_train_epochs: 5
+  max_steps: 200
+  seed: 42
+
+  # memory / rollout
+  ppo_max_token_len: 16384
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  # resources and outputs
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 20              # checkpoints feed the per-loop gradient probe (condition B)
+  logging_steps: 1
+
+  # validation on MATH-500 at the training generation limit
+  no_validation: false
+  skip_initial_validation: false
+  eval_steps: 20
+  val_batch_size: 64
+  val_max_new_tokens: 8192
+
+wandb:
+  enabled: true
+  mode: offline
+  project: looprl-grpo-ouro
+  run_name: null
+  tags: [grpo, baseline, ouro-2.6b-thinking, math-train]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides:
+  data:
+    train_batch_size: 64      # prompts per step -> 64 x 8 = 512 rollouts per step
+  actor_rollout_ref:
+    actor:
+      ppo_mini_batch_size: 64 # one optimizer update per step (on-policy)
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]  # hf_model: loadable by the probe
+  trainer:
+    logger: [wandb, console]
+
+env:
+  TOKENIZERS_PARALLELISM: "false"

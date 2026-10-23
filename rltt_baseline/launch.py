@@ -1,24 +1,32 @@
-"""Launch the vendored RLTT trainer from a YAML config.
+"""Launch the vendored RLTT or GRPO trainer from a YAML config.
 
     python -m rltt_baseline.launch --config code/configs/rltt_baseline.yaml \
         [--dry-run] [args.learning_rate=2e-6 wandb.mode=online ...]
 
-What this adds around the RLTT ``rltt_experiments/rltt_train.py`` (whose files are not
-modified; located by ``paths.rltt_source_dir``):
+``trainer: rltt`` runs ``rltt_experiments/rltt_train.py``; ``trainer: grpo`` runs
+``grpo_experiments/grpo_train.py`` (standard verl GRPO, the RLTT paper's GRPO baseline).
+What this adds around the vendor script (whose files are not modified; located by
+``paths.rltt_source_dir``):
 
 1. argparse values come from the YAML ``args`` section (vendor defaults for unlisted keys);
 2. ``verl_overrides`` are merged into the final verl config inside ``RayPPOTrainer.__init__``;
 3. ``wandb`` settings become ``--no_wandb`` / ``--wandb_project``, the experiment name and
    ``WANDB_*`` variables;
-4. the trainer uses ``MetricsRLTTActorRolloutRefWorker`` (per-loop entropy, expected exit
-   step, total loss) and the driver adds ``reasoning/*`` metrics;
+4. the driver adds ``reasoning/*`` metrics; for RLTT the trainer also uses
+   ``MetricsRLTTActorRolloutRefWorker`` (per-loop entropy, expected exit step, total loss);
 5. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
+
+GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
+``@check_model_inputs``. The launcher therefore refuses a model directory whose
+``modeling_ouro.py`` still has that decorator (an official, possibly shared, model directory);
+use the directory built by ``rltt_baseline.prepare_model``.
 
 Only the vendor multi-GPU verl path is supported (the vendor falls back to its simple
 single-GPU trainer when fewer than two GPUs are visible, which bypasses 2-4).
 """
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -35,11 +43,19 @@ from rltt_baseline.config import (
 )
 from rltt_baseline.paths import SRC_DIR, rltt_source_dir
 
+TRAINER_MODULES = {"rltt": ("rltt_experiments", "rltt_train"),
+                   "grpo": ("grpo_experiments", "grpo_train")}
+OFFICIAL_DECORATOR = "    @check_model_inputs\n    @auto_docstring\n    def forward("
 
-def setup_paths() -> None:
-    """Make the vendor modules importable here and in Ray workers (which inherit PYTHONPATH)."""
+
+def setup_paths(trainer: str) -> None:
+    """Make the vendor modules importable here and in Ray workers (which inherit PYTHONPATH).
+
+    Only the chosen experiments directory is added: both define modules named ``config``,
+    ``data_utils`` and ``simple_trainer``.
+    """
     vendor = rltt_source_dir()
-    paths = [str(p) for p in (SRC_DIR, vendor / "rltt_experiments", vendor)]
+    paths = [str(p) for p in (SRC_DIR, vendor / TRAINER_MODULES[trainer][0], vendor)]
     for path in reversed(paths):
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -47,13 +63,20 @@ def setup_paths() -> None:
     os.environ["PYTHONPATH"] = os.pathsep.join(paths + [p for p in existing if p not in paths])
 
 
-def vendor_defaults(rltt_train) -> argparse.Namespace:
+def vendor_defaults(module) -> argparse.Namespace:
     saved = sys.argv
-    sys.argv = [rltt_train.__file__]
+    sys.argv = [module.__file__]
     try:
-        return rltt_train.parse_args()
+        return module.parse_args()
     finally:
         sys.argv = saved
+
+
+def check_grpo_model_dir(model_path: str) -> None:
+    modeling = Path(model_path) / "modeling_ouro.py"
+    if modeling.is_file() and OFFICIAL_DECORATOR in modeling.read_text():
+        raise SystemExit(f"{model_path} holds the official modeling_ouro.py, which grpo_train.py "
+                         "would edit in place; pass the prepare_model output directory instead")
 
 
 def install_trainer_overrides(overrides: dict) -> None:
@@ -83,7 +106,8 @@ def install_reasoning_metrics(args) -> None:
 
     from rltt_baseline.metrics import install_driver_metrics
 
-    model_path = args.rltt_model_path if args.use_rltt_model else args.model_path
+    use_rltt = getattr(args, "use_rltt_model", False)
+    model_path = args.rltt_model_path if use_rltt else args.model_path
     tokenizer = {}
 
     def decode(token_ids):
@@ -99,7 +123,7 @@ def install_reasoning_metrics(args) -> None:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="RLTT baseline launcher")
+    parser = argparse.ArgumentParser(description="RLTT / GRPO baseline launcher")
     parser.add_argument("--config", required=True, help="YAML config path")
     parser.add_argument("--dry-run", action="store_true",
                         help="resolve and print the configuration, then exit without training")
@@ -107,14 +131,15 @@ def main(argv=None) -> int:
     opts = parser.parse_args(argv)
 
     cfg = load_config(opts.config, opts.overrides)
-    setup_paths()
-    import rltt_train  # vendor module; sets HF_*_OFFLINE=1 on import
+    setup_paths(cfg.trainer)
+    vendor = importlib.import_module(TRAINER_MODULES[cfg.trainer][1])  # sets HF_*_OFFLINE=1
 
-    args = build_args(cfg, vendor_defaults(rltt_train))
+    args = build_args(cfg, vendor_defaults(vendor))
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
     overrides = verl_overrides(cfg)
 
     resolved = {
+        "trainer": cfg.trainer,
         "config_file": str(Path(opts.config).resolve()),
         "cli_overrides": list(opts.overrides),
         "config": OmegaConf.to_container(cfg, resolve=True),
@@ -133,6 +158,8 @@ def main(argv=None) -> int:
         n_gpus = torch.cuda.device_count()
     if n_gpus <= 1 or args.debug:
         raise SystemExit("rltt_baseline needs the vendor verl path: >= 2 GPUs and debug=false")
+    if cfg.trainer == "grpo":
+        check_grpo_model_dir(args.model_path)
 
     os.makedirs(args.output_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(args.output_dir, "rltt_baseline_config.yaml"), resolve=True)
@@ -140,11 +167,12 @@ def main(argv=None) -> int:
         json.dump(resolved, fh, indent=2, default=str)
 
     os.environ.update(env)
-    rltt_train.parse_args = lambda: args
+    vendor.parse_args = lambda: args
     install_trainer_overrides(overrides)
-    install_metrics_worker()
+    if cfg.trainer == "rltt":
+        install_metrics_worker()
     install_reasoning_metrics(args)
-    rltt_train.main()
+    vendor.main()
     return 0
 
 
