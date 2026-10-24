@@ -1,4 +1,6 @@
-# RLTT baseline (Williams & Tureci 2026, arXiv 2602.10520), paper Table 6 settings.
+# RLTT baseline (Williams & Tureci 2026, arXiv 2602.10520), paper Table 6 settings, except data
+# and lengths, which follow SAPD (as in grpo_baseline_8gpu.yaml): DeepMath-103K level >= 6 with
+# its own prompt, prompts up to 2,048 tokens, generations up to 16,384 (paper: MATH, 1,024 / 2,048).
 # Launcher: python -m rltt_baseline.launch --config <this file> [overrides]
 # Overrides use dot-list syntax, e.g. args.learning_rate=2e-6 wandb.mode=online
 # Values follow RLTT rltt_experiments/run_rltt.slurm and the paper's Table 6. Paths come from
@@ -18,11 +20,12 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   no_gradient_checkpointing: false
   ref_offload: true
 
-  # data: MATH train (7,500 problems), MATH-500 for optional validation
-  train_file: ${oc.env:LOOPRL_MATH_TRAIN_JSONL}
+  # data: SAPD math training set (deepmath_level6.parquet), prompts used unchanged;
+  # MATH-500 for optional validation
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
-  max_prompt_length: 1024
-  max_completion_length: 2048
+  max_prompt_length: 2048
+  max_completion_length: 16384
 
   # RLTT objective
   loop_weighting: exit_pdf      # uniform | progressive | exit_pdf | learned
@@ -44,8 +47,8 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   seed: 42
 
   # memory / rollout
-  ppo_max_token_len: 8192
-  log_prob_max_token_len: 8192
+  ppo_max_token_len: 32768      # must be >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false

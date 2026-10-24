@@ -14,7 +14,9 @@ What this adds around the vendor script (whose files are not modified; located b
    ``WANDB_*`` variables;
 4. the driver adds ``reasoning/*`` metrics; for RLTT the trainer also uses
    ``MetricsRLTTActorRolloutRefWorker`` (per-loop entropy, expected exit step, total loss);
-5. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
+5. a ``train_file`` ending in ``.parquet`` is used as a verl dataset with its own prompts
+   (``rltt_baseline.verl_data``) instead of the vendor's MATH JSONL conversion;
+6. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -94,6 +96,25 @@ def install_trainer_overrides(overrides: dict) -> None:
     RayPPOTrainer.__init__ = __init__
 
 
+def install_parquet_train_data() -> None:
+    """Route a ``.parquet`` train_file to ``verl_data.copy_verl_parquet`` (prompts unchanged)."""
+    import data_utils
+
+    from rltt_baseline.verl_data import copy_verl_parquet
+
+    original = data_utils.prepare_train_data
+    if getattr(original, "_rltt_parquet", False):
+        return
+
+    def prepare_train_data(train_file, output_dir, *args, **kwargs):
+        if not str(train_file).endswith(".parquet"):
+            return original(train_file, output_dir, *args, **kwargs)
+        return copy_verl_parquet(train_file, os.path.join(output_dir, "train.parquet"))
+
+    prepare_train_data._rltt_parquet = True
+    data_utils.prepare_train_data = prepare_train_data
+
+
 def install_metrics_worker() -> None:
     import verl_rltt
 
@@ -162,6 +183,10 @@ def main(argv=None) -> int:
         raise SystemExit("rltt_baseline needs the vendor verl path: >= 2 GPUs and debug=false")
     if cfg.trainer == "grpo":
         check_grpo_model_dir(args.model_path)
+    if str(args.train_file).endswith(".parquet"):
+        from rltt_baseline.verl_data import load_rows
+
+        load_rows(args.train_file)  # fail before Ray starts
 
     os.makedirs(args.output_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(args.output_dir, "rltt_baseline_config.yaml"), resolve=True)
@@ -171,6 +196,7 @@ def main(argv=None) -> int:
     os.environ.update(env)
     vendor.parse_args = lambda: args
     install_trainer_overrides(overrides)
+    install_parquet_train_data()
     if cfg.trainer == "rltt":
         install_metrics_worker()
     install_reasoning_metrics(args)

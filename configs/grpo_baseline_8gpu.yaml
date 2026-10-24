@@ -1,7 +1,9 @@
 # GRPO baseline on Ouro-2.6B-Thinking, one node with 8 GPUs (stage 1 of the loop-gradient study).
-# Hyperparameters follow the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
+# Data and lengths follow SAPD: DeepMath-103K level >= 6 (57,046 problems) with its own prompt,
+#   prompts up to 2,048 tokens, generations up to 16,384 tokens.
+# Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
 # trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml:
-#   32 prompts x 8 rollouts per step, 2048-token generations, gradient accumulation 2 (one optimizer
+#   32 prompts x 8 rollouts per step, gradient accumulation 2 (one optimizer
 #   update per 64 prompts), 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 #   weight decay 0.1, grad clip 0.1, KL 1e-3, BF16, binary reward, group-normalised advantage.
 # Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
@@ -20,11 +22,13 @@ args:  # keys = dest names of grpo_train.py argparse options
   no_lora: true
   no_sft_checkpoint: true
 
-  # data: MATH train (7,500 problems), MATH-500 for optional validation
-  train_file: ${oc.env:LOOPRL_MATH_TRAIN_JSONL}
+  # data: SAPD math training set (deepmath_level6.parquet from scripts/prepare_data.sh), a verl
+  # parquet whose prompts are used unchanged; a MATH JSONL instead gets the RLTT prompt.
+  # MATH-500 for optional validation (vendor conversion, RLTT prompt).
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
-  max_prompt_length: 1024
-  max_completion_length: 2048
+  max_prompt_length: 2048     # SAPD; longer prompts are filtered out
+  max_completion_length: 16384 # SAPD
 
   # GRPO
   use_ppo: false
@@ -45,8 +49,8 @@ args:  # keys = dest names of grpo_train.py argparse options
   seed: 42
 
   # memory / rollout
-  ppo_max_token_len: 8192
-  log_prob_max_token_len: 8192
+  ppo_max_token_len: 32768    # per-GPU token budget; must be >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false
@@ -61,19 +65,19 @@ args:  # keys = dest names of grpo_train.py argparse options
   save_steps: 10              # checkpoints feed the per-loop gradient probe (condition B)
   logging_steps: 1
 
-  # validation (off in the paper runs; MATH-500 at 3,072 tokens when enabled)
+  # validation (off, as in the RLTT paper runs)
   no_validation: true
   skip_initial_validation: true
   eval_steps: 5
   val_batch_size: 64
-  val_max_new_tokens: 3072
+  val_max_new_tokens: 16384
 
 wandb:
   enabled: true
   mode: offline
   project: looprl-grpo-ouro
   run_name: null
-  tags: [grpo, baseline, ouro-2.6b-thinking, math-train]
+  tags: [grpo, baseline, ouro-2.6b-thinking, deepmath-level6]
   notes: null
   dir: ${args.output_dir}
 

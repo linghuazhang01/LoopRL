@@ -9,14 +9,14 @@ from omegaconf import OmegaConf
 
 from rltt_baseline import config as rcfg
 from rltt_baseline import metrics as rmet
-from rltt_baseline import paths, prepare_model
+from rltt_baseline import paths, prepare_model, verl_data
 from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates, per_loop_token_stats
 
 CONFIG = paths.config_file("rltt_baseline.yaml")
 ENV = {
     "LOOPRL_OURO_DIR": "/models/Ouro-2.6B-Thinking",
     "LOOPRL_MODEL_DIR": "/models/Ouro-2.6B-Thinking-RLTT",
-    "LOOPRL_MATH_TRAIN_JSONL": "/data/math_train.jsonl",
+    "LOOPRL_TRAIN_FILE": "/data/deepmath_level6.parquet",
     "LOOPRL_MATH500_JSONL": "/data/math500.jsonl",
     "LOOPRL_OUTPUT_DIR": "/out/rltt",
 }
@@ -202,7 +202,9 @@ def test_default_config_resolves_to_paper_settings(env):
     args = rcfg.build_args(cfg, _defaults())
     assert args.model_path == ENV["LOOPRL_OURO_DIR"]
     assert args.use_rltt_model and args.loop_weighting == "exit_pdf"
-    assert args.max_completion_length == 2048 and args.max_steps == 140
+    assert args.max_completion_length == 16384 and args.max_steps == 140  # lengths: SAPD
+    assert args.max_prompt_length == 2048 and args.train_file == ENV["LOOPRL_TRAIN_FILE"]
+    assert args.ppo_max_token_len >= args.max_prompt_length + args.max_completion_length
     assert args.num_prompts_per_batch == 32
     assert args.temperature == 1.0 and isinstance(args.learning_rate, float)
     assert args.no_wandb is False and args.wandb_project == "rltt-ouro-baseline"
@@ -326,13 +328,80 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["ppo_epochs"] == 4  # vendor default, unused when use_ppo is false
     # RLTT paper Table 6 settings shared with the RLTT config
     assert vendor["num_prompts_per_batch"] == 32 and vendor["num_generations"] == 8
-    assert vendor["max_completion_length"] == 2048 and vendor["gradient_accumulation_steps"] == 2
+    assert vendor["gradient_accumulation_steps"] == 2
+    # SAPD data and lengths
+    assert vendor["train_file"] == ENV["LOOPRL_TRAIN_FILE"]
+    assert vendor["max_prompt_length"] == 2048 and vendor["max_completion_length"] == 16384
+    for key in ("ppo_max_token_len", "log_prob_max_token_len"):
+        assert vendor[key] >= 2048 + 16384
     assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 1e-3
     over = resolved["verl_overrides"]
     actor = over["actor_rollout_ref"]["actor"]
     assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 64
     assert actor["grad_clip"] == 0.1 and actor["optim"]["betas"] == [0.9, 0.99]
     assert actor["use_kl_loss"] is True and over["algorithm"]["use_kl_in_reward"] is False
+
+
+# ---------- verl parquet training data (SAPD prompts) ----------
+
+def _verl_rows():
+    suffix = "\nPlease reason step by step, and put your final answer within \\boxed{}."
+    return [{"data_source": "DeepMath-103K",
+             "prompt": [{"content": f"What is {i} + 1?{suffix}", "role": "user"}],
+             "ability": "math", "reward_model": {"ground_truth": str(i + 1), "style": "rule"},
+             "extra_info": {"index": i, "split": "train"}} for i in range(3)]
+
+
+def _write_parquet(path, rows):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.Table.from_pylist(rows), path)
+
+
+def test_copy_verl_parquet_keeps_prompts_and_adds_problem(tmp_path):
+    rows = _verl_rows()
+    _write_parquet(tmp_path / "in.parquet", rows)
+    out = verl_data.copy_verl_parquet(tmp_path / "in.parquet", tmp_path / "data" / "train.parquet")
+    got = verl_data.load_rows(out)
+    assert [r["prompt"] for r in got] == [r["prompt"] for r in rows]
+    assert [r["reward_model"]["ground_truth"] for r in got] == ["1", "2", "3"]
+    assert got[0]["extra_info"]["problem"] == rows[0]["prompt"][0]["content"]
+    assert got[2]["extra_info"]["index"] == 2
+
+
+@pytest.mark.parametrize("bad", [{"prompt": []}, {"reward_model": {"ground_truth": " "}},
+                                 {"data_source": ""}])
+def test_copy_verl_parquet_rejects_malformed_rows(tmp_path, bad):
+    rows = _verl_rows()
+    rows[1].update(bad)
+    _write_parquet(tmp_path / "in.parquet", rows)
+    with pytest.raises(ValueError, match="row 1"):
+        verl_data.copy_verl_parquet(tmp_path / "in.parquet", tmp_path / "out.parquet")
+
+
+def test_parquet_train_file_bypasses_vendor_prompt(tmp_path, monkeypatch):
+    from rltt_baseline import launch
+
+    calls = []
+    fake = types.ModuleType("data_utils")
+    fake.prepare_train_data = lambda train_file, output_dir, **kw: calls.append(train_file) or "x"
+    monkeypatch.setitem(sys.modules, "data_utils", fake)
+    launch.install_parquet_train_data()
+    assert fake.prepare_train_data("/d/math_train.jsonl", str(tmp_path)) == "x"
+    _write_parquet(tmp_path / "in.parquet", _verl_rows())
+    out = fake.prepare_train_data(str(tmp_path / "in.parquet"), str(tmp_path / "data"))
+    assert out == str(tmp_path / "data" / "train.parquet") and calls == ["/d/math_train.jsonl"]
+
+
+def test_prepare_data_defaults_to_sapd_data_and_rejects_unknown(tmp_path):
+    from rltt_baseline import prepare_data
+
+    assert prepare_data.DEFAULT_DATASETS.split(",")[0] == "deepmath_level6"
+    assert set(prepare_data.PREPARE) == set(prepare_data.DATASETS)
+    with pytest.raises(SystemExit):
+        prepare_data.main(["--out", str(tmp_path), "--datasets", "deepmath_level6,bogus"])
+    assert not (tmp_path / "data_manifest.json").exists()
 
 
 def test_kl_in_reward_is_refused(env, monkeypatch):

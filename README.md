@@ -14,7 +14,9 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 
 > 状态（2026-10-23）：CPU 单元测试和 tiny 随机模型测试通过；在 3×H200 上，RLTT 与 GRPO 各跑通
 > 2 步 smoke run（GRPO 含 checkpoint 与 `hf_model` 保存，保存的模型可直接加载）；环境、数据、
-> 模型三个准备脚本在服务器上从零跑通。逐轮梯度探测尚未在真实模型上运行。所有数字都不是实验结论。
+> 模型三个准备脚本在服务器上从零跑通。逐轮梯度探测尚未在真实模型上运行。
+> 2026-10-24 训练数据改为 SAPD 的 DeepMath 数据、prompt 2,048 / 生成 16,384 之后，只做了 CPU 测试和数据脚本实跑，
+> GPU smoke run 尚未在新设置下运行。所有数字都不是实验结论。
 
 ## 本仓库补充了什么
 
@@ -22,7 +24,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 |---|---|
 | `rltt_baseline/ouro_rltt/` | 原作训练时加载 `Ouro-*-Thinking-RLTT` 模型，要求 forward 返回逐轮 log-prob、熵和 `exit_pdf`，但原仓库没有提供这份模型代码。这里按原作 actor 的调用接口重新实现 |
 | `rltt_baseline/prepare_model.py`、`fetch_model.py` | 下载固定 revision 的 Ouro-2.6B-Thinking 并核对 SHA256，再生成训练用模型目录：权重软链接，官方 `modeling_ouro.py` 改名为 `modeling_ouro_base.py` 并加 transformers 4.57 兼容修改 |
-| `rltt_baseline/prepare_data.py`、`prepare_math_train.py` | 下载并转换 MATH 训练集（7,500 题）和 MATH-500 |
+| `rltt_baseline/prepare_data.py`、`prepare_math_train.py`、`verl_data.py` | 下载 SAPD 数学训练集（DeepMath-103K 难度 ≥ 6，57,046 题，核对 SHA256）、MATH 训练集（7,500 题）和 MATH-500；`train_file` 为 verl 格式 parquet 时原样使用其中的 prompt |
 | `rltt_baseline/config.py`、`launch.py` | YAML 配置（`trainer: rltt / grpo`），支持命令行 dot-list 覆盖；`verl_overrides` 可以改任意 verl 配置 |
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
@@ -59,9 +61,10 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    bash scripts/setup_env.sh $W/.venv
    export LOOPRL_VENV=$W/.venv
    ```
-2. **数据**（MATH 训练集 7,500 题、MATH-500）：
+2. **数据**（SAPD 数学训练集 `deepmath_level6.parquet`、MATH 训练集 7,500 题、MATH-500）：
    ```bash
-   bash scripts/prepare_data.sh $W/data
+   bash scripts/prepare_data.sh $W/data      # 默认：SAPD 数据 + MATH-500，结束时打印 export 行
+   # 另加 RLTT 论文的 MATH 训练集：--datasets deepmath_level6,math500,math_train
    ```
 3. **模型**（下载 `ByteDance/Ouro-2.6B-Thinking` @ `f1edd81e` 并核对 SHA256，生成训练用目录；
    已有官方目录时加 `--source <dir>` 跳过下载）：
@@ -72,7 +75,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    ```bash
    export LOOPRL_MODEL_DIR=$W/models/Ouro-2.6B-Thinking-RLTT
    export LOOPRL_OURO_DIR=$W/models/Ouro-2.6B-Thinking        # 只有 RLTT 配置用到
-   export LOOPRL_MATH_TRAIN_JSONL=$W/data/math_train.jsonl
+   export LOOPRL_TRAIN_FILE=$W/data/deepmath_level6.parquet   # 或 $W/data/math_train.jsonl
    export LOOPRL_MATH500_JSONL=$W/data/math500.jsonl
    export LOOPRL_OUTPUT_DIR=$W/outputs/grpo_run1
    ```
@@ -89,15 +92,26 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 
 ### GRPO 8 卡配置要点（`configs/grpo_baseline_8gpu.yaml`）
 
-超参数按 RLTT 论文 Table 6（论文中 GRPO 与 RLTT 共用同一套设置），与 `configs/rltt_baseline.yaml` 一致：
+数据与长度按 SAPD，优化超参数按 RLTT 论文 Table 6（论文中 GRPO 与 RLTT 共用同一套设置），
+与 `configs/rltt_baseline.yaml` 一致：
 
-- 模型 Ouro-2.6B-Thinking 全参数，4 次循环；数据 MATH 训练集 7,500 题。
-- 每步 32 题 × 8 条 = 256 条 rollout，生成上限 2,048 tokens，temperature 1.0；梯度累积 2，
+- 模型 Ouro-2.6B-Thinking 全参数，4 次循环。
+- 数据：SAPD 的数学训练集，即 G-OPD 发布的 DeepMath-103K 难度 ≥ 6 子集（57,046 题，
+  `icemoon28/MOPD-Training-Data` 中的 `DeepMath-103K/train_filtered_level6.parquet`）。
+  prompt 用文件自带的：题目后接 “Please reason step by step, and put your final answer within
+  \boxed{}.”，单条 user 消息，再套 Ouro 的 chat template。奖励沿用 RLTT：取最后一个 `\boxed{}`，
+  用 `math_verify` 判断与标准答案是否等价，0/1。
+- prompt 上限 2,048 tokens（按 Ouro chat template，最长的题 743 tokens，没有被过滤的），
+  生成上限 16,384 tokens；每卡 token 上限 32,768（须 ≥ 2,048 + 16,384）。
+- 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 2，
   即每 64 题做一次优化器更新（mini-batch = 64 题），共 140 步（70 次更新）。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
   梯度裁剪 0.1；KL β = 0.001，按 RLTT 的方式作为 `low_var_kl` loss；clip 0.2，token-mean。
 - 每 10 步存 checkpoint（含 `hf_model`，供逐轮梯度探测）；训练中不做验证（论文如此），
-  需要时加 `args.no_validation=false`（MATH-500，3,072 tokens）。
+  需要时加 `args.no_validation=false`（MATH-500，用 RLTT prompt）。
+- 显存：Ouro 每次循环有独立的 KV cache（48 层 × 4 次 = 192 层），每 token 约 1.57 MB。
+  按此估算，vLLM 占 45% 显存时每张 H200 约能放 3.5 万 tokens 的 KV，即同时约 2 条满长度序列，
+  长回答多时 rollout 会很慢（实际数值以 vLLM 日志为准）。
 
 原作 `grpo_train.py` 与论文有四处不一致，配置里用 `verl_overrides` 改正：
 

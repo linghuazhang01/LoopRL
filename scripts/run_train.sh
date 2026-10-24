@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Train with a YAML config (RLTT or GRPO). On a Slurm cluster run it inside an allocation.
-#   LOOPRL_VENV=<venv> LOOPRL_MODEL_DIR=... LOOPRL_MATH_TRAIN_JSONL=... LOOPRL_MATH500_JSONL=... \
+#   LOOPRL_VENV=<venv> LOOPRL_MODEL_DIR=... LOOPRL_TRAIN_FILE=... LOOPRL_MATH500_JSONL=... \
 #   LOOPRL_OUTPUT_DIR=... [LOOPRL_OURO_DIR=...] bash run_train.sh <config.yaml> [dot-list overrides]
 set -euo pipefail
 CONFIG="${1:?Usage: $0 <config.yaml> [overrides...]}"
