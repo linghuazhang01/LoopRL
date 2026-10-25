@@ -101,5 +101,11 @@ verl_overrides:
   trainer:
     logger: [wandb, console]
 
+rollout:
+  # full: stock vLLM (one KV cache per loop). decode_last: prompts keep every loop's KV,
+  # generated tokens keep only the last loop's (rltt_baseline.vllm_decode_last); verl then also
+  # logs the rollout / training log-prob mismatch. Training forwards always use the full KV.
+  kv_layout: full
+
 env:
   TOKENIZERS_PARALLELISM: "false"

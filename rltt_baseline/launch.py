@@ -16,7 +16,9 @@ What this adds around the vendor script (whose files are not modified; located b
    ``MetricsRLTTActorRolloutRefWorker`` (per-loop entropy, expected exit step, total loss);
 5. a ``train_file`` ending in ``.parquet`` is used as a verl dataset with its own prompts
    (``rltt_baseline.verl_data``) instead of the vendor's MATH JSONL conversion;
-6. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
+6. ``rollout.kv_layout=decode_last`` adds the verl settings for decode_last rollouts
+   (``rltt_baseline.config.add_rollout_overrides``);
+7. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -37,6 +39,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from rltt_baseline.config import (
+    add_rollout_overrides,
     apply_verl_overrides,
     build_args,
     check_kl_not_in_reward,
@@ -158,7 +161,7 @@ def main(argv=None) -> int:
 
     args = build_args(cfg, vendor_defaults(vendor))
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
-    overrides = verl_overrides(cfg)
+    overrides = add_rollout_overrides(cfg, verl_overrides(cfg))
     check_kl_not_in_reward(cfg.trainer, overrides)
 
     resolved = {

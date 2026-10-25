@@ -26,6 +26,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/prepare_model.py`、`fetch_model.py` | 下载固定 revision 的 Ouro-2.6B-Thinking 并核对 SHA256，再生成训练用模型目录：权重软链接，官方 `modeling_ouro.py` 改名为 `modeling_ouro_base.py` 并加 transformers 4.57 兼容修改 |
 | `rltt_baseline/prepare_data.py`、`prepare_math_train.py`、`verl_data.py` | 下载 SAPD 数学训练集（DeepMath-103K 难度 ≥ 6，57,046 题，核对 SHA256）、MATH 训练集（7,500 题）和 MATH-500；`train_file` 为 verl 格式 parquet 时原样使用其中的 prompt |
 | `rltt_baseline/config.py`、`launch.py` | YAML 配置（`trainer: rltt / grpo`），支持命令行 dot-list 覆盖；`verl_overrides` 可以改任意 verl 配置 |
+| `rltt_baseline/decode_last.py`、`vllm_decode_last.py` | 可选的 rollout KV 布局 `decode_last`（`rollout.kv_layout`，默认关闭）：prompt 保留每一轮的 KV，生成的 token 只保留最后一轮的 KV。只改变 vLLM rollout，训练 forward 不变 |
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
@@ -133,10 +134,45 @@ KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` �
 
 ### 配置与覆盖
 
-配置文件有五个顶层键：`trainer`（`rltt` / `grpo`）、`args`（与所选原作脚本的 argparse 参数同名，
-未列出的用原作默认值；拼错的键或类型不符会直接报错）、`wandb`、`verl_overrides`、`env`。
+配置文件有六个顶层键：`trainer`（`rltt` / `grpo`）、`args`（与所选原作脚本的 argparse 参数同名，
+未列出的用原作默认值；拼错的键或类型不符会直接报错）、`wandb`、`verl_overrides`、`env`、
+`rollout`（`kv_layout: full | decode_last`，见下节）。
 命令行覆盖示例：`args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.run_name=try1`。
 解析后的完整配置会保存到 `<output_dir>/rltt_baseline_config.yaml`。
+
+### decode_last rollout（可选，默认关闭）
+
+`rollout.kv_layout=decode_last` 让 rollout 采用 Ouro 论文 §5.4.2 的 “last-step reuse”：
+prefill 时 prompt 的每一轮各有自己的 KV；decode 时生成的 token 跑满 4 轮，第 u 轮读 prompt 的第 u 轮 KV、
+之前生成 token 的最后一轮 KV 和自己的第 u 轮 KV，算完最后一轮后只保留最后一轮的 KV。
+默认 `full` 与原版 vLLM 完全相同；关闭只需不设或设回 `full`。
+
+```bash
+python -m rltt_baseline.launch --config configs/grpo_baseline_8gpu.yaml rollout.kv_layout=decode_last
+```
+
+打开后 launcher 自动加入以下 verl 设置（不要再手动设置冲突项，launcher 会拒绝）：
+- `actor_rollout_ref.model.external_lib` 加入 `rltt_baseline.vllm_decode_last`：worker 建 vLLM 引擎前
+  import 它，注册 `OuroDecodeLastKVForCausalLM` 并给 `GPUModelRunner._prepare_inputs` 加一个钩子；
+- `rollout.engine_kwargs.vllm`：`hf_overrides.architectures` 选这个模型类；
+  `compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}`（不用 torch.compile，纯 decode
+  批次用 CUDA graph）。因此不能同时设置 `rollout.cudagraph_capture_sizes`；
+- `rollout.calculate_log_probs=true`：verl 记录 rollout 与训练 log-prob 的差异
+  （`training/rollout_probs_diff_*`、`rollout_corr/*`），loss 不变（`rollout_correction.rollout_is` 默认为空）。
+  可用 `rollout.log_probs=false` 关掉。
+
+注意：
+- **只改 rollout。** 训练时 actor 重算 log-prob 仍用完整的逐轮 KV（teacher forcing 无法并行实现
+  decode_last），所以 rollout 分布和训练策略略有不一致，属于 off-policy。差异见上面的指标；
+  需要校正时可设 `verl_overrides.algorithm.rollout_correction.rollout_is=token`（GRPO 路径；RLTT 原作 loss
+  未接入 IS 权重）。
+- **不省显存。** 仍保留每一轮的 KV cache，只改变计算语义。
+- 哪些 token 是“生成的”按位置判断（位置 ≥ prompt 长度），在 prefix caching（同一题的 n 个样本共享 prompt
+  块）、chunked prefill 下都精确。被抢占的请求重算时，已生成的 token 在同一次 prefill 里互相读的是第 u 轮
+  KV，算完后才换成最后一轮 KV，和逐 token 生成略有差别。
+- 支持 TRITON_ATTN 与 FLASH_ATTN 后端、bf16/fp16 KV cache；其他后端或 fp8 KV 会直接报错。
+- 实验依据：RecurrentTransformer 项目 `plan/20261024_ouro_last_loop_kv/`（Ouro-2.6B-Thinking 上
+  decode_last 与完整 KV 的配对对比）。
 
 ### wandb
 
@@ -180,5 +216,6 @@ python -m pytest tests          # 需要 transformers >= 4.56 的测试会自动
 - RLTT：原作 actor 没有对 `exit_pdf` 权重做 detach，梯度会流入 exit gate；`prepare_model --detach-exit-pdf` 可关闭。
 - RLTT：不支持熵正则（`entropy_coeff` 必须为 0），逐轮熵只用于记录。
 - 少于 2 张 GPU 时原作会换用自己的单卡训练器，本仓库的配置覆盖和新增指标不会生效，因此 launcher 直接拒绝。
+- `rollout.kv_layout=decode_last` 只作用于 vLLM rollout；训练 forward 仍是完整 KV，见上文。
 - RLTT 原作的 requirements 是自身有冲突的 pip freeze（numpy 1.26.4 与 opencv-python-headless 4.12），
   `setup_env.sh` 用 `--no-deps` 按锁定版本逐个安装。

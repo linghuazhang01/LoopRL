@@ -443,3 +443,94 @@ def test_check_grpo_model_dir_refuses_official_modeling(tmp_path):
     src = _fake_source(tmp_path)
     prepare_model.build(src, built, allowed, 2048, False, False)
     check_grpo_model_dir(str(built))  # our shim has no decorator: accepted
+
+
+# ---------- decode_last rollout KV layout ----------
+
+def test_rollout_kv_layout_defaults_to_full_and_adds_nothing(env):
+    cfg = rcfg.load_config(str(CONFIG))
+    assert cfg.rollout.kv_layout == "full"
+    overrides = rcfg.verl_overrides(cfg)
+    assert rcfg.add_rollout_overrides(cfg, overrides) == overrides
+    cfg = rcfg.load_config(str(CONFIG), ["rollout.log_probs=true"])
+    rollout = rcfg.add_rollout_overrides(cfg, {})["actor_rollout_ref"]["rollout"]
+    assert rollout == {"calculate_log_probs": True}
+
+
+def test_decode_last_rollout_overrides(env):
+    from rltt_baseline import decode_last
+
+    cfg = rcfg.load_config(str(GRPO_CONFIG), [
+        "rollout.kv_layout=decode_last",
+        "verl_overrides.actor_rollout_ref.model.external_lib=my_lib"])
+    out = rcfg.add_rollout_overrides(cfg, rcfg.verl_overrides(cfg))
+    ref = out["actor_rollout_ref"]
+    assert ref["model"]["external_lib"] == ["my_lib", decode_last.LIB]
+    assert ref["rollout"]["calculate_log_probs"] is True
+    assert ref["rollout"]["engine_kwargs"]["vllm"] == {
+        "hf_overrides": {"architectures": [decode_last.ARCHITECTURE]},
+        "compilation_config": {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}}
+    assert ref["actor"]["optim"]["betas"] == [0.9, 0.99]  # the config's own overrides survive
+    cfg = rcfg.load_config(str(GRPO_CONFIG), ["rollout.kv_layout=decode_last",
+                                              "rollout.log_probs=false"])
+    out = rcfg.add_rollout_overrides(cfg, rcfg.verl_overrides(cfg))
+    assert out["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is False
+
+
+@pytest.mark.parametrize("extra, match", [
+    ("verl_overrides.actor_rollout_ref.rollout.cudagraph_capture_sizes=[1,2]", "cudagraph"),
+    ("verl_overrides.actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.mode=3",
+     "torch.compile"),
+    ("verl_overrides.actor_rollout_ref.rollout.name=sglang", "vLLM"),
+])
+def test_decode_last_refuses_conflicting_settings(env, extra, match):
+    cfg = rcfg.load_config(str(CONFIG), ["rollout.kv_layout=decode_last", extra])
+    with pytest.raises(ValueError, match=match):
+        rcfg.add_rollout_overrides(cfg, rcfg.verl_overrides(cfg))
+
+
+def test_rollout_section_is_validated(env):
+    with pytest.raises(ValueError, match="kv_layout"):
+        rcfg.load_config(str(CONFIG), ["rollout.kv_layout=last"])
+    with pytest.raises(KeyError, match="rollout"):
+        rcfg.load_config(str(CONFIG), ["rollout.layout=decode_last"])
+
+
+def test_decode_last_dry_run_carries_the_settings(env, capsys, monkeypatch):
+    from rltt_baseline import decode_last, launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(CONFIG), "--dry-run", "rollout.kv_layout=decode_last"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    ref = resolved["verl_overrides"]["actor_rollout_ref"]
+    assert ref["model"]["external_lib"] == [decode_last.LIB]
+    assert resolved["config"]["rollout"]["kv_layout"] == "decode_last"
+
+
+def test_generated_mask_uses_positions_not_query_length():
+    import numpy as np
+    from rltt_baseline.decode_last import generated_mask
+
+    # A: decoding (prompt 5, position 7); B: prompt chunk (prompt 10, positions 3-6);
+    # C: preemption recompute (prompt 4, positions 0-5);
+    # D: one recomputed prompt token after a full prefix-cache hit (prompt 16, position 15)
+    positions = np.array([7, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 15])
+    mask = generated_mask(positions, np.array([1, 4, 6, 1]), np.array([5, 10, 4, 16]))
+    assert mask.tolist() == [True, False, False, False, False,
+                             False, False, False, False, True, True, False]
+    with pytest.raises(ValueError):
+        generated_mask(positions, np.array([1, 4, 6]), np.array([5, 10, 4]))
+
+
+def test_vllm_decode_last_registers_once():
+    pytest.importorskip("vllm")
+    from rltt_baseline import decode_last, vllm_decode_last
+    from vllm import ModelRegistry
+    from vllm.v1.worker import gpu_model_runner
+
+    hook = gpu_model_runner.GPUModelRunner._prepare_inputs
+    vllm_decode_last.register()
+    assert decode_last.ARCHITECTURE in ModelRegistry.get_supported_archs()
+    assert gpu_model_runner.GPUModelRunner._prepare_inputs is hook and hook._ouro_decode_last
