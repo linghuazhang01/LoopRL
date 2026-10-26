@@ -18,7 +18,9 @@ What this adds around the vendor script (whose files are not modified; located b
    (``rltt_baseline.verl_data``) instead of the vendor's MATH JSONL conversion;
 6. ``rollout.kv_layout=decode_last`` adds the verl settings for decode_last rollouts
    (``rltt_baseline.config.add_rollout_overrides``);
-7. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
+7. ``model.num_hidden_layers``, when set, is checked against the model directories'
+   ``config.json`` (the 1.4B and 2.6B configs share ``LOOPRL_MODEL_DIR``);
+8. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -83,6 +85,20 @@ def check_grpo_model_dir(model_path: str) -> None:
     if modeling.is_file() and OFFICIAL_DECORATOR in modeling.read_text():
         raise SystemExit(f"{model_path} holds the official modeling_ouro.py, which grpo_train.py "
                          "would edit in place; pass the prepare_model output directory instead")
+
+
+def check_model_layers(args, expected) -> None:
+    """Refuse model directories whose ``config.json`` has another ``num_hidden_layers``."""
+    if expected is None:
+        return
+    dirs = [args.model_path]
+    if getattr(args, "use_rltt_model", False):
+        dirs.append(args.rltt_model_path)
+    for model_dir in dirs:
+        found = json.loads((Path(model_dir) / "config.json").read_text()).get("num_hidden_layers")
+        if found != expected:
+            raise SystemExit(f"{model_dir}: num_hidden_layers {found}, but the config expects "
+                             f"{expected} (model.num_hidden_layers); wrong model directory?")
 
 
 def install_trainer_overrides(overrides: dict) -> None:
@@ -184,6 +200,7 @@ def main(argv=None) -> int:
         n_gpus = torch.cuda.device_count()
     if n_gpus <= 1 or args.debug:
         raise SystemExit("rltt_baseline needs the vendor verl path: >= 2 GPUs and debug=false")
+    check_model_layers(args, cfg.model.get("num_hidden_layers"))
     if cfg.trainer == "grpo":
         check_grpo_model_dir(args.model_path)
     if str(args.train_file).endswith(".parquet"):

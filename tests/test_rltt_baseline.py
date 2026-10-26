@@ -342,6 +342,107 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert actor["use_kl_loss"] is True and over["algorithm"]["use_kl_in_reward"] is False
 
 
+GRPO_1P4B_CONFIG = paths.config_file("grpo_baseline_1p4b_8gpu.yaml")
+
+
+def test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation(env):
+    small = OmegaConf.to_container(rcfg.load_config(str(GRPO_1P4B_CONFIG)))
+    large = OmegaConf.to_container(rcfg.load_config(str(GRPO_CONFIG)))
+    assert small.pop("model") == {"num_hidden_layers": 24} and large.pop("model") == {}
+    assert small["wandb"].pop("tags") == ["grpo", "baseline", "ouro-1.4b-thinking",
+                                          "deepmath-level6"]
+    large["wandb"].pop("tags")
+    # one optimizer update per 32-prompt step (2.6B: two steps accumulated into one update)
+    assert small["args"].pop("gradient_accumulation_steps") == 1
+    assert large["args"].pop("gradient_accumulation_steps") == 2
+    small_actor = small["verl_overrides"]["actor_rollout_ref"]["actor"]
+    large_actor = large["verl_overrides"]["actor_rollout_ref"]["actor"]
+    assert small_actor.pop("ppo_mini_batch_size") == 32
+    assert large_actor.pop("ppo_mini_batch_size") == 64
+    assert small == large
+    assert small["args"]["n_gpus"] == 8 and small["trainer"] == "grpo"
+    assert small["args"]["max_prompt_length"] == 2048
+    assert small["args"]["max_completion_length"] == 16384
+
+
+@pytest.mark.parametrize("name", ["rltt_baseline.yaml", "grpo_baseline_8gpu.yaml",
+                                  "grpo_baseline_1p4b_8gpu.yaml"])
+def test_mini_batch_is_one_accumulated_update(env, name):
+    # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
+    cfg = rcfg.load_config(str(paths.config_file(name)))
+    actor = cfg.verl_overrides.actor_rollout_ref.actor
+    assert actor.ppo_mini_batch_size == (cfg.verl_overrides.data.train_batch_size
+                                         * cfg.args.gradient_accumulation_steps)
+
+
+def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    vendor = resolved["vendor_args"]
+    assert vendor["model_path"] == ENV["LOOPRL_MODEL_DIR"] and vendor["n_gpus"] == 8
+    assert vendor["max_steps"] == 140 and vendor["num_prompts_per_batch"] == 32
+    assert vendor["gradient_accumulation_steps"] == 1
+    assert vendor["max_completion_length"] == 16384
+    assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 32
+    assert resolved["config"]["model"] == {"num_hidden_layers": 24}
+    assert resolved["verl_overrides"]["algorithm"]["use_kl_in_reward"] is False
+    with pytest.raises(KeyError, match="unknown model keys"):
+        rcfg.load_config(str(GRPO_1P4B_CONFIG), ["model.hidden_size=2048"])
+
+
+def test_check_model_layers_refuses_the_other_model_size(tmp_path):
+    from rltt_baseline.launch import check_model_layers
+
+    for name, layers in (("small", 24), ("large", 48)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.json").write_text(json.dumps({"num_hidden_layers": layers}))
+    grpo = types.SimpleNamespace(model_path=str(tmp_path / "small"))
+    check_model_layers(grpo, 24)
+    check_model_layers(grpo, None)  # no expectation: not checked
+    with pytest.raises(SystemExit, match="num_hidden_layers 24, but the config expects 48"):
+        check_model_layers(grpo, 48)
+    rltt = types.SimpleNamespace(model_path=str(tmp_path / "small"), use_rltt_model=True,
+                                 rltt_model_path=str(tmp_path / "large"))
+    with pytest.raises(SystemExit, match="large"):
+        check_model_layers(rltt, 24)
+
+
+def test_fetch_model_pins_and_1p4b_build(tmp_path, monkeypatch):
+    from rltt_baseline import fetch_model
+
+    vendor = paths.ouro_source_dir()
+    pins = fetch_model.MODELS["2.6B"]["sha256"]
+    for name in ("modeling_ouro.py", "configuration_ouro.py", "config.json"):
+        assert prepare_model.sha256(vendor / name) == pins[name]
+    assert fetch_model.MODELS["1.4B"]["repo_id"] == "ByteDance/Ouro-1.4B-Thinking"
+
+    # a 1.4B-like source: vendored files with whitespace changes, pinned by their own SHA256
+    src = tmp_path / "official"
+    src.mkdir()
+    for name in ("modeling_ouro.py", "configuration_ouro.py", "config.json"):
+        (src / name).write_text((vendor / name).read_text() + "\n")
+    (src / "model.safetensors").write_bytes(b"weights")
+    spec = {"repo_id": "ByteDance/Ouro-1.4B-Thinking", "revision": "r",
+            "sha256": {name: prepare_model.sha256(src / name) for name in
+                       ("model.safetensors", "modeling_ouro.py", "configuration_ouro.py",
+                        "config.json")}}
+    monkeypatch.setitem(fetch_model.MODELS, "1.4B", spec)
+    out = tmp_path / "models"
+    assert fetch_model.main(["--out", str(out), "--model", "1.4B", "--source", str(src)]) == 0
+    built = out / "Ouro-1.4B-Thinking-RLTT"
+    assert (built / "model.safetensors").is_symlink()
+    record = json.loads((out / "fetch_model_manifest_1.4B.json").read_text())
+    assert record["repo_id"] == spec["repo_id"] and record["model_dir"] == str(built)
+    (src / "config.json").write_text("{}")
+    with pytest.raises(SystemExit, match="SHA256"):
+        fetch_model.main(["--out", str(out), "--model", "1.4B", "--source", str(src)])
+
+
 # ---------- verl parquet training data (SAPD prompts) ----------
 
 def _verl_rows():

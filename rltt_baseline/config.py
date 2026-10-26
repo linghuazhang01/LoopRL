@@ -25,6 +25,10 @@ A config file has these top-level keys:
     vLLM's sampled-token log-probs, so verl logs the rollout / training mismatch
     (``training/rollout_probs_diff_*``, ``rollout_corr/*``) without changing the loss.
     Training forwards always use the full per-loop KV.
+``model``
+    ``num_hidden_layers`` (optional): the launcher checks it against ``config.json`` of the model
+    directories before training, so a config for one Ouro size cannot run with the other's
+    weights (both read ``LOOPRL_MODEL_DIR``). Ouro-1.4B-Thinking has 24, Ouro-2.6B-Thinking 48.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
 ``args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.mode=online``.
@@ -39,12 +43,13 @@ from omegaconf import DictConfig, OmegaConf
 
 from rltt_baseline import decode_last
 
-SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout")
-DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout")
+SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model")
+DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
 ROLLOUT_KEYS = {"kv_layout", "log_probs"}
+MODEL_KEYS = {"num_hidden_layers"}
 KV_LAYOUTS = ("full", "decode_last")
 # Vendor default of verl ``algorithm.use_kl_in_reward``: the GRPO script adds the KL to the
 # reward, the RLTT script uses a KL loss. This project never puts the KL in the reward.
@@ -69,6 +74,9 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
     bad = set(cfg.rollout.keys()) - ROLLOUT_KEYS
     if bad:
         raise KeyError(f"unknown rollout keys {sorted(bad)}; allowed {sorted(ROLLOUT_KEYS)}")
+    bad = set(cfg.model.keys()) - MODEL_KEYS
+    if bad:
+        raise KeyError(f"unknown model keys {sorted(bad)}; allowed {sorted(MODEL_KEYS)}")
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
     if cfg.rollout.kv_layout not in KV_LAYOUTS:
