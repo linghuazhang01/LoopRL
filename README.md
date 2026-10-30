@@ -43,6 +43,7 @@ configs/grpo_baseline_8gpu.yaml  GRPO 8 卡训练配置
 configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
+scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
 tests/                      单元测试与 tiny 模型集成测试
 third_party/RLTT            原作仓库（submodule，固定 commit）
 third_party/ouro_source     官方 Ouro modeling 文件（Apache-2.0，见该目录 README）
@@ -130,6 +131,22 @@ KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` �
 梯度累积 2 时共 70 次更新，所以实际 warmup 占前 14 次更新（20%）。原作也是这样，这里不改。
 - 原作 `grpo_train.py` 会**原地修改**模型目录里的 `modeling_ouro.py`。launcher 只接受
   `prepare_model` 生成的目录，拒绝官方目录，避免改动共享的模型文件。
+
+### 数据过滤采样（`scripts/deepmath_filter_portable/`）
+
+GRPO 数据过滤：用 Ouro-1.4B-Thinking 在 D4 上对训练集每题采 4 次，过滤依据是 4 次中答对几次。这里是其中 `rest45k` 批次的便携采样脚本，覆盖随机 12,000 题以外的全部 45,046 题，共 180,184 条样本。脚本只依赖 vLLM，不依赖 `rltt_baseline`，可以单独拷到别的机器上。
+
+仓库不含题目文件。先用 CPU 从训练 parquet 生成，需要 numpy、pandas、pyarrow：
+
+```bash
+python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" \
+    --n 12000 --seed 20261028 --out /tmp/deepmath_filter12k
+python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" --rest \
+    --out scripts/deepmath_filter_portable/data \
+    --exclude /tmp/deepmath_filter12k/sample12000.jsonl
+```
+
+`sample.py` 启动时核对题目文件的 SHA256（`d942f80b…a052`），不一致会拒绝运行。之后在 `scripts/deepmath_filter_portable/` 目录下按该目录的 README 操作，开始前先跑 `--smoke`。
 
 ### 配置与覆盖
 

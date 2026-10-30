@@ -6,3 +6,6 @@ __pycache__/
 .ruff_cache/
 outputs/
 wandb/
+scripts/deepmath_filter_portable/data/
+scripts/deepmath_filter_portable/logs/
+scripts/deepmath_filter_portable/model_*/
