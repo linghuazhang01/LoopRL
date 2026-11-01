@@ -8,7 +8,9 @@ transformers on PYTHONPATH, e.g. a ``uv pip install --target`` directory:
 import inspect
 import json
 import shutil
+import types
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -17,7 +19,7 @@ transformers = pytest.importorskip("transformers")
 if tuple(int(x) for x in transformers.__version__.split(".")[:2]) < (4, 56):
     pytest.skip("Ouro modeling needs transformers >= 4.56", allow_module_level=True)
 
-from rltt_baseline import paths, prepare_model  # noqa: E402
+from rltt_baseline import loop_audit, paths, prepare_model  # noqa: E402
 
 VENDOR = paths.ouro_source_dir()
 TINY = {"vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 2,
@@ -125,3 +127,46 @@ def test_rltt_loss_backpropagates_to_backbone_and_gate(models):
     loss.backward()
     assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
     assert rltt.model.early_exit_gate.weight.grad.abs().sum() > 0  # exit_pdf not detached
+
+
+class _OuroActor:
+    """The standard-path ``compute_log_prob`` of a verl actor, padded forward."""
+
+    def __init__(self, module):
+        self.actor_module = module
+
+    def _forward_micro_batch(self, micro_batch, temperature):
+        return self.actor_module(input_ids=micro_batch["input_ids"],
+                                 attention_mask=micro_batch["attention_mask"],
+                                 position_ids=micro_batch["position_ids"], use_cache=False).logits
+
+    def compute_log_prob(self, data):
+        with torch.no_grad():
+            return self._forward_micro_batch(data.batch, data.meta_info["temperature"])
+
+
+def test_loop_audit_reads_the_loops_of_the_real_model(models, tmp_path):
+    _, rltt = models
+    ids, mask, pos, labels = _inputs()
+    response_length = 3
+    actor = _OuroActor(rltt)
+    loop_audit.attach_loop_audit(actor, {"dir": str(tmp_path), "every_n_steps": 1, "top_k": 4,
+                                         "save_tokens": True, "chunk_tokens": 2}, rank=0)
+    data = types.SimpleNamespace(
+        meta_info={"temperature": 0.8},
+        batch={"input_ids": ids, "attention_mask": mask, "position_ids": pos,
+               "responses": ids[:, -response_length:]})
+    logits = actor.compute_log_prob(data=data)
+    with torch.no_grad():
+        out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+                   return_per_loop_log_probs=True, log_prob_labels=labels,
+                   log_prob_temperature=0.8)
+    columns = slice(ids.size(1) - response_length - 1, -1)
+    with np.load(tmp_path / "step_000001" / "tokens_rank00.npz") as shard:
+        for t in range(4):
+            torch.testing.assert_close(torch.from_numpy(shard["sampled_log_prob"][:, t]),
+                                       out.per_loop_log_probs[t][:, columns].flatten())
+            torch.testing.assert_close(torch.from_numpy(shard["entropy"][:, t]),
+                                       out.per_loop_entropies[t][:, columns].flatten())
+        final_top = logits[:, columns].flatten(0, 1).topk(4, dim=-1).indices
+        assert torch.equal(torch.from_numpy(shard["topk_ids"][:, -1].astype(np.int64)), final_top)

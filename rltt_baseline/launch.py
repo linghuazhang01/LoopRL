@@ -20,7 +20,10 @@ What this adds around the vendor script (whose files are not modified; located b
    (``rltt_baseline.config.add_rollout_overrides``);
 7. ``model.num_hidden_layers``, when set, is checked against the model directories'
    ``config.json`` (the 1.4B and 2.6B configs share ``LOOPRL_MODEL_DIR``);
-8. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``.
+8. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``;
+9. ``audit.loop_distribution.enabled`` writes per-loop token distributions to
+   ``<output_dir>/audit/`` (``rltt_baseline.loop_audit``); for GRPO it also selects
+   ``AuditGRPOActorRolloutRefWorker``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -41,6 +44,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from rltt_baseline.config import (
+    add_audit_overrides,
     add_rollout_overrides,
     apply_verl_overrides,
     build_args,
@@ -142,7 +146,15 @@ def install_metrics_worker() -> None:
     verl_rltt.RLTTActorRolloutRefWorker = MetricsRLTTActorRolloutRefWorker
 
 
-def install_reasoning_metrics(args) -> None:
+def install_grpo_audit_worker() -> None:
+    import verl_grpo
+
+    from rltt_baseline.grpo_workers import AuditGRPOActorRolloutRefWorker
+
+    verl_grpo.GRPOActorRolloutRefWorker = AuditGRPOActorRolloutRefWorker
+
+
+def install_reasoning_metrics(args, loop_audit=None) -> None:
     from math_utils import extract_boxed_answer
 
     from rltt_baseline.metrics import install_driver_metrics
@@ -160,7 +172,8 @@ def install_reasoning_metrics(args) -> None:
             )
         return tokenizer["tok"].decode(token_ids, skip_special_tokens=True)
 
-    install_driver_metrics(decode=decode, extract_answer=extract_boxed_answer)
+    install_driver_metrics(decode=decode, extract_answer=extract_boxed_answer,
+                           loop_audit=loop_audit)
 
 
 def main(argv=None) -> int:
@@ -177,8 +190,9 @@ def main(argv=None) -> int:
 
     args = build_args(cfg, vendor_defaults(vendor))
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
-    overrides = add_rollout_overrides(cfg, verl_overrides(cfg))
+    overrides = add_audit_overrides(cfg, add_rollout_overrides(cfg, verl_overrides(cfg)), args)
     check_kl_not_in_reward(cfg.trainer, overrides)
+    loop_audit = (overrides.get("actor_rollout_ref") or {}).get("loop_audit")
 
     resolved = {
         "trainer": cfg.trainer,
@@ -219,7 +233,9 @@ def main(argv=None) -> int:
     install_parquet_train_data()
     if cfg.trainer == "rltt":
         install_metrics_worker()
-    install_reasoning_metrics(args)
+    elif loop_audit:
+        install_grpo_audit_worker()
+    install_reasoning_metrics(args, loop_audit)
     vendor.main()
     return 0
 

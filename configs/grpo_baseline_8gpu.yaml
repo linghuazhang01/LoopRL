@@ -109,3 +109,13 @@ rollout:
 
 env:
   TOKENIZERS_PARALLELISM: "false"
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. Off by default: about 220 bytes per token before compression.
+  loop_distribution:
+    enabled: false
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory

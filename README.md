@@ -29,6 +29,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/decode_last.py`、`vllm_decode_last.py` | 可选的 rollout KV 布局 `decode_last`（`rollout.kv_layout`，默认关闭）：prompt 保留每一轮的 KV，生成的 token 只保留最后一轮的 KV。只改变 vLLM rollout，训练 forward 不变 |
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
+| `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 可选的逐轮分布审计（`audit.loop_distribution`，默认关闭）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
 | `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
 
@@ -42,6 +43,8 @@ factory，官方 `modeling_ouro.py` 直接加载会报 `wrapped_fn() got an unex
 rltt_baseline/              适配代码（Python 包）
 configs/grpo_baseline_8gpu.yaml  GRPO 8 卡训练配置（Ouro-2.6B-Thinking）
 configs/grpo_baseline_1p4b_8gpu.yaml  GRPO 8 卡训练配置（Ouro-1.4B-Thinking，生成 16K，每步更新一次）
+configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml  同 grpo_baseline_8gpu，打开逐轮分布审计
+configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml  同 grpo_baseline_1p4b_8gpu，打开逐轮分布审计
 configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
@@ -218,6 +221,80 @@ verl 自带：`critic/score/mean`（平均奖励）、`response_length/*`（含 
 
 RLTT 另有原作的 `rltt/loop_<t>_log_prob`、各轮退出概率，以及本仓库新增的
 `rltt/loop_<t>_entropy`、`rltt/expected_exit_step`、`actor/total_loss`。
+
+### 逐轮分布审计
+
+采样只用最后一轮，但每一轮 t 都有自己的下一 token 分布
+`P^(t) = softmax(lm_head(h_t) / temperature)`。打开审计后，每个审计步对每个生成 token
+记录各轮分布的差异，GRPO 和 RLTT 都支持：
+
+```yaml
+audit:
+  loop_distribution:
+    enabled: true
+    every_n_steps: 1    # 审计第 1、1+n、1+2n... 步
+    top_k: 5
+    save_tokens: true   # false 时不留逐 token 数组，只留 summary.json 和 responses.jsonl
+    chunk_tokens: 512   # 每次 lm_head 处理的 token 数；显存不够时调小
+```
+
+也可以在命令行写 `audit.loop_distribution.enabled=true`。默认关闭，关闭时不装 hook，GRPO
+仍用原作的 worker。
+
+`configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml` 和 `configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml`
+是已经打开审计的配置，与对应的基线配置只差这个开关和 wandb 标签 `loop-audit`（2.6B 另加
+`model.num_hidden_layers: 48`，防止误用 1.4B 模型目录）：
+
+```bash
+bash scripts/run_train.sh configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml
+bash scripts/run_train.sh configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml
+```
+
+输出在 `<output_dir>/audit/step_<step>/`：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.json` | 全步所有 token 汇总的 mean、p5、p95，以及 token 数、回答数、错误记录 |
+| `responses.jsonl` | 每条回答一行：`uid`、`rank`、`index`、长度、reward、是否答对、是否截断，以及该回答的 mean、p5、p95 |
+| `tokens_rank<r>.npz` | 逐 token 数组：`kl` (n, T, T)、`entropy`、`sampled_log_prob` (n, T)、`topk_ids`、`topk_probs` (n, T, k)、`sampled_token` |
+
+| 指标 | 含义 |
+|---|---|
+| `kl/<t>_<s>` | KL(P^(t) \|\| P^(s))，单位 nat；所有有序轮次对，共 12 项 |
+| `entropy/loop_<t>` | 第 t 轮分布的熵 |
+| `sampled_log_prob/loop_<t>` | 实际采样的 token 在第 t 轮的 log-prob |
+| `top1_prob/loop_<t>`、`topk_mass/loop_<t>` | 第 t 轮最大概率、前 k 个 token 的概率和 |
+| `top1_agree/<t>_<s>`、`topk_overlap/<t>_<s>` | 两轮 top-1 是否相同、top-k 集合的重合比例 |
+
+同样的统计也写入 wandb：`loop_audit/<指标>/<mean|p5|p95>`。读取某条回答的逐 token 结果
+（`rank`、`index` 来自 `responses.jsonl`）：
+
+```python
+from transformers import AutoTokenizer
+from rltt_baseline.loop_audit import read_response
+
+tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+token = read_response("<output_dir>/audit/step_000001", rank=0, index=3, tokenizer=tokenizer)
+token["kl"][17, 0, 3]              # 第 18 个 token 上的 KL(P^(1) || P^(4))
+token["topk_tokens"][17][0]        # 第 18 个 token 上第 1 轮的 top-5 token
+token["topk_probs"][17, 0]         # 对应的概率
+```
+
+- **不增加前向。** 审计读取 `compute_log_prob` 那次前向的逐轮 hidden state，只多算 `lm_head`。
+  多加一次前向时，每层 FSDP 都要做 collective，各 rank 的前向次数必须相同；`lm_head` 属于 root
+  FSDP 单元，各 rank 调用次数不同也不会卡住。
+- **不存完整分布。** 一个词表的 float32 约 200 KB，每个 token 四轮约 800 KB，所以只存 top-k。
+- **磁盘。** 压缩前每个 token 约 218 字节（四轮、top-5）。256 条回答、平均 7,738 token
+  时约 430 MB/步，140 步约 60 GB；压缩比尚未在真实数据上测过。用 `every_n_steps` 或
+  `save_tokens: false` 减少占用。
+- **前几轮是假设分布。** 实际采样只来自最后一轮；其余各轮表示“在这个上下文下若停在第 t 轮”的分布，
+  上下文都是实际生成的 token。
+- **分布来自训练 forward。** 这次前向使用完整的逐轮 KV，`decode_last` rollout 时也一样，所以
+  审计的最后一轮不等于 `decode_last` 实际采样时用的分布。
+- **自检。** `last_loop_log_prob_gap` 比较审计的最后一轮与 verl 的 `old_log_probs`，应接近 0；
+  `unmatched_responses` 是对不上 driver batch 的回答数，应为 0。
+- **失败不影响训练。** 审计出错时写 `error_rank<r>.txt`，并记录在 `summary.json`，训练继续。
+- 审计按调用次数从第 1 步计数，因此 `resume_mode` 不是 `disable` 或启用 LoRA 时会拒绝启动。
 
 ### 逐轮梯度探测
 

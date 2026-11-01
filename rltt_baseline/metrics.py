@@ -18,6 +18,9 @@ reasoning RL. All keys are prefixed ``reasoning/``:
   extractor is given;
 - ``nonzero_adv_token_ratio``: response tokens with |advantage| > 1e-8, when advantages exist;
 - ``accuracy/level_<k>``: accuracy by MATH level, when ``extra_info`` carries ``level``.
+
+With ``audit.loop_distribution`` the same wrapper also finalizes the step's per-loop audit and
+adds its ``loop_audit/*`` statistics (``rltt_baseline.loop_audit``).
 """
 
 from collections import defaultdict
@@ -25,6 +28,8 @@ from typing import Callable, Dict, Optional, Sequence
 
 import numpy as np
 import torch
+
+from rltt_baseline.loop_audit import finalize_pending
 
 PREFIX = "reasoning/"
 
@@ -137,11 +142,13 @@ def batch_reasoning_metrics(
     )
 
 
-def install_driver_metrics(decode=None, extract_answer=None, correct_threshold: float = 0.5):
+def install_driver_metrics(decode=None, extract_answer=None, correct_threshold: float = 0.5,
+                           loop_audit: Optional[dict] = None):
     """Wrap ``verl.trainer.ppo.metric_utils.compute_data_metrics`` to add reasoning metrics.
 
     The RLTT trainer imports ``compute_data_metrics`` inside ``fit`` from the module, so the
-    wrapper must be installed before ``fit`` runs. Returns the original function.
+    wrapper must be installed before ``fit`` runs. ``loop_audit`` is the
+    ``actor_rollout_ref.loop_audit`` setting, or None. Returns the original function.
     """
     from verl.trainer.ppo import metric_utils
 
@@ -152,6 +159,9 @@ def install_driver_metrics(decode=None, extract_answer=None, correct_threshold: 
     def compute_data_metrics(batch, use_critic: bool = True):
         metrics = original(batch=batch, use_critic=use_critic)
         metrics.update(batch_reasoning_metrics(batch, decode, extract_answer, correct_threshold))
+        if loop_audit:
+            metrics.update(finalize_pending(loop_audit["dir"], batch, correct_threshold,
+                                            loop_audit["save_tokens"]))
         return metrics
 
     compute_data_metrics._rltt_reasoning_wrapped = True

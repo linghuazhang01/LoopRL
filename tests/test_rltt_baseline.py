@@ -395,6 +395,37 @@ def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
         rcfg.load_config(str(GRPO_1P4B_CONFIG), ["model.hidden_size=2048"])
 
 
+def test_dry_run_with_the_loop_audit_switched_on(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run",
+                        "audit.loop_distribution.enabled=true"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    audit = resolved["verl_overrides"]["actor_rollout_ref"]["loop_audit"]
+    assert audit["dir"] == ENV["LOOPRL_OUTPUT_DIR"] + "/audit" and audit["top_k"] == 5
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert "loop_audit" not in resolved["verl_overrides"]["actor_rollout_ref"]
+
+
+@pytest.mark.parametrize("name", ["grpo_baseline_1p4b_8gpu_loop_audit.yaml",
+                                  "grpo_baseline_2p6b_8gpu_loop_audit.yaml"])
+def test_loop_audit_configs_dry_run(env, capsys, monkeypatch, name):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(paths.config_file(name)), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    audit = resolved["verl_overrides"]["actor_rollout_ref"]["loop_audit"]
+    assert audit == {"every_n_steps": 1, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
+                     "dir": ENV["LOOPRL_OUTPUT_DIR"] + "/audit"}
+
+
 def test_check_model_layers_refuses_the_other_model_size(tmp_path):
     from rltt_baseline.launch import check_model_layers
 

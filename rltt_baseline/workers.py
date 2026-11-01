@@ -24,6 +24,8 @@ from verl.utils.py_functional import append_to_dict
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl_rltt.rltt_actor import RLTTDataParallelPPOActor
 
+from rltt_baseline.loop_audit import attach_loop_audit
+
 
 class MetricsRLTTActor(RLTTDataParallelPPOActor):
     def __init__(self, *args, **kwargs):
@@ -111,6 +113,7 @@ class MetricsRLTTActorRolloutRefWorker(ActorRolloutRefWorker):
                 learned_weights_temp=self.learned_weights_temp,
                 learned_weights_lr=self.learned_weights_lr,
             )
+            attach_loop_audit(self.actor, self.config.get("loop_audit"), self.rank)
             if self.rank == 0:
                 print(f"[rltt_baseline] MetricsRLTTActor loop_weighting={self.loop_weighting} "
                       f"pid={os.getpid()} python={sys.executable}", flush=True)

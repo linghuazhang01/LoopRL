@@ -29,6 +29,12 @@ A config file has these top-level keys:
     ``num_hidden_layers`` (optional): the launcher checks it against ``config.json`` of the model
     directories before training, so a config for one Ouro size cannot run with the other's
     weights (both read ``LOOPRL_MODEL_DIR``). Ouro-1.4B-Thinking has 24, Ouro-2.6B-Thinking 48.
+``audit``
+    ``loop_distribution``: per-loop token distributions on every response token, written to
+    ``<output_dir>/audit/step_<step>/`` (``rltt_baseline.loop_audit``). Keys: ``enabled``
+    (default false), ``every_n_steps`` (default 1; steps 1, 1 + n, ...), ``top_k`` (default 5),
+    ``save_tokens`` (default true; false keeps ``summary.json`` and ``responses.jsonl`` only),
+    ``chunk_tokens`` (default 512; response tokens per ``lm_head`` call).
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
 ``args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.mode=online``.
@@ -37,19 +43,23 @@ Values may use ``${oc.env:VAR}`` interpolation.
 
 import argparse
 import difflib
+import os
 from typing import Dict, List, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
 from rltt_baseline import decode_last
 
-SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model")
-DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model")
+SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit")
+DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
 ROLLOUT_KEYS = {"kv_layout", "log_probs"}
 MODEL_KEYS = {"num_hidden_layers"}
+AUDIT_KEYS = {"loop_distribution"}
+LOOP_AUDIT_DEFAULTS = {"enabled": False, "every_n_steps": 1, "top_k": 5, "save_tokens": True,
+                       "chunk_tokens": 512}
 KV_LAYOUTS = ("full", "decode_last")
 # Vendor default of verl ``algorithm.use_kl_in_reward``: the GRPO script adds the KL to the
 # reward, the RLTT script uses a KL loss. This project never puts the KL in the reward.
@@ -77,6 +87,10 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
     bad = set(cfg.model.keys()) - MODEL_KEYS
     if bad:
         raise KeyError(f"unknown model keys {sorted(bad)}; allowed {sorted(MODEL_KEYS)}")
+    bad = set(cfg.audit.keys()) - AUDIT_KEYS
+    if bad:
+        raise KeyError(f"unknown audit keys {sorted(bad)}; allowed {sorted(AUDIT_KEYS)}")
+    check_loop_audit(cfg.audit.get("loop_distribution"))
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
     if cfg.rollout.kv_layout not in KV_LAYOUTS:
@@ -84,6 +98,22 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
                          f"{cfg.rollout.kv_layout!r}")
     OmegaConf.resolve(cfg)
     return cfg
+
+
+def check_loop_audit(audit) -> None:
+    if audit is None:
+        return
+    bad = set(audit.keys()) - set(LOOP_AUDIT_DEFAULTS)
+    if bad:
+        raise KeyError(f"unknown audit.loop_distribution keys {sorted(bad)}; "
+                       f"allowed {sorted(LOOP_AUDIT_DEFAULTS)}")
+    for name, value in audit.items():
+        if isinstance(LOOP_AUDIT_DEFAULTS[name], bool):
+            if not isinstance(value, bool):
+                raise TypeError(f"audit.loop_distribution.{name} must be a bool, got {value!r}")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"audit.loop_distribution.{name} must be a positive int, "
+                             f"got {value!r}")
 
 
 def _coerce(name: str, value, default):
@@ -222,6 +252,24 @@ def add_rollout_overrides(cfg: DictConfig, overrides: dict) -> dict:
             "engine_kwargs": {"vllm": {
                 "hf_overrides": {"architectures": [decode_last.ARCHITECTURE]},
                 "compilation_config": dict(decode_last.COMPILATION)}}}}})
+
+
+def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
+    """``overrides`` plus ``actor_rollout_ref.loop_audit`` when the per-loop audit is on.
+
+    The workers count audited steps from 1, and LoRA adds a second ``compute_log_prob`` per step
+    (the reference pass), so both resuming and LoRA are refused rather than mislabelling steps.
+    """
+    settings = OmegaConf.to_container(cfg.audit.get("loop_distribution") or {}, resolve=True)
+    settings = {**LOOP_AUDIT_DEFAULTS, **settings}
+    if not settings.pop("enabled"):
+        return overrides
+    if not args.no_lora:
+        raise ValueError("audit.loop_distribution needs no_lora=true")
+    if (overrides.get("trainer") or {}).get("resume_mode", "disable") != "disable":
+        raise ValueError("audit.loop_distribution counts steps from 1 and cannot resume a run")
+    settings["dir"] = os.path.join(os.path.abspath(str(args.output_dir)), "audit")
+    return _deep_merge(overrides, {"actor_rollout_ref": {"loop_audit": settings}})
 
 
 def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:
