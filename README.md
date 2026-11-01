@@ -50,6 +50,7 @@ configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
 scripts/deepmath_filter_results/   过滤采样的判分与训练子集导出（见该目录的 README）
+data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/  过滤后的训练集，2,865 题（见下文“过滤后的训练集”）
 scripts/deepmath_filter_a100/      12K 过滤采样 A100 分担时的脚本，只作记录（见该目录的 README）
 tests/                      单元测试与 tiny 模型集成测试
 third_party/RLTT            原作仓库（submodule，固定 commit）
@@ -167,7 +168,7 @@ checkpoint、显存参数）都相同，测试 `test_grpo_1p4b_config_matches_2p
 
 GRPO 数据过滤：用 Ouro-1.4B-Thinking 在 D4 上对训练集每题采 4 次，过滤依据是 4 次中答对几次。这里是其中 `rest45k` 批次的便携采样脚本，覆盖随机 12,000 题以外的全部 45,046 题，共 180,184 条样本。脚本只依赖 vLLM，不依赖 `rltt_baseline`，可以单独拷到别的机器上。
 
-仓库不含题目文件。先用 CPU 从训练 parquet 生成，需要 numpy、pandas、pyarrow：
+仓库不含 `rest45k` 的题目文件。先用 CPU 从训练 parquet 生成，需要 numpy、pandas、pyarrow：
 
 ```bash
 python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" \
@@ -178,6 +179,16 @@ python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" -
 ```
 
 `sample.py` 启动时核对题目文件的 SHA256（`d942f80b…a052`），不一致会拒绝运行。之后在 `scripts/deepmath_filter_portable/` 目录下按该目录的 README 操作，开始前先跑 `--smoke`。
+
+### 过滤后的训练集
+
+`data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/` 是 12,000 题过滤后留下的 2,865 题，parquet 与原训练集同 schema，可以直接用于训练：
+
+```bash
+export LOOPRL_TRAIN_FILE=$PWD/data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/train_filtered_level6_passes1to3_no_yesno_01_truefalse.parquet
+```
+
+140 步 × 32 题需要 4,480 题，这份只够约 89 步不重复。规则和构成见该目录的 README。
 
 ### 配置与覆盖
 

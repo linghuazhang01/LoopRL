@@ -1,0 +1,30 @@
+{
+ "rule": "1 <= correct out of 4 <= 3",
+ "dropped_answer_types": [
+  "yes_no",
+  "zero_one"
+ ],
+ "dropped_true_false": true,
+ "source": "G-OPD DeepMath-103K/train_filtered_level6.parquet",
+ "source_sha256": "de3350fdd00bc0410550098ea65179e2be873da99e4075f80de575fc17670597",
+ "source_rows": 57046,
+ "sample_file": "code/data/processed/deepmath_level6_filter12k/sample12000.jsonl",
+ "sample_sha256": "1d0ccfe21d3ef67b5e70bd9a68cae6a0b3827936d017f5aded0fdb9436f543db",
+ "passes_file": "plan/20261028_deepmath_filter_1p4b/final_20261101/passes.csv",
+ "passes_sha256": "f21c0eb549c34bc3ca2219b8c5a3c1b5602b789f11e76d4514c2bc1afc542526",
+ "problems_graded": 12000,
+ "problems_kept": 2865,
+ "kept_by_passes": {
+  "1": 722,
+  "2": 854,
+  "3": 1289
+ },
+ "kept_by_answer_type": {
+  "integer": 843,
+  "other": 2022
+ },
+ "parquet": "train_filtered_level6_passes1to3_no_yesno_01_truefalse.parquet",
+ "parquet_sha256": "499634cd1ab7406ebc8ccee106d6f986c84061970520f1a243598de9e2d5bc85",
+ "jsonl": "sample2865.jsonl",
+ "jsonl_sha256": "40647a32adb8e2032944460fe61eb811604c7f7c9abbb11e0b96bf6bc518f245"
+}
