@@ -44,6 +44,7 @@ configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
+scripts/deepmath_filter_results/   过滤采样的判分与训练子集导出（见该目录的 README）
 tests/                      单元测试与 tiny 模型集成测试
 third_party/RLTT            原作仓库（submodule，固定 commit）
 third_party/ouro_source     官方 Ouro modeling 文件（Apache-2.0，见该目录 README）
