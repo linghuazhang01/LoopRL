@@ -170,3 +170,46 @@ def test_loop_audit_reads_the_loops_of_the_real_model(models, tmp_path):
                                        out.per_loop_entropies[t][:, columns].flatten())
         final_top = logits[:, columns].flatten(0, 1).topk(4, dim=-1).indices
         assert torch.equal(torch.from_numpy(shard["topk_ids"][:, -1].astype(np.int64)), final_top)
+
+
+def test_plc_losses_on_the_real_per_loop_outputs(models):
+    """PLC policy loss reaches the backbone only; the gate is trained by the gate loss alone."""
+    from rltt_baseline import plc
+
+    _, rltt = models
+    ids, mask, pos, labels = _inputs()
+    response_length = 4
+    window = slice(-response_length - 1, -1)
+    response_mask = mask[:, -response_length:].float()
+    adv = torch.tensor([1.0, -1.0])
+
+    def forward():
+        out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+                   return_per_loop_log_probs=True, return_exit_pdf=True, log_prob_labels=labels)
+        ell = torch.stack([lp[:, window] for lp in out.per_loop_log_probs], dim=-1).float()
+        return ell, out.exit_pdf[:, window, :].float()
+
+    with torch.no_grad():
+        ell_old, pdf_old = forward()
+    logq = plc.loop_prior_logq("exit", ell_old.shape[-1], exit_pdf=pdf_old)
+    weights = plc.compute_loop_weights(ell_old, logq, gamma=1.0)
+    assert torch.allclose(weights.sum(-1), torch.ones(2, response_length), atol=1e-5)
+    joint = pdf_old * ell_old.exp()
+    assert torch.allclose(weights, joint / joint.sum(-1, keepdim=True), atol=1e-5)
+
+    rltt.zero_grad()
+    ell_new, pdf_new = forward()
+    assert torch.allclose(ell_new[..., -1], ell_old[..., -1], atol=1e-5)   # same policy
+    pg_loss, _ = plc.plc_policy_loss(ell_new, ell_old, adv, response_mask, weights, lam=1.0,
+                                     clip_ratio=0.2)
+    pg_loss.backward()
+    assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+    assert rltt.model.early_exit_gate.weight.grad is None  # weights are detached
+
+    rltt.zero_grad()
+    _, pdf_new = forward()
+    g_loss, metrics = plc.gate_loss(pdf_new, weights, adv, response_mask, gate_coef=1.0,
+                                    gate_entropy_coef=0.05)
+    g_loss.backward()
+    assert rltt.model.early_exit_gate.weight.grad.abs().sum() > 0
+    assert metrics["gate/kl_w_q_mean"] >= 0 and 1.0 <= metrics["gate/expected_exit_step"] <= 4

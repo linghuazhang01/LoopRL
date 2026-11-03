@@ -35,6 +35,14 @@ A config file has these top-level keys:
     (default false), ``every_n_steps`` (default 1; steps 1, 1 + n, ...), ``top_k`` (default 5),
     ``save_tokens`` (default true; false keeps ``summary.json`` and ``responses.jsonl`` only),
     ``chunk_tokens`` (default 512; response tokens per ``lm_head`` call).
+``plc``
+    Posterior Loop Credit (``rltt_baseline.plc``), ``trainer: rltt`` only. Keys and defaults are
+    the fields of ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (posterior | rltt),
+    ``prior`` (uniform | progressive | exit), ``progressive_alpha``, ``gamma`` (1; 0 = RLTT),
+    ``lam`` (1; 0 = GRPO), ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
+    ``gate_coef``, ``gate_entropy_coef``, ``use_is_correction``, ``is_clip``,
+    ``log_weight_stats``. When enabled the section is passed to the workers as
+    ``actor_rollout_ref.actor.plc`` and the launcher uses ``PLCActorRolloutRefWorker``.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
 ``args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.mode=online``.
@@ -49,9 +57,11 @@ from typing import Dict, List, Optional
 from omegaconf import DictConfig, OmegaConf
 
 from rltt_baseline import decode_last
+from rltt_baseline.plc import PLCSettings
 
-SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit")
-DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit")
+SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit",
+            "plc")
+DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit", "plc")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
@@ -91,6 +101,7 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
     if bad:
         raise KeyError(f"unknown audit keys {sorted(bad)}; allowed {sorted(AUDIT_KEYS)}")
     check_loop_audit(cfg.audit.get("loop_distribution"))
+    plc_settings(cfg)  # validates the plc section
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
     if cfg.rollout.kv_layout not in KV_LAYOUTS:
@@ -270,6 +281,32 @@ def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespa
         raise ValueError("audit.loop_distribution counts steps from 1 and cannot resume a run")
     settings["dir"] = os.path.join(os.path.abspath(str(args.output_dir)), "audit")
     return _deep_merge(overrides, {"actor_rollout_ref": {"loop_audit": settings}})
+
+
+def plc_settings(cfg: DictConfig) -> PLCSettings:
+    """The validated ``plc`` section (all defaults when the section is empty)."""
+    section = cfg.get("plc")
+    values = OmegaConf.to_container(section, resolve=True) if section is not None else {}
+    return PLCSettings.from_mapping(values)
+
+
+def add_plc_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
+    """``overrides`` plus ``actor_rollout_ref.actor.plc`` when PLC is on.
+
+    PLC runs on the RLTT trainer with the per-loop model; the vendor's ``learned`` loop
+    weights are a different objective and are refused.
+    """
+    settings = plc_settings(cfg)
+    if not settings.enabled:
+        return overrides
+    if cfg.trainer != "rltt":
+        raise ValueError("plc.enabled needs trainer=rltt")
+    if not args.use_rltt_model:
+        raise ValueError("plc.enabled needs args.use_rltt_model=true (per-loop model)")
+    if args.loop_weighting == "learned":
+        raise ValueError("plc.enabled cannot be combined with args.loop_weighting=learned")
+    values = {k: v for k, v in settings.__dict__.items()}
+    return _deep_merge(overrides, {"actor_rollout_ref": {"actor": {"plc": values}}})
 
 
 def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:
