@@ -456,6 +456,10 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.vllm_gpu_memory_utilization == 0.5, name
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
     assert cfg.wandb.project == "looprl-ouro" and cfg.wandb.entity is None, name
+    rollout = cfg.verl_overrides.actor_rollout_ref.rollout
+    assert rollout.max_num_batched_tokens == 32768, name
+    max_model_len = cfg.args.max_prompt_length + cfg.args.max_completion_length
+    assert rollout.max_num_batched_tokens >= max_model_len, name
 
 
 @pytest.mark.parametrize("method", ["grpo", "rltt", "plc"])
@@ -503,6 +507,36 @@ def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
     assert resolved["reference_policy"].startswith("dropped")
     with pytest.raises(KeyError, match="unknown model keys"):
         rcfg.load_config(str(GRPO_1P4B_CONFIG), ["model.hidden_size=2048"])
+
+
+# ---------- vLLM token budget ----------
+
+@pytest.mark.parametrize("rollout,ok", [
+    ({}, False),                                         # verl default 8192 < 18,432
+    ({"max_num_batched_tokens": 16384}, False),
+    ({"max_num_batched_tokens": 18432}, True),
+    ({"max_num_batched_tokens": 32768}, True),
+    ({"enable_chunked_prefill": False}, True),           # verl only checks with chunked prefill
+])
+def test_rollout_token_budget(rollout, ok):
+    args = types.SimpleNamespace(max_prompt_length=2048, max_completion_length=16384)
+    overrides = {"actor_rollout_ref": {"rollout": rollout}} if rollout else {}
+    if ok:
+        rcfg.check_rollout_token_budget(overrides, args)
+    else:
+        with pytest.raises(ValueError, match="max_num_batched_tokens"):
+            rcfg.check_rollout_token_budget(overrides, args)
+
+
+def test_dry_run_refuses_the_verl_default_token_budget(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    with pytest.raises(ValueError, match="max_num_batched_tokens=8192"):
+        launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run",
+                     "verl_overrides.actor_rollout_ref.rollout.max_num_batched_tokens=8192"])
 
 
 # ---------- reference policy (KL off) ----------

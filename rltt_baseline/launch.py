@@ -57,6 +57,7 @@ from rltt_baseline.config import (
     apply_verl_overrides,
     build_args,
     check_kl_not_in_reward,
+    check_rollout_token_budget,
     drop_unused_reference,
     load_config,
     plc_settings,
@@ -237,6 +238,7 @@ def main(argv=None) -> int:
     overrides = add_plc_overrides(cfg, overrides, args)
     plc = plc_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
+    check_rollout_token_budget(overrides, args)
     loop_audit = (overrides.get("actor_rollout_ref") or {}).get("loop_audit")
 
     resolved = {

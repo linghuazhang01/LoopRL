@@ -1,5 +1,10 @@
 # LoopRL：给 Claude 的项目约定
 
+先读并遵守 `AGENTS.md`（训练数据、seed 42、启动训练前报告全部参数），它对所有 agent 生效，
+与本文件冲突时以它为准：
+
+@AGENTS.md
+
 在 looped language model（Ouro）上做 RL：GRPO 对照、RLTT 对照（arXiv 2602.10520）和我们的方法
 PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule，固定 commit，**不修改**）；
 本仓库的适配代码在 `rltt_baseline/`，配置在 `configs/`，细节见 README.md。
@@ -36,7 +41,8 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 
 其余一切（数据、prompt / 生成长度、每步题数 × 采样数、步数、梯度累积、mini-batch、学习率与调度、
 betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参数、checkpoint 内容、`model.num_hidden_layers`、
-`rollout`、`env`、`audit`、`wandb.mode / dir / project / entity`）组内必须一致。所有 run 都记到
+`rollout`、`env`、`audit`、`wandb.mode / dir / project / entity`、vLLM 的
+`verl_overrides.actor_rollout_ref.rollout.max_num_batched_tokens`）组内必须一致。所有 run 都记到
 同一个 wandb 项目 `looprl-ouro`，靠 run 名和 tag 区分方法与规模；消融和多 seed 的 run 用
 `wandb.run_name=...` 起不同的名字。逐轮分布审计（`audit.loop_distribution`）
 在所有配置里都打开；它只读 `compute_log_prob` 那次前向的隐状态，不改变训练，但每次运行写几十 GB，
@@ -56,6 +62,15 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
 `test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 32 题 × 8 条、
 梯度累积 1、mini-batch 32 题、140 步 = 140 次优化器更新（论文 Table 6 是累积 2，这里统一改为 1）。
+
+## vLLM token 预算：32768
+
+- 每份配置写 `verl_overrides.actor_rollout_ref.rollout.max_num_batched_tokens: 32768`。
+  verl 0.6.1 默认 8192，而原作脚本开着 chunked prefill、`max_model_len` = 2048 + 16384 = 18432；
+  这时 verl 要求 `max_num_batched_tokens >= max_model_len`，否则 vLLM 初始化直接报错。
+- launcher 的 `check_rollout_token_budget` 在 dry-run 阶段就拒绝不满足这一条的配置。
+- 其余没写出的 verl rollout 默认值（`top_p` 1.0、`top_k` -1、`do_sample` true、`ignore_eos` false、
+  `max_num_seqs` 1024、`dtype` bfloat16）三种方法相同；改其中任何一个都要整组显式写出。
 
 ## KL：全部关闭
 

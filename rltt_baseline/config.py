@@ -76,6 +76,9 @@ KV_LAYOUTS = ("full", "decode_last")
 VENDOR_KL_IN_REWARD = {"rltt": False, "grpo": True}
 # Vendor default of verl ``actor.use_kl_loss`` (both scripts hard-code it).
 VENDOR_KL_LOSS = {"rltt": True, "grpo": False}
+# verl 0.6.1 ``RolloutConfig.max_num_batched_tokens`` default; both vendor scripts leave it unset
+# and hard-code ``rollout.enable_chunked_prefill: True``.
+VERL_MAX_NUM_BATCHED_TOKENS = 8192
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
@@ -309,6 +312,26 @@ def add_plc_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace
         raise ValueError("plc.enabled cannot be combined with args.loop_weighting=learned")
     values = {k: v for k, v in settings.__dict__.items()}
     return _deep_merge(overrides, {"actor_rollout_ref": {"actor": {"plc": values}}})
+
+
+def check_rollout_token_budget(overrides: dict, args: argparse.Namespace) -> None:
+    """Refuse a vLLM token budget that verl 0.6.1 would reject when the rollout engine starts.
+
+    The vendor scripts set ``max_model_len = max_prompt_length + max_completion_length`` and turn
+    chunked prefill on; verl then raises unless ``max_num_batched_tokens >= max_model_len``. Its
+    default (8192) is below the 18,432 tokens of these configs, so without an override every run
+    would fail after Ray and the models have started.
+    """
+    rollout = (overrides.get("actor_rollout_ref") or {}).get("rollout") or {}
+    if not rollout.get("enable_chunked_prefill", True):
+        return
+    budget = int(rollout.get("max_num_batched_tokens", VERL_MAX_NUM_BATCHED_TOKENS))
+    max_model_len = int(args.max_prompt_length) + int(args.max_completion_length)
+    if budget < max_model_len:
+        raise ValueError(f"actor_rollout_ref.rollout.max_num_batched_tokens={budget} is below "
+                         f"max_model_len={max_model_len} (prompt + completion); verl refuses this "
+                         "with chunked prefill. Set verl_overrides.actor_rollout_ref.rollout."
+                         "max_num_batched_tokens >= max_model_len")
 
 
 def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:

@@ -61,6 +61,8 @@ third_party/ouro_source     官方 Ouro modeling 文件（Apache-2.0，见该目
 
 ## 使用
 
+在本仓库工作的 agent 须遵守 `AGENTS.md`：只用 14,684 条训练集、训练 seed 固定 42、每次启动训练前报告全部参数。
+
 ```bash
 git clone --recurse-submodules https://github.com/linghuazhang01/LoopRL.git
 cd LoopRL
@@ -137,6 +139,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
   用 `math_verify` 判断与标准答案是否等价，0/1。
 - prompt 上限 2,048 tokens（按 Ouro chat template，最长的题 743 tokens，没有被过滤的），
   生成上限 16,384 tokens；每卡 token 上限 32,768（须 ≥ 2,048 + 16,384）。
+  vLLM 每步 token 预算 `max_num_batched_tokens` 也是 32,768：verl 默认 8,192 小于
+  `max_model_len` 18,432，开着 chunked prefill 时 vLLM 会拒绝启动，launcher 在 dry-run 阶段就会报错。
 - 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 1（论文 2），
   即每步做一次优化器更新（mini-batch = 32 题），共 140 步 = 140 次更新。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，

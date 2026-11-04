@@ -91,6 +91,10 @@ verl_overrides:
   algorithm:
     use_kl_in_reward: false   # vendor GRPO adds KL to the reward; never in the reward here
   actor_rollout_ref:
+    rollout:
+      max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
+                                     # below max_model_len 18,432, which verl refuses with
+                                     # chunked prefill on (both vendor scripts turn it on)
     actor:
       ppo_mini_batch_size: 32 # = the 32 prompts of one step -> one update per step
       grad_clip: 0.1          # vendor leaves the verl default 1.0
