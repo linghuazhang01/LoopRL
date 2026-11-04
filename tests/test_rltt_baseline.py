@@ -482,8 +482,89 @@ def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
     assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 32
     assert resolved["config"]["model"] == {"num_hidden_layers": 24}
     assert resolved["verl_overrides"]["algorithm"]["use_kl_in_reward"] is False
+    assert resolved["reference_policy"].startswith("dropped")
     with pytest.raises(KeyError, match="unknown model keys"):
         rcfg.load_config(str(GRPO_1P4B_CONFIG), ["model.hidden_size=2048"])
+
+
+# ---------- reference policy (KL off) ----------
+
+class _Role:
+    """Stand-in for verl's Role enum: drop_unused_reference matches keys by ``.name``."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+
+ACTOR_ROLLOUT, REF_POLICY = _Role("ActorRollout"), _Role("RefPolicy")
+
+
+def _verl_config(use_kl_loss=False, use_kl_in_reward=False, algorithm=True):
+    cfg = {"actor_rollout_ref": {"actor": {"use_kl_loss": use_kl_loss}}}
+    if algorithm:
+        cfg["algorithm"] = {"use_kl_in_reward": use_kl_in_reward}
+    return OmegaConf.create(cfg)
+
+
+@pytest.mark.parametrize("kl_loss,kl_reward,algorithm,dropped", [
+    (False, False, True, True),
+    (False, False, False, True),   # no algorithm section: KL in reward off
+    (True, False, True, False),
+    (False, True, True, False),
+])
+def test_drop_unused_reference(kl_loss, kl_reward, algorithm, dropped):
+    mapping = {ACTOR_ROLLOUT: "actor_worker", REF_POLICY: "ref_worker"}
+    cfg = _verl_config(kl_loss, kl_reward, algorithm)
+    out, did = rcfg.drop_unused_reference(mapping, cfg)
+    assert did is dropped and rcfg.kl_uses_reference(cfg) is not dropped
+    assert (REF_POLICY in out) is not dropped and out[ACTOR_ROLLOUT] == "actor_worker"
+    assert REF_POLICY in mapping  # the caller's mapping is left untouched
+    # no reference role registered (the RLTT script): nothing to drop
+    assert rcfg.drop_unused_reference({ACTOR_ROLLOUT: "w"}, cfg) == ({ACTOR_ROLLOUT: "w"}, False)
+
+
+@pytest.mark.parametrize("by_keyword", [True, False])
+def test_trainer_patch_drops_the_reference_role(monkeypatch, capsys, by_keyword):
+    from rltt_baseline import launch
+
+    seen = {}
+
+    class RayPPOTrainer:
+        def __init__(self, config, tokenizer, role_worker_mapping, resource_pool_manager,
+                     **kwargs):
+            seen.update(config=config, mapping=role_worker_mapping, pool=resource_pool_manager)
+
+    fake = types.ModuleType("verl.trainer.ppo.ray_trainer")
+    fake.RayPPOTrainer = RayPPOTrainer
+    for name in ("verl", "verl.trainer", "verl.trainer.ppo"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "verl.trainer.ppo.ray_trainer", fake)
+    # overrides as the configs write them: KL off
+    launch.install_trainer_overrides({"actor_rollout_ref": {"actor": {"use_kl_loss": False}},
+                                      "algorithm": {"use_kl_in_reward": False}})
+    base = _verl_config(use_kl_loss=True, use_kl_in_reward=True)  # vendor GRPO-like values
+    mapping = {ACTOR_ROLLOUT: "actor_worker", REF_POLICY: "ref_worker"}
+    if by_keyword:
+        RayPPOTrainer(base, "tok", role_worker_mapping=mapping, resource_pool_manager="pool")
+    else:
+        RayPPOTrainer(base, "tok", mapping, "pool")
+    assert seen["mapping"] == {ACTOR_ROLLOUT: "actor_worker"} and seen["pool"] == "pool"
+    assert seen["config"].actor_rollout_ref.actor.use_kl_loss is False
+    assert "reference policy not built" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", sorted({n for g in MATCHED_GROUPS.values() for n in g.values()}))
+def test_reference_policy_status_of_matched_configs(env, name):
+    cfg = rcfg.load_config(str(paths.config_file(name)))
+    status = rcfg.reference_policy_status(cfg.trainer, rcfg.verl_overrides(cfg))
+    assert status.startswith("dropped" if cfg.trainer == "grpo" else "none"), (name, status)
+    if cfg.trainer == "grpo":  # switching the KL loss back on keeps the reference model
+        on = rcfg.load_config(str(paths.config_file(name)),
+                              ["verl_overrides.actor_rollout_ref.actor.use_kl_loss=true"])
+        assert rcfg.reference_policy_status(on.trainer, rcfg.verl_overrides(on)).startswith("built")
 
 
 def test_dry_run_with_the_loop_audit_switched_on(env, capsys, monkeypatch):

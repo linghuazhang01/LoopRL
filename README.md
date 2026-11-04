@@ -158,6 +158,10 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` 为 true 时，launcher 拒绝启动
 （GRPO 原作默认就是 true，所以配置里必须显式写 `false`）。
 
+原作 GRPO 脚本总会注册参考模型，verl 0.6.1 只要注册就会加载它并每步多做一次前向。KL loss 也关闭时，
+launcher 在构造 trainer 前去掉这个角色，GRPO 就和 RLTT / PLC 一样不加载参考模型；dry-run 输出和
+`rltt_baseline_resolved.json` 的 `reference_policy` 字段写明是否去掉。重新打开 KL loss 时参考模型照常加载。
+
 `configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1）。
 warmup 长度按步数算（140 × 10% = 14），verl 的学习率调度器每次更新前进一次；梯度累积 1 时步数等于
 更新次数，warmup 就是前 14 次更新（10%）。若以后改回累积 2，warmup 会占到更新数的 20%。

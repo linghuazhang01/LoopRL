@@ -26,7 +26,11 @@ What this adds around the vendor script (whose files are not modified; located b
    ``AuditGRPOActorRolloutRefWorker``;
 10. ``plc.enabled`` (RLTT trainer) replaces the vendor loss by Posterior Loop Credit
     (``rltt_baseline.plc``) through ``PLCActorRolloutRefWorker``; with ``plc.use_gate_loss`` the
-    RLTT model directory must have been built without ``--detach-exit-pdf``.
+    RLTT model directory must have been built without ``--detach-exit-pdf``;
+11. when neither ``actor.use_kl_loss`` nor ``algorithm.use_kl_in_reward`` is on in the final verl
+    config, ``Role.RefPolicy`` is removed from the trainer's ``role_worker_mapping``, so the GRPO
+    script (the only one that registers it) neither loads the frozen reference model nor runs its
+    forward each step; ``rltt_baseline_resolved.json`` records the outcome as ``reference_policy``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -53,8 +57,10 @@ from rltt_baseline.config import (
     apply_verl_overrides,
     build_args,
     check_kl_not_in_reward,
+    drop_unused_reference,
     load_config,
     plc_settings,
+    reference_policy_status,
     verl_overrides,
     wandb_env,
 )
@@ -118,7 +124,20 @@ def install_trainer_overrides(overrides: dict) -> None:
         return
 
     def __init__(self, config, *args, **kwargs):
-        original(self, apply_verl_overrides(config, overrides), *args, **kwargs)
+        config = apply_verl_overrides(config, overrides)
+        # role_worker_mapping: a keyword in the vendor scripts, else the positional after tokenizer
+        if "role_worker_mapping" in kwargs:
+            kwargs["role_worker_mapping"], dropped = drop_unused_reference(
+                kwargs["role_worker_mapping"], config)
+        elif len(args) >= 2:
+            mapping, dropped = drop_unused_reference(args[1], config)
+            args = (args[0], mapping, *args[2:])
+        else:
+            dropped = False
+        if dropped:
+            print("[rltt_baseline] KL off: reference policy not built (Role.RefPolicy removed "
+                  "from role_worker_mapping)", flush=True)
+        original(self, config, *args, **kwargs)
 
     __init__._rltt_overrides = True
     RayPPOTrainer.__init__ = __init__
@@ -228,6 +247,7 @@ def main(argv=None) -> int:
         "vendor_args": vars(args),
         "env": env,
         "verl_overrides": overrides,
+        "reference_policy": reference_policy_status(cfg.trainer, overrides),
     }
     if opts.dry_run:
         print(json.dumps(resolved, indent=2, default=str))

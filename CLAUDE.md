@@ -57,8 +57,11 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 - 每份配置都写 `args.beta: 0.0`，并在 `verl_overrides.actor_rollout_ref.actor` 写 `use_kl_loss: false`、
   `kl_loss_coef: 0.0`。这是共享键，组内必须一致。
 - 原作 RLTT 脚本没有注册参考模型 worker（只有 ActorRollout），它的 actor 在没有 `ref_log_prob` 时用
-  `old_log_probs` 代替，所以 RLTT / PLC 即使开着 KL 也只是对旧策略算，接近 0。GRPO 脚本注册了参考模型，
-  关掉 KL 后它仍会每步算一次参考 log-prob（只多花时间，不进 loss）。
+  `old_log_probs` 代替，所以 RLTT / PLC 即使开着 KL 也只是对旧策略算，接近 0。
+- GRPO 脚本注册了参考模型；verl 0.6.1 只要注册了就会加载并每步前向一次，与 `use_kl_loss` 无关。
+  launcher 在最终 verl 配置里 `use_kl_loss` 和 `use_kl_in_reward` 都为 false 时，从
+  `role_worker_mapping` 里去掉 `Role.RefPolicy`，所以 KL 关闭时三种方法都不加载参考模型，
+  每步耗时可以直接比较。结果记录在 `rltt_baseline_resolved.json` 的 `reference_policy` 字段。
 - 要重新打开 KL，必须先解决 RLTT / PLC 没有参考模型的问题，否则三种方法的 KL 含义不同。
 
 ## 随机种子：全部锁定 42
@@ -76,8 +79,8 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 ## 配置文件看不出来、但会随 `trainer` 一起改变的东西
 
 - `trainer: rltt`（RLTT 与 PLC）的 actor 用自定义前向：padded 输入、模型内分块算逐轮 log-prob；
-  `trainer: grpo` 走 verl 标准 actor（remove-padding 路径）。数学等价，数值路径不同。参考模型三者都走
-  verl 标准路径。
+  `trainer: grpo` 走 verl 标准 actor（remove-padding 路径）。数学等价，数值路径不同。KL 关闭时
+  三者都没有参考模型（见上面"KL：全部关闭"）。
 - exit gate 是否被训练由**模型目录**决定：`prepare_model` 默认写 `rltt_detach_exit_pdf: false`
   （PLC 的 gate loss 需要）。原作 RLTT 用 `exit_pdf` 权重时梯度会流进 gate，GRPO 则完全不碰 gate。
   三种方法共用 `LOOPRL_MODEL_DIR`，换模型目录相当于换了实验设置，要在实验记录里写明。

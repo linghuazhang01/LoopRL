@@ -74,6 +74,8 @@ KV_LAYOUTS = ("full", "decode_last")
 # Vendor default of verl ``algorithm.use_kl_in_reward``: the GRPO script adds the KL to the
 # reward, the RLTT script uses a KL loss. This project never puts the KL in the reward.
 VENDOR_KL_IN_REWARD = {"rltt": False, "grpo": True}
+# Vendor default of verl ``actor.use_kl_loss`` (both scripts hard-code it).
+VENDOR_KL_LOSS = {"rltt": True, "grpo": False}
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
@@ -317,6 +319,48 @@ def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:
         raise ValueError("KL must not be added to the reward: set "
                          "verl_overrides.algorithm.use_kl_in_reward=false "
                          "(the KL, if any, is a loss term: actor.use_kl_loss)")
+
+
+def kl_uses_reference(verl_config) -> bool:
+    """True when the final verl config reads the reference policy: KL loss or KL in the reward.
+
+    verl 0.6.1 builds the reference model whenever ``Role.RefPolicy`` is in the trainer's
+    ``role_worker_mapping``, whether or not anything uses its log-probs.
+    """
+    actor = verl_config.actor_rollout_ref.actor
+    algorithm = verl_config.get("algorithm") or {}
+    return bool(actor.get("use_kl_loss", False)) or bool(algorithm.get("use_kl_in_reward", False))
+
+
+def drop_unused_reference(role_worker_mapping: dict, verl_config):
+    """``(mapping, dropped)``: ``role_worker_mapping`` minus ``Role.RefPolicy`` if no KL uses it.
+
+    Only the GRPO vendor script registers a reference worker; with the KL off it would still load
+    a frozen model copy and run one extra forward per step whose output nothing reads. Keys are
+    matched by enum name so this works without importing verl.
+    """
+    if kl_uses_reference(verl_config):
+        return role_worker_mapping, False
+    kept = {role: worker for role, worker in role_worker_mapping.items()
+            if getattr(role, "name", None) != "RefPolicy"}
+    return kept, len(kept) != len(role_worker_mapping)
+
+
+def reference_policy_status(trainer: str, overrides: dict) -> str:
+    """What the run does with the reference model, from the vendor defaults and ``overrides``.
+
+    Mirrors the launcher at trainer construction: the RLTT script never registers a reference
+    worker; the GRPO script does, and the launcher removes it when neither KL uses it.
+    """
+    if trainer == "rltt":
+        return "none: the rltt vendor script registers no reference worker"
+    actor = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
+    kl_loss = actor.get("use_kl_loss", VENDOR_KL_LOSS[trainer])
+    kl_reward = (overrides.get("algorithm") or {}).get("use_kl_in_reward",
+                                                       VENDOR_KL_IN_REWARD[trainer])
+    if kl_loss or kl_reward:
+        return "built: the KL reads the reference log-probs"
+    return "dropped: KL off, Role.RefPolicy removed before the trainer is built"
 
 
 def apply_verl_overrides(config, overrides: dict):
