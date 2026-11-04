@@ -23,7 +23,10 @@ What this adds around the vendor script (whose files are not modified; located b
 8. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``;
 9. ``audit.loop_distribution.enabled`` writes per-loop token distributions to
    ``<output_dir>/audit/`` (``rltt_baseline.loop_audit``); for GRPO it also selects
-   ``AuditGRPOActorRolloutRefWorker``.
+   ``AuditGRPOActorRolloutRefWorker``;
+10. ``plc.enabled`` (RLTT trainer) replaces the vendor loss by Posterior Loop Credit
+    (``rltt_baseline.plc``) through ``PLCActorRolloutRefWorker``; with ``plc.use_gate_loss`` the
+    RLTT model directory must have been built without ``--detach-exit-pdf``.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -45,11 +48,13 @@ from omegaconf import OmegaConf
 
 from rltt_baseline.config import (
     add_audit_overrides,
+    add_plc_overrides,
     add_rollout_overrides,
     apply_verl_overrides,
     build_args,
     check_kl_not_in_reward,
     load_config,
+    plc_settings,
     verl_overrides,
     wandb_env,
 )
@@ -146,6 +151,25 @@ def install_metrics_worker() -> None:
     verl_rltt.RLTTActorRolloutRefWorker = MetricsRLTTActorRolloutRefWorker
 
 
+def install_plc_worker() -> None:
+    import verl_rltt
+
+    from rltt_baseline.plc_workers import PLCActorRolloutRefWorker
+
+    verl_rltt.RLTTActorRolloutRefWorker = PLCActorRolloutRefWorker
+
+
+def check_plc_model(args, settings) -> None:
+    """The gate loss needs gradients through the exit PDF (``rltt_detach_exit_pdf: false``)."""
+    if not (settings.enabled and settings.use_gate_loss):
+        return
+    config = json.loads((Path(args.rltt_model_path) / "config.json").read_text())
+    if config.get("rltt_detach_exit_pdf", False):
+        raise SystemExit(f"{args.rltt_model_path}: rltt_detach_exit_pdf is true, so the gate "
+                         "would get no gradient; rebuild it with prepare_model without "
+                         "--detach-exit-pdf or set plc.use_gate_loss=false")
+
+
 def install_grpo_audit_worker() -> None:
     import verl_grpo
 
@@ -191,6 +215,8 @@ def main(argv=None) -> int:
     args = build_args(cfg, vendor_defaults(vendor))
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
     overrides = add_audit_overrides(cfg, add_rollout_overrides(cfg, verl_overrides(cfg)), args)
+    overrides = add_plc_overrides(cfg, overrides, args)
+    plc = plc_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
     loop_audit = (overrides.get("actor_rollout_ref") or {}).get("loop_audit")
 
@@ -215,6 +241,7 @@ def main(argv=None) -> int:
     if n_gpus <= 1 or args.debug:
         raise SystemExit("rltt_baseline needs the vendor verl path: >= 2 GPUs and debug=false")
     check_model_layers(args, cfg.model.get("num_hidden_layers"))
+    check_plc_model(args, plc)
     if cfg.trainer == "grpo":
         check_grpo_model_dir(args.model_path)
     if str(args.train_file).endswith(".parquet"):
@@ -231,7 +258,9 @@ def main(argv=None) -> int:
     vendor.parse_args = lambda: args
     install_trainer_overrides(overrides)
     install_parquet_train_data()
-    if cfg.trainer == "rltt":
+    if cfg.trainer == "rltt" and plc.enabled:
+        install_plc_worker()
+    elif cfg.trainer == "rltt":
         install_metrics_worker()
     elif loop_audit:
         install_grpo_audit_worker()

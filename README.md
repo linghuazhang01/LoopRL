@@ -29,6 +29,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/decode_last.py`、`vllm_decode_last.py` | 可选的 rollout KV 布局 `decode_last`（`rollout.kv_layout`，默认关闭）：prompt 保留每一轮的 KV，生成的 token 只保留最后一轮的 KV。只改变 vLLM rollout，训练 forward 不变 |
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
+| `rltt_baseline/plc.py`、`plc_workers.py` | PLC（Posterior Loop Credit，`plc.enabled`，默认关闭）：把 RLTT 的逐轮权重换成按 token 的后验权重 `softmax_t(log q_t + γ·log P_old^(t)(y_j))`，逐轮 PPO ratio，可选 gate 损失；γ=0 退回 RLTT，λ=0 退回 GRPO |
 | `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 可选的逐轮分布审计（`audit.loop_distribution`，默认关闭）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
 | `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
@@ -46,6 +47,7 @@ configs/grpo_baseline_1p4b_8gpu.yaml  GRPO 8 卡训练配置（Ouro-1.4B-Thinkin
 configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml  同 grpo_baseline_8gpu，打开逐轮分布审计
 configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml  同 grpo_baseline_1p4b_8gpu，打开逐轮分布审计
 configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置
+configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -190,11 +192,39 @@ export LOOPRL_TRAIN_FILE=$PWD/data/deepmath_level6_filter12k_passes1to3_no_yesno
 
 140 步 × 32 题需要 4,480 题，这份只够约 89 步不重复。规则和构成见该目录的 README。
 
+### PLC：Posterior Loop Credit（`configs/plc_posterior_exit_gate_1p4b_8gpu.yaml`）
+
+`plc.enabled: true` 时 launcher 用 `PLCActorRolloutRefWorker` 代替原作的 RLTT worker（仍是 `trainer: rltt`，
+仍需 `use_rltt_model: true` 的逐轮模型目录）。记号：`ℓ[j,t] = log P^(t)(y_j)` 为采样 token 在第 t 轮的
+log-prob，`q_t` 为退出深度的先验。
+
+- **权重**：`w[j,t] = softmax_t(log q_t + γ·ℓ_old[j,t])`，用旧策略（`compute_log_prob` 那次 forward）的
+  逐轮 log-prob 计算，detach，整个更新内固定。γ=1 是退出混合策略 `Σ_t q_t P^(t)` 的精确后验；γ=0 时
+  `w = q`，就是 RLTT（先验 uniform / progressive / exit 分别对应 RLTT 的三种权重）。
+- **损失**：`-agg_j[(1-λ)·PPO^(T) + λ·Σ_t w[j,t]·PPO^(t)]`，每轮一个 PPO ratio `exp(ℓ_new - ℓ_old)`，
+  clip 用 verl 的 `clip_ratio` / 双重 clip；λ=0 与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
+  熵项和 KL（`low_var_kl`，参考模型）只加在最后一轮，与原作相同。
+- **gate 损失**（`use_gate_loss`，需要 `prior: exit`）：`gate_coef·agg[Â·CE(sg[w], q_new)] − gate_entropy_coef·agg[H(q_new)]`，
+  即混合策略梯度中 gate 的那一项加 Ouro Stage I 的熵正则（Ouro 预训练 β=0.1，末阶段 0.05）。
+  它要求模型目录没有用 `--detach-exit-pdf` 构建，launcher 训练前检查 `config.json`。
+- **可选**：`eps_floor`（权重下限）、`use_is_correction`（在 loop 项上乘
+  `min(Σ_t q_t·exp(ℓ_old[t] − ℓ_old[T]), is_clip)`，把自归一化权重换成普通的逐轮重要性权重）。
+- **指标**：`plc/w_mean_per_loop`、`plc/eff_loops_mean`、`plc/argmax_is_final_frac`、`plc/delta_*`、
+  `plc/clipfrac_per_loop`、`plc/ratio_mean_per_loop`，gate 的 `gate/q_mean_per_loop`、`gate/expected_exit_step`、
+  `gate/kl_w_q_mean`、`gate/entropy_mean`；原有的 `rltt/loop_<t>_entropy`、`actor/*` 照旧。
+- **批次里新增的张量**：`old_log_probs_loops` `[B,L,T]`，`prior: exit` 时还有 `old_exit_pdf` `[B,L,T]`。
+  `old_log_probs` 就是前者的最后一轮。
+
+消融用命令行覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`、
+`plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`。
+状态：只有 CPU 单元测试和 tiny 随机模型测试（`tests/test_plc.py`、`test_rltt_baseline_modeling.py`），
+没有在真实权重或 GPU 上运行过。
+
 ### 配置与覆盖
 
-配置文件有六个顶层键：`trainer`（`rltt` / `grpo`）、`args`（与所选原作脚本的 argparse 参数同名，
+配置文件的顶层键：`trainer`（`rltt` / `grpo`）、`args`（与所选原作脚本的 argparse 参数同名，
 未列出的用原作默认值；拼错的键或类型不符会直接报错）、`wandb`、`verl_overrides`、`env`、
-`rollout`（`kv_layout: full | decode_last`，见下节）。
+`rollout`（`kv_layout: full | decode_last`，见下节）、`model`、`audit`、`plc`（见上节）。
 命令行覆盖示例：`args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.run_name=try1`。
 解析后的完整配置会保存到 `<output_dir>/rltt_baseline_config.yaml`。
 
