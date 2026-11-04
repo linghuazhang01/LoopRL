@@ -1,6 +1,7 @@
 import json  # noqa: I001  (first-party grouping differs between the two checkouts)
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ ENV = {
     "LOOPRL_TRAIN_FILE": "/data/deepmath_level6.parquet",
     "LOOPRL_MATH500_JSONL": "/data/math500.jsonl",
     "LOOPRL_OUTPUT_DIR": "/out/rltt",
+    "LOOPRL_ENV_FILE": "/nonexistent/env.local",  # never read a real env.local in tests
 }
 
 
@@ -209,7 +211,7 @@ def test_default_config_resolves_to_paper_settings(env):
     assert args.temperature == 1.0 and isinstance(args.learning_rate, float)
     assert args.no_wandb is False and args.wandb_project == "looprl-ouro"
     env_vars = rcfg.wandb_env(cfg)
-    assert env_vars["WANDB_MODE"] == "offline"
+    assert env_vars["WANDB_MODE"] == "online"
     assert env_vars["WANDB_DIR"] == ENV["LOOPRL_OUTPUT_DIR"]
     assert env_vars["WANDB_TAGS"] == "rltt,baseline,ouro-2.6b-thinking,deepmath-level6"
 
@@ -456,6 +458,7 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.vllm_gpu_memory_utilization == 0.5, name
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
     assert cfg.wandb.project == "looprl-ouro" and cfg.wandb.entity is None, name
+    assert cfg.wandb.enabled is True and cfg.wandb.mode == "online", name
     rollout = cfg.verl_overrides.actor_rollout_ref.rollout
     assert rollout.max_num_batched_tokens == 32768, name
     max_model_len = cfg.args.max_prompt_length + cfg.args.max_completion_length
@@ -510,6 +513,60 @@ def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
     assert resolved["reference_policy"].startswith("dropped")
     with pytest.raises(KeyError, match="unknown model keys"):
         rcfg.load_config(str(GRPO_1P4B_CONFIG), ["model.hidden_size=2048"])
+
+
+# ---------- env.local and the wandb key ----------
+
+def test_read_env_file_parses_without_executing(tmp_path):
+    path = tmp_path / "env.local"
+    path.write_text("# comment\n\nexport WANDB_API_KEY='abc 123'\nHF_TOKEN=\"t\"\n"
+                    "EMPTY=\nPLAIN=v # note\nnot a line\nCMD=$(rm -rf /)\n")
+    assert rcfg.read_env_file(path) == {"WANDB_API_KEY": "abc 123", "HF_TOKEN": "t",
+                                        "PLAIN": "v", "CMD": "$(rm -rf /)"}
+
+
+def test_load_env_file_keeps_existing_variables(tmp_path):
+    path = tmp_path / "env.local"
+    path.write_text("WANDB_API_KEY=from-file\nOTHER=x\n")
+    environ = {"OTHER": "already"}
+    assert rcfg.load_env_file(path, environ) == ["WANDB_API_KEY"]
+    assert environ == {"OTHER": "already", "WANDB_API_KEY": "from-file"}
+    assert rcfg.load_env_file(tmp_path / "missing", environ) == []
+    assert rcfg.env_file_path({}, tmp_path) == tmp_path / "env.local"
+    assert rcfg.env_file_path({"LOOPRL_ENV_FILE": "/x/y"}, tmp_path) == Path("/x/y")
+
+
+def test_dry_run_reads_the_key_from_env_local_and_never_prints_it(env, tmp_path, capsys,
+                                                                    monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    secret = "wandb-secret-0123456789"
+    (tmp_path / "env.local").write_text(f"WANDB_API_KEY={secret}\n")
+    monkeypatch.setenv("LOOPRL_ENV_FILE", str(tmp_path / "env.local"))
+    monkeypatch.setenv("WANDB_API_KEY", "")  # restored (removed) after the test
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert secret not in out
+    resolved = json.loads(out)
+    assert resolved["wandb_api_key"] == "found" and resolved["env"]["WANDB_MODE"] == "online"
+    assert resolved["env_file"] == {"path": str(tmp_path / "env.local"), "exists": True,
+                                    "loaded_keys": ["WANDB_API_KEY"]}
+
+
+def test_online_launch_without_a_key_stops_before_ray(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("WANDB_API_KEY", "")
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["wandb_api_key"] == "missing"
+    with pytest.raises(SystemExit, match="WANDB_API_KEY.*env.local"):
+        launch.main(["--config", str(GRPO_1P4B_CONFIG)])
 
 
 # ---------- vLLM token budget ----------

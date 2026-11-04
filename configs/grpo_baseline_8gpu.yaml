@@ -76,7 +76,7 @@ args:  # keys = dest names of grpo_train.py argparse options
 
 wandb:
   enabled: true
-  mode: offline
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
   project: looprl-ouro            # one wandb project for every method and size
   entity: null
   run_name: null                # null = vendor name GRPO-<model dir name>

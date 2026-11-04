@@ -334,8 +334,16 @@ python -m rltt_baseline.launch --config configs/grpo_baseline_8gpu.yaml rollout.
 
 ### wandb
 
-日志通过 verl 0.6.1 的 `Tracking` 写入 wandb。`wandb.mode` 默认 `offline`（计算节点通常不能联网），
-训练后在能联网的机器上运行 `wandb sync <output_dir>/wandb/offline-run-*`。
+日志通过 verl 0.6.1 的 `Tracking` 写入 wandb。所有配置都是 `wandb.mode: online`，项目 `looprl-ouro`
+（`AGENTS.md` 规则 4）。`WANDB_API_KEY` 放在训练机器本地的 `env.local`（仓库根目录，已 gitignore；
+或用 `LOOPRL_ENV_FILE` 指定路径），格式见 `env.local.example`：
+
+```bash
+cp env.local.example env.local   # 然后填入 WANDB_API_KEY=...；不要提交这个文件
+```
+
+launcher 启动时读取它（不覆盖已设置的环境变量），dry-run 输出只写 `wandb_api_key: found / missing`
+和读到的变量名，不写值。online 而缺少密钥时，launcher 在启动 Ray 之前报错。训练节点需要能访问 wandb。
 
 ### 训练指标
 

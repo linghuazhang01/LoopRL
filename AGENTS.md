@@ -1,7 +1,7 @@
 # LoopRL：给所有代码 agent 的硬性规则
 
 本文件适用于在本仓库工作的所有 agent（Claude、Codex 等）。`CLAUDE.md` 写配置对照组、KL、
-分支等细节；两者冲突时以本文件为准。下面三条规则没有例外，除非用户在对话里明确要求改变。
+分支等细节；两者冲突时以本文件为准。下面四条规则没有例外，除非用户在对话里明确要求改变。
 
 ## 1. 训练数据：只用 14,684 条合并过滤训练集
 
@@ -54,10 +54,25 @@
      `verl_overrides`（含 `max_num_batched_tokens`、KL、mini-batch、betas、审计设置）、
      `config.plc`、`config.rollout`、`config.audit`、`config.wandb`、`env`、`reference_policy`。
      按类别整理成表格，不能只给摘要或只列改动过的项。
+   - **wandb**：mode（必须是 `online`）、项目名、run 名，以及 dry-run 输出里的 `wandb_api_key`
+     （必须是 `found`）和 `env_file.loaded_keys`。只报告密钥“已找到”，不报告密钥本身（规则 4）。
    - **与对照组的差异**：这次运行和同组其他方法的配置相比，除方法本身外是否还有差异；
      有差异必须逐项指出。
 
-3. 发现违反规则 1 或规则 2，或者有用户没要求的共享参数差异时，不启动，先告诉用户。
+3. 发现违反规则 1、2 或 4，或者有用户没要求的共享参数差异时，不启动，先告诉用户。
 
 4. 启动后告诉用户输出目录，以及 `<output_dir>/rltt_baseline_resolved.json` 的位置；这份文件
    记录了本次运行实际使用的全部参数。
+
+## 4. wandb 必须 online，密钥只从 env.local 取
+
+- 所有配置都写 `wandb.enabled: true`、`wandb.mode: online`、`wandb.project: looprl-ouro`。
+  不要改成 `offline` 或 `disabled`，命令行也不要覆盖 `wandb.mode`。
+- `WANDB_API_KEY` 放在训练机器本地的 `env.local`（仓库根目录；或用 `LOOPRL_ENV_FILE` 指定路径），
+  格式见 `env.local.example`。launcher 启动时按 `KEY=VALUE` 逐行读取（不当 shell 执行），
+  不覆盖已经设置的环境变量。
+- `env.local` 已加入 `.gitignore`。**不要提交它，不要把密钥写进任何被跟踪的文件、配置、命令行、
+  日志或给用户的回复里**；需要说明时只说“已找到 / 缺失”。
+- `wandb.mode` 为 online 而找不到 `WANDB_API_KEY` 时，launcher 在启动 Ray 之前报错退出。遇到这种情况
+  不要改成 offline 绕过，告诉用户在训练机器上补好 `env.local`。
+- 训练节点必须能访问 wandb（api.wandb.ai）。不能联网时先告诉用户，不要自行改成 offline。

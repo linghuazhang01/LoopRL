@@ -41,7 +41,8 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 
 其余一切（数据、prompt / 生成长度、每步题数 × 采样数、步数、梯度累积、mini-batch、学习率与调度、
 betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参数、checkpoint 内容、`model.num_hidden_layers`、
-`rollout`、`env`、`audit`、`wandb.mode / dir / project / entity`、vLLM 的
+`rollout`、`env`、`audit`、`wandb.mode / dir / project / entity`（mode 必须是 `online`，见 `AGENTS.md`
+规则 4；密钥从本地 gitignored 的 `env.local` 读取）、vLLM 的
 `verl_overrides.actor_rollout_ref.rollout.max_num_batched_tokens`）组内必须一致。所有 run 都记到
 同一个 wandb 项目 `looprl-ouro`，靠 run 名和 tag 区分方法与规模；消融和多 seed 的 run 用
 `wandb.run_name=...` 起不同的名字。逐轮分布审计（`audit.loop_distribution`）

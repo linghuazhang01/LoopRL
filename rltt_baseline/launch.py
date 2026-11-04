@@ -30,7 +30,10 @@ What this adds around the vendor script (whose files are not modified; located b
 11. when neither ``actor.use_kl_loss`` nor ``algorithm.use_kl_in_reward`` is on in the final verl
     config, ``Role.RefPolicy`` is removed from the trainer's ``role_worker_mapping``, so the GRPO
     script (the only one that registers it) neither loads the frozen reference model nor runs its
-    forward each step; ``rltt_baseline_resolved.json`` records the outcome as ``reference_policy``.
+    forward each step; ``rltt_baseline_resolved.json`` records the outcome as ``reference_policy``;
+12. variables in the local, gitignored ``env.local`` (repo root, or ``LOOPRL_ENV_FILE``) are loaded
+    first without overriding the environment, e.g. ``WANDB_API_KEY``; the resolved config lists
+    only their names. A launch with ``wandb.mode=online`` and no ``WANDB_API_KEY`` stops before Ray.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -58,12 +61,16 @@ from rltt_baseline.config import (
     build_args,
     check_kl_not_in_reward,
     check_rollout_token_budget,
+    check_wandb_key,
     drop_unused_reference,
+    env_file_path,
     load_config,
+    load_env_file,
     plc_settings,
     reference_policy_status,
     verl_overrides,
     wandb_env,
+    wandb_key_status,
 )
 from rltt_baseline.paths import SRC_DIR, rltt_source_dir
 
@@ -228,6 +235,10 @@ def main(argv=None) -> int:
     parser.add_argument("overrides", nargs="*", help="OmegaConf dot-list overrides")
     opts = parser.parse_args(argv)
 
+    # local secrets (WANDB_API_KEY ...) from env.local, before the config resolves ${oc.env:...};
+    # existing variables win, and only the names are reported
+    env_file = env_file_path(os.environ, SRC_DIR)
+    env_file_keys = load_env_file(env_file, os.environ)
     cfg = load_config(opts.config, opts.overrides)
     setup_paths(cfg.trainer)
     vendor = importlib.import_module(TRAINER_MODULES[cfg.trainer][1])  # sets HF_*_OFFLINE=1
@@ -250,11 +261,15 @@ def main(argv=None) -> int:
         "env": env,
         "verl_overrides": overrides,
         "reference_policy": reference_policy_status(cfg.trainer, overrides),
+        "env_file": {"path": str(env_file), "exists": env_file.is_file(),
+                     "loaded_keys": env_file_keys},
+        "wandb_api_key": wandb_key_status(cfg, os.environ),
     }
     if opts.dry_run:
         print(json.dumps(resolved, indent=2, default=str))
         return 0
 
+    check_wandb_key(cfg, os.environ, env_file)
     n_gpus = args.n_gpus
     if n_gpus is None:
         import torch

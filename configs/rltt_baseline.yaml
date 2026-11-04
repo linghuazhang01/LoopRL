@@ -78,7 +78,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
 
 wandb:
   enabled: true
-  mode: offline                 # compute nodes: offline, then `wandb sync` from a login node
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
   project: looprl-ouro            # one wandb project for every method and size
   entity: null
   run_name: null                # null = vendor name RLTT-<model>-<loop_weighting>

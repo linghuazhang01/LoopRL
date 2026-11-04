@@ -52,7 +52,9 @@ Values may use ``${oc.env:VAR}`` interpolation.
 import argparse
 import difflib
 import os
-from typing import Dict, List, Optional
+import re
+from pathlib import Path
+from typing import Dict, List, Mapping, MutableMapping, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -192,6 +194,67 @@ def validate_args(args: argparse.Namespace, trainer: str = "rltt") -> None:
             raise ValueError(f"{name} must be positive")
     if args.max_steps == 0 or args.max_steps < -1:
         raise ValueError("max_steps must be -1 (use epochs) or positive")
+
+
+# Local secrets file (gitignored): KEY=VALUE lines, e.g. WANDB_API_KEY=...; LOOPRL_ENV_FILE
+# points elsewhere. Values are never printed or written to the resolved config.
+ENV_FILE_NAME = "env.local"
+_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def read_env_file(path) -> Dict[str, str]:
+    """``KEY=VALUE`` pairs of a dotenv-style file; blank lines, comments and empty values skipped.
+
+    The file is parsed, never executed: no variable expansion, no command substitution.
+    """
+    values = {}
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _ENV_LINE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if value:
+            values[key] = value
+    return values
+
+
+def env_file_path(environ: Mapping[str, str], default_dir) -> Path:
+    return Path(environ.get("LOOPRL_ENV_FILE") or Path(default_dir) / ENV_FILE_NAME)
+
+
+def load_env_file(path, environ: MutableMapping[str, str]) -> List[str]:
+    """Set the file's variables that ``environ`` lacks; returns their names (never the values)."""
+    path = Path(path)
+    if not path.is_file():
+        return []
+    loaded = []
+    for key, value in read_env_file(path).items():
+        if not environ.get(key):
+            environ[key] = value
+            loaded.append(key)
+    return sorted(loaded)
+
+
+def wandb_key_status(cfg: DictConfig, environ: Mapping[str, str]) -> str:
+    """Whether an online wandb run has ``WANDB_API_KEY``; describes, never shows, the key."""
+    wandb = cfg.wandb
+    if not wandb.get("enabled", True) or wandb.get("mode") != "online":
+        return f"not needed: wandb mode {wandb.get('mode')}, enabled {wandb.get('enabled', True)}"
+    return "found" if environ.get("WANDB_API_KEY") else "missing"
+
+
+def check_wandb_key(cfg: DictConfig, environ: Mapping[str, str], env_file) -> None:
+    if wandb_key_status(cfg, environ) == "missing":
+        raise SystemExit(f"wandb.mode is online but WANDB_API_KEY is not set: put "
+                         f"WANDB_API_KEY=<key> in {env_file} (gitignored; see env.local.example) "
+                         "or export it before launching")
 
 
 def wandb_env(cfg: DictConfig) -> Dict[str, str]:

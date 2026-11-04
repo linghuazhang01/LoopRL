@@ -9,3 +9,6 @@ wandb/
 scripts/deepmath_filter_portable/data/
 scripts/deepmath_filter_portable/logs/
 scripts/deepmath_filter_portable/model_*/
+
+# local secrets (see env.local.example)
+env.local

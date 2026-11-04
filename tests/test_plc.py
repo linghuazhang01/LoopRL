@@ -18,6 +18,7 @@ ENV = {
     "LOOPRL_TRAIN_FILE": "/data/deepmath_level6.parquet",
     "LOOPRL_MATH500_JSONL": "/data/math500.jsonl",
     "LOOPRL_OUTPUT_DIR": "/out/plc",
+    "LOOPRL_ENV_FILE": "/nonexistent/env.local",  # never read a real env.local in tests
 }
 T = 4
 
