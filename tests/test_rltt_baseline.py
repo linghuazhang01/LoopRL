@@ -366,7 +366,8 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
 @pytest.mark.parametrize("name", ["rltt_baseline.yaml", "grpo_baseline_8gpu.yaml",
                                   "grpo_baseline_1p4b_8gpu.yaml",
                                   "rltt_baseline_1p4b_8gpu.yaml",
-                                  "plc_posterior_exit_gate_1p4b_8gpu.yaml"])
+                                  "plc_posterior_exit_gate_1p4b_8gpu.yaml",
+                                  "plc_posterior_exit_gate_2p6b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
     cfg = rcfg.load_config(str(paths.config_file(name)))
@@ -382,7 +383,8 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 MATCHED_GROUPS = {
     "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
              "plc": "plc_posterior_exit_gate_1p4b_8gpu.yaml"},
-    "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},
+    "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml",
+             "plc": "plc_posterior_exit_gate_2p6b_8gpu.yaml"},
 }
 # verl settings the GRPO configs must override because grpo_train.py lacks them; rltt_train.py
 # sets the same values from its own options (checked in _method_free_view)
@@ -452,6 +454,20 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.beta == 0.0 and actor.use_kl_loss is False and actor.kl_loss_coef == 0.0, name
     assert cfg.args.vllm_gpu_memory_utilization == 0.5, name
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
+
+
+@pytest.mark.parametrize("method", ["grpo", "rltt", "plc"])
+def test_each_method_differs_between_sizes_only_in_the_model(env, method):
+    small = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(
+        MATCHED_GROUPS["1.4B"][method]))))
+    large = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(
+        MATCHED_GROUPS["2.6B"][method]))))
+    assert small.pop("model") == {"num_hidden_layers": 24}
+    assert large.pop("model") == {"num_hidden_layers": 48}
+    for key in ("tags", "run_name"):  # naming only
+        small["wandb"].pop(key, None)
+        large["wandb"].pop(key, None)
+    assert small == large, method
 
 
 @pytest.mark.parametrize("group,layers", [("1.4B", 24), ("2.6B", 48)])
@@ -567,24 +583,19 @@ def test_reference_policy_status_of_matched_configs(env, name):
         assert rcfg.reference_policy_status(on.trainer, rcfg.verl_overrides(on)).startswith("built")
 
 
-def test_dry_run_with_the_loop_audit_switched_on(env, capsys, monkeypatch):
+def test_dry_run_with_the_loop_audit_switched_off(env, capsys, monkeypatch):
     from rltt_baseline import launch
 
     for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
         monkeypatch.setenv(key, "")
     monkeypatch.setattr(sys, "path", list(sys.path))
     assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run",
-                        "audit.loop_distribution.enabled=true"]) == 0
-    resolved = json.loads(capsys.readouterr().out)
-    audit = resolved["verl_overrides"]["actor_rollout_ref"]["loop_audit"]
-    assert audit["dir"] == ENV["LOOPRL_OUTPUT_DIR"] + "/audit" and audit["top_k"] == 5
-    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run"]) == 0
+                        "audit.loop_distribution.enabled=false"]) == 0
     resolved = json.loads(capsys.readouterr().out)
     assert "loop_audit" not in resolved["verl_overrides"]["actor_rollout_ref"]
 
 
-@pytest.mark.parametrize("name", ["grpo_baseline_1p4b_8gpu_loop_audit.yaml",
-                                  "grpo_baseline_2p6b_8gpu_loop_audit.yaml"])
+@pytest.mark.parametrize("name", sorted({n for g in MATCHED_GROUPS.values() for n in g.values()}))
 def test_loop_audit_configs_dry_run(env, capsys, monkeypatch, name):
     from rltt_baseline import launch
 

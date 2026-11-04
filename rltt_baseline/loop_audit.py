@@ -147,7 +147,10 @@ class LoopAudit:
 
         self._compute_log_prob = actor.compute_log_prob
         actor.compute_log_prob = self.compute_log_prob
-        for name in ("_forward_micro_batch", "_forward_micro_batch_rltt"):
+        # verl / vendor RLTT log-prob passes use the first two; PLCActor.compute_log_prob uses
+        # _forward_micro_batch_plc (padded per-loop forward)
+        for name in ("_forward_micro_batch", "_forward_micro_batch_rltt",
+                     "_forward_micro_batch_plc"):
             if hasattr(actor, name):
                 setattr(actor, name, self._remember_micro_batch(getattr(actor, name)))
 

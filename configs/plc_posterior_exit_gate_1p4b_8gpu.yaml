@@ -1,5 +1,7 @@
 # PLC (Posterior Loop Credit) on Ouro-1.4B-Thinking: gamma = 1, lam = 1, exit-gate prior, gate loss on.
-# One node with 8 GPUs, one optimizer update per step (as grpo_baseline_1p4b_8gpu.yaml).
+# One node with 8 GPUs, one optimizer update per step. PLC member of the 1.4B comparison group
+# (grpo_baseline_1p4b_8gpu.yaml / rltt_baseline_1p4b_8gpu.yaml, see CLAUDE.md); the 2.6B copy is
+# plc_posterior_exit_gate_2p6b_8gpu.yaml and differs only in the model.
 #
 # Objective (rltt_baseline.plc): the RLTT per-loop objective with token x loop weights
 #   w[j, t] = softmax_t(log q_t + gamma * log P_old^(t)(y_j)),   q = the model's exit distribution
@@ -13,7 +15,8 @@
 # Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
 # like the other configs here. For the RLTT paper's setting (MATH train, 2,048 generations) override
 #   args.train_file=<MATH train jsonl> args.max_completion_length=2048
-# Optimisation follows RLTT Table 6: 140 steps, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+# Optimisation follows RLTT Table 6 apart from the accumulation (1 here, paper 2): 140 steps =
+# 140 updates, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 # weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
 # Ablations by override, e.g. plc.gamma=0 (RLTT-exit), plc.lam=0 (GRPO), plc.use_gate_loss=false,
@@ -128,9 +131,14 @@ model:
   num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
 
 audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. On in every config of the comparison groups (shared key):
+  # read-only, no extra forward (hooks the compute_log_prob pass), so the loss is unchanged; it
+  # costs an lm_head call per loop on the response tokens and about 220 bytes per token on disk
+  # before compression.
   loop_distribution:
-    enabled: false
-    every_n_steps: 1
+    enabled: true
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
     top_k: 5
-    save_tokens: true
-    chunk_tokens: 512
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory

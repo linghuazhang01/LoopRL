@@ -21,7 +21,7 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -36,7 +36,9 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 
 其余一切（数据、prompt / 生成长度、每步题数 × 采样数、步数、梯度累积、mini-batch、学习率与调度、
 betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参数、checkpoint 内容、`model.num_hidden_layers`、
-`rollout`、`env`、`audit`、`wandb.mode / dir`）组内必须一致。
+`rollout`、`env`、`audit`、`wandb.mode / dir`）组内必须一致。逐轮分布审计（`audit.loop_distribution`）
+在所有配置里都打开；它只读 `compute_log_prob` 那次前向的隐状态，不改变训练，但每次运行写几十 GB，
+要关或调稀疏时整组一起改。
 
 这由 `tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings` 强制检查，
 对照组列在该文件的 `MATCHED_GROUPS` 里。因此：
@@ -49,7 +51,8 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
    PLC 配置加 `plc.gamma=0 plc.use_gate_loss=false` 是"与 PLC 完全同一条代码路径"的 RLTT 对照；
    `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。两者回答的问题不同，论文里都要有。
 
-两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48）：都是每步 32 题 × 8 条、
+两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
+`test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 32 题 × 8 条、
 梯度累积 1、mini-batch 32 题、140 步 = 140 次优化器更新（论文 Table 6 是累积 2，这里统一改为 1）。
 
 ## KL：全部关闭

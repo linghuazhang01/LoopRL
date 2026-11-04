@@ -30,7 +30,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
 | `rltt_baseline/plc.py`、`plc_workers.py` | PLC（Posterior Loop Credit，`plc.enabled`，默认关闭）：把 RLTT 的逐轮权重换成按 token 的后验权重 `softmax_t(log q_t + γ·log P_old^(t)(y_j))`，逐轮 PPO ratio，可选 gate 损失；γ=0 退回 RLTT，λ=0 退回 GRPO |
-| `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 可选的逐轮分布审计（`audit.loop_distribution`，默认关闭）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
+| `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 逐轮分布审计（`audit.loop_distribution`，所有配置都打开）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
 | `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
 
@@ -44,11 +44,10 @@ factory，官方 `modeling_ouro.py` 直接加载会报 `wrapped_fn() got an unex
 rltt_baseline/              适配代码（Python 包）
 configs/grpo_baseline_8gpu.yaml  GRPO 8 卡训练配置（Ouro-2.6B-Thinking）
 configs/grpo_baseline_1p4b_8gpu.yaml  GRPO 8 卡训练配置（Ouro-1.4B-Thinking，生成 16K，每步更新一次）
-configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml  同 grpo_baseline_8gpu，打开逐轮分布审计
-configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml  同 grpo_baseline_1p4b_8gpu，打开逐轮分布审计
 configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置（Ouro-2.6B-Thinking，与 grpo_baseline_8gpu 对齐）
 configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinking，与 GRPO 1.4B / PLC 配置对齐）
 configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
+configs/plc_posterior_exit_gate_2p6b_8gpu.yaml  同上，Ouro-2.6B-Thinking（与 1.4B 版只差模型）
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -113,7 +112,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -305,7 +304,7 @@ RLTT 另有原作的 `rltt/loop_<t>_log_prob`、各轮退出概率，以及本�
 
 采样只用最后一轮，但每一轮 t 都有自己的下一 token 分布
 `P^(t) = softmax(lm_head(h_t) / temperature)`。打开审计后，每个审计步对每个生成 token
-记录各轮分布的差异，GRPO 和 RLTT 都支持：
+记录各轮分布的差异，GRPO、RLTT 和 PLC 都支持。所有配置都打开了审计，它是共享键，组内必须一致：
 
 ```yaml
 audit:
@@ -317,17 +316,13 @@ audit:
     chunk_tokens: 512   # 每次 lm_head 处理的 token 数；显存不够时调小
 ```
 
-也可以在命令行写 `audit.loop_distribution.enabled=true`。默认关闭，关闭时不装 hook，GRPO
-仍用原作的 worker。
+审计不加前向：它挂在训练本来就要做的 `compute_log_prob` 那次前向上，读出各轮隐状态再算
+`lm_head`，所以不改变 loss 和梯度，只多花 `lm_head` 的计算和磁盘。逐 token 数组压缩前约每 token
+220 字节：每步 256 条回答，平均每条 6K token 时约 340 MB/步，140 步约 47 GB/次运行（满长 16K 时约
+2.5 倍）。磁盘不够时可以整组一起改 `save_tokens: false`（只留汇总）或调大 `every_n_steps`。
 
-`configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml` 和 `configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml`
-是已经打开审计的配置，与对应的基线配置只差这个开关和 wandb 标签 `loop-audit`（2.6B 另加
-`model.num_hidden_layers: 48`，防止误用 1.4B 模型目录）：
-
-```bash
-bash scripts/run_train.sh configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml
-bash scripts/run_train.sh configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml
-```
+命令行写 `audit.loop_distribution.enabled=false` 可以临时关掉；关闭时不装 hook，GRPO 仍用原作的
+worker。之前的 `*_loop_audit.yaml` 诊断变体在审计全部打开后与基线配置相同，已删除。
 
 输出在 `<output_dir>/audit/step_<step>/`：
 

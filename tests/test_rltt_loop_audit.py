@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from omegaconf import OmegaConf
 
 from rltt_baseline import config as rcfg
 from rltt_baseline import loop_audit as la
@@ -92,6 +91,32 @@ class RLTTStyleActor(FakeActor):
 
     def _forward_micro_batch_rltt(self, micro_batch, temperature):
         return self._forward_micro_batch(micro_batch, temperature)
+
+
+class PLCStyleActor(FakeActor):
+    """``PLCActor.compute_log_prob``: a padded per-loop forward through _forward_micro_batch_plc."""
+
+    def __init__(self):
+        super().__init__(remove_padding=False)
+
+    def _forward_micro_batch_plc(self, micro_batch, temperature):
+        # calls the model directly, as PLCActor does (not through _forward_micro_batch)
+        input_ids = micro_batch["input_ids"]
+        response_length = micro_batch["responses"].size(-1)
+        logits = self.actor_module(input_ids) / temperature
+        full = F.log_softmax(logits, -1).gather(-1, input_ids.roll(-1, 1).unsqueeze(-1))
+        return None, full.squeeze(-1)[:, -response_length - 1:-1]
+
+    def compute_log_prob(self, data, calculate_entropy=False):
+        rows = torch.arange(len(data.batch["input_ids"])).flip(0)
+        log_probs = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        with torch.no_grad():
+            for part in rows.split(2):
+                micro_batch = {name: value[part] for name, value in data.batch.items()}
+                _, picked = self._forward_micro_batch_plc(micro_batch,
+                                                          data.meta_info["temperature"])
+                log_probs[part] = picked
+        return log_probs, None
 
 
 def make_data(rows=6, prompt=4, response=5, temperature=0.7, **meta):
@@ -255,6 +280,17 @@ def test_audit_writes_step_files(tmp_path, remove_padding):
         assert line["correct"] == (line["reward"] >= 0.5)
 
 
+def test_audit_measures_the_plc_log_prob_pass(tmp_path):
+    actor = PLCStyleActor()
+    la.attach_loop_audit(actor, settings(tmp_path), rank=0)
+    data, metrics = run_step(actor, tmp_path)
+    summary = json.loads((tmp_path / la.step_dir_name(1) / "summary.json").read_text())
+    assert summary["errors"] == [] and summary["responses"] == 6
+    assert summary["tokens"] == int(data.batch["attention_mask"][:, -5:].sum())
+    assert summary["last_loop_log_prob_gap"] < 1e-6
+    assert metrics["loop_audit/last_loop_log_prob_gap"] < 1e-6
+
+
 def test_padded_and_packed_forwards_agree(tmp_path):
     for name, remove_padding in (("padded", False), ("packed", True)):
         actor = FakeActor(remove_padding)
@@ -394,29 +430,14 @@ def _args(no_lora=True):
     return types.SimpleNamespace(no_lora=no_lora, output_dir="/out/run")
 
 
-@pytest.mark.parametrize("name", ["rltt_baseline.yaml", "grpo_baseline_8gpu.yaml",
-                                  "grpo_baseline_1p4b_8gpu.yaml"])
-def test_audit_is_off_in_every_config(env, name):
+@pytest.mark.parametrize("name", sorted(p.name for p in paths.config_file(
+    "grpo_baseline_8gpu.yaml").parent.glob("*.yaml")))
+def test_audit_is_on_in_every_config(env, name):
     cfg = rcfg.load_config(str(paths.config_file(name)))
-    assert cfg.audit.loop_distribution.enabled is False
-    assert rcfg.add_audit_overrides(cfg, {}, _args()) == {}
-
-
-@pytest.mark.parametrize("name,baseline,model", [
-    ("grpo_baseline_1p4b_8gpu_loop_audit.yaml", "grpo_baseline_1p4b_8gpu.yaml",
-     {"num_hidden_layers": 24}),
-    ("grpo_baseline_2p6b_8gpu_loop_audit.yaml", "grpo_baseline_8gpu.yaml",
-     {"num_hidden_layers": 48}),
-])
-def test_audit_configs_differ_from_their_baselines_only_in_the_switch(env, name, baseline, model):
-    on = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(name))))
-    off = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(baseline))))
-    assert on["audit"]["loop_distribution"].pop("enabled") is True
-    assert off["audit"]["loop_distribution"].pop("enabled") is False
-    assert on["wandb"].pop("tags") == off["wandb"].pop("tags") + ["loop-audit"]
-    assert on.pop("model") == model
-    off.pop("model")
-    assert on == off
+    assert cfg.audit.loop_distribution.enabled is True
+    audit = rcfg.add_audit_overrides(cfg, {}, _args())["actor_rollout_ref"]["loop_audit"]
+    assert audit == {"every_n_steps": 1, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
+                     "dir": "/out/run/audit"}
 
 
 def test_config_switch_adds_the_worker_settings(env):
