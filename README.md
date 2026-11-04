@@ -72,7 +72,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    bash scripts/setup_env.sh $W/.venv
    export LOOPRL_VENV=$W/.venv
    ```
-2. **数据**（SAPD 数学训练集 `deepmath_level6.parquet`、MATH 训练集 7,500 题、MATH-500）：
+2. **数据**（当前实验用 14,684 条合并过滤训练集，按下文“过滤后的训练集”下载并校验；
+   以下脚本准备上游源数据和 MATH-500，不会生成这份合并过滤集）：
    ```bash
    bash scripts/prepare_data.sh $W/data      # 默认：SAPD 数据 + MATH-500，结束时打印 export 行
    # 另加 RLTT 论文的 MATH 训练集：--datasets deepmath_level6,math500,math_train
@@ -87,7 +88,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    ```bash
    export LOOPRL_MODEL_DIR=$W/models/Ouro-2.6B-Thinking-RLTT
    export LOOPRL_OURO_DIR=$W/models/Ouro-2.6B-Thinking        # 只有 RLTT 配置用到
-   export LOOPRL_TRAIN_FILE=$W/data/deepmath_level6.parquet   # 或 $W/data/math_train.jsonl
+   export LOOPRL_TRAIN_FILE=$W/data/deepmath_14684/data/train.parquet  # 按下文从 HF 下载
    export LOOPRL_MATH500_JSONL=$W/data/math500.jsonl
    export LOOPRL_OUTPUT_DIR=$W/outputs/grpo_run1
    ```
@@ -127,8 +128,10 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 只有梯度累积改为 1；与 `configs/rltt_baseline.yaml` 一致：
 
 - 模型 Ouro-2.6B-Thinking 全参数，4 次循环。
-- 数据：SAPD 的数学训练集，即 G-OPD 发布的 DeepMath-103K 难度 ≥ 6 子集（57,046 题，
+- 上游数据：SAPD 的数学训练集，即 G-OPD 发布的 DeepMath-103K 难度 ≥ 6 子集（57,046 题，
   `icemoon28/MOPD-Training-Data` 中的 `DeepMath-103K/train_filtered_level6.parquet`）。
+  当前实验使用下文的 **14,684 条合并过滤训练集**；GRPO、RLTT、PLC 都用同一个
+  `LOOPRL_TRAIN_FILE` 指向它。
   prompt 用文件自带的：题目后接 “Please reason step by step, and put your final answer within
   \boxed{}.”，单条 user 消息，再套 Ouro 的 chat template。奖励沿用 RLTT：取最后一个 `\boxed{}`，
   用 `math_verify` 判断与标准答案是否等价，0/1。
@@ -202,13 +205,60 @@ python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" -
 
 ### 过滤后的训练集
 
+当前实验使用 **14,684 条**的合并过滤版本，HF 私有数据仓库为
+[`icemoon28/LoopRL-DeepMath-14684`](https://huggingface.co/datasets/icemoon28/LoopRL-DeepMath-14684)。
+它由 12K 批次筛选出的 2,865 条与 rest45K 批次筛选出的 11,819 条合并，保持原有行序和内容。
+两批次的过滤、判分口径及已知例外记录在仓库的 `source_manifest.json`；完整文件清单和校验值见
+`manifest.json`、`SHA256SUMS`。
+
+- split：`train`；HF 文件：`data/train.parquet`；条数：`14,684`；大小：`2,023,592` 字节。
+- schema：`data_source`、`prompt`、`ability`、`reward_model`、`extra_info`，与现有 verl 训练入口兼容。
+- Parquet SHA256：`353b572a7c3a492b1e50d87e4d5195a461950018331c12258ff704d60c480b41`。
+- 固定数据 revision：`6e0be984159c007d0abd3d717a55617774390907`。
+
+历史运行使用的 JuiceFS 文件如下，HF 保存的是它的逐字节副本：
+
+```text
+/mnt/tidalfs-awsatl01-ren/dataset/pai/haishan1/looprl-work/data/deepmath_level6_train_merged_12k_rest45k/train_filtered_level6_passes1to3_merged_12k_rest45k.parquet
+```
+
+数据仓库为 **Private**，下载账号须有访问权限。先在已有 `huggingface_hub` 环境中执行
+`hf auth login`，或使用已安全配置的 `HF_TOKEN`。以下命令沿用上文的工作目录 `W`；在训练 Pod 中，
+`W` 必须位于已验收的 JuiceFS `/mnt/tidalfs-awsatl01-ren/dataset/pai/sz/zlh` 下；在本机使用本机目录。
+
+```bash
+export LOOPRL_DATA_DIR=$W/data/deepmath_14684
+hf download icemoon28/LoopRL-DeepMath-14684 \
+    --repo-type dataset \
+    --revision 6e0be984159c007d0abd3d717a55617774390907 \
+    --local-dir "$LOOPRL_DATA_DIR"
+
+(cd "$LOOPRL_DATA_DIR" && sha256sum -c SHA256SUMS)
+export LOOPRL_TRAIN_FILE="$LOOPRL_DATA_DIR/data/train.parquet"
+
+python - "$LOOPRL_TRAIN_FILE" <<'PY'
+import sys
+import pyarrow.parquet as pq
+
+rows = pq.ParquetFile(sys.argv[1]).metadata.num_rows
+assert rows == 14684, rows
+print(f"Verified {rows} training rows")
+PY
+```
+
+macOS 可将校验命令替换为 `shasum -a 256 -c SHA256SUMS`。下载并校验后，训练入口通过
+`LOOPRL_TRAIN_FILE` 读取这份文件，三种方法使用相同路径。
+
+#### 仓库内的 12K 过滤分量（2,865 条）
+
 `data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/` 是 12,000 题过滤后留下的 2,865 题，parquet 与原训练集同 schema，可以直接用于训练：
 
 ```bash
 export LOOPRL_TRAIN_FILE=$PWD/data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/train_filtered_level6_passes1to3_no_yesno_01_truefalse.parquet
 ```
 
-140 步 × 32 题需要 4,480 题，这份只够约 89 步不重复。规则和构成见该目录的 README。
+这份 2,865 条数据已纳入上述合并训练集。单独使用时，140 步 × 32 题需要 4,480 题，
+它只够约 89 步不重复。规则和构成见该目录的 README。
 
 ### PLC：Posterior Loop Credit（`configs/plc_posterior_exit_gate_1p4b_8gpu.yaml`）
 
