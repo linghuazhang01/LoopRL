@@ -69,8 +69,9 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
   verl 0.6.1 默认 8192，而原作脚本开着 chunked prefill、`max_model_len` = 2048 + 16384 = 18432；
   这时 verl 要求 `max_num_batched_tokens >= max_model_len`，否则 vLLM 初始化直接报错。
 - launcher 的 `check_rollout_token_budget` 在 dry-run 阶段就拒绝不满足这一条的配置。
-- 其余没写出的 verl rollout 默认值（`top_p` 1.0、`top_k` -1、`do_sample` true、`ignore_eos` false、
-  `max_num_seqs` 1024、`dtype` bfloat16）三种方法相同；改其中任何一个都要整组显式写出。
+- 同一处还显式写出其余与训练有关的 rollout 参数：`top_p` 1.0、`top_k` -1、`do_sample` true、
+  `ignore_eos` false、`max_num_seqs` 1024、`dtype` bfloat16。取值等于 verl 0.6.1 默认值，写出来是为了
+  不依赖默认值；它们是共享键，测试锁定，改任何一个都要整组一起改。
 
 ## KL：全部关闭
 

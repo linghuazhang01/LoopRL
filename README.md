@@ -141,6 +141,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
   生成上限 16,384 tokens；每卡 token 上限 32,768（须 ≥ 2,048 + 16,384）。
   vLLM 每步 token 预算 `max_num_batched_tokens` 也是 32,768：verl 默认 8,192 小于
   `max_model_len` 18,432，开着 chunked prefill 时 vLLM 会拒绝启动，launcher 在 dry-run 阶段就会报错。
+  同一处还显式写出 `top_p` 1.0、`top_k` -1、`do_sample` true、`ignore_eos` false、`max_num_seqs` 1024、
+  `dtype` bfloat16，取值与 verl 默认值相同，所有配置一致。
 - 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 1（论文 2），
   即每步做一次优化器更新（mini-batch = 32 题），共 140 步 = 140 次更新。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
@@ -220,15 +222,11 @@ python scripts/prepare_deepmath_level6_sample.py --source "$LOOPRL_TRAIN_FILE" -
 - Parquet SHA256：`353b572a7c3a492b1e50d87e4d5195a461950018331c12258ff704d60c480b41`。
 - 固定数据 revision：`6e0be984159c007d0abd3d717a55617774390907`。
 
-历史运行使用的 JuiceFS 文件如下，HF 保存的是它的逐字节副本：
-
-```text
-/mnt/tidalfs-awsatl01-ren/dataset/pai/haishan1/looprl-work/data/deepmath_level6_train_merged_12k_rest45k/train_filtered_level6_passes1to3_merged_12k_rest45k.parquet
-```
+早期运行读的是集群共享存储上的同一份文件，HF 上的是它的逐字节副本，SHA256 相同。
 
 数据仓库为 **Private**，下载账号须有访问权限。先在已有 `huggingface_hub` 环境中执行
-`hf auth login`，或使用已安全配置的 `HF_TOKEN`。以下命令沿用上文的工作目录 `W`；在训练 Pod 中，
-`W` 必须位于已验收的 JuiceFS `/mnt/tidalfs-awsatl01-ren/dataset/pai/sz/zlh` 下；在本机使用本机目录。
+`hf auth login`，或使用已安全配置的 `HF_TOKEN`。以下命令沿用上文的工作目录 `W`；在训练集群上，
+`W` 放在集群的共享存储里，在本机就用本机目录。
 
 ```bash
 export LOOPRL_DATA_DIR=$W/data/deepmath_14684

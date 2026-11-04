@@ -99,6 +99,13 @@ verl_overrides:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
                                      # below max_model_len 18,432, which verl refuses with
                                      # chunked prefill on (both vendor scripts turn it on)
+      # sampling and engine settings written out (verl 0.6.1 defaults, same for every method)
+      top_p: 1.0                     # no nucleus truncation
+      top_k: -1                      # no top-k truncation
+      do_sample: true                # sample at args.temperature, not greedy
+      ignore_eos: false              # stop at EOS
+      max_num_seqs: 1024             # vLLM concurrent sequences cap
+      dtype: bfloat16                # vLLM weights / activations
     actor:
       ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups

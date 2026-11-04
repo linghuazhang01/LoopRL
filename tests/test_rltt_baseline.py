@@ -460,6 +460,9 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert rollout.max_num_batched_tokens == 32768, name
     max_model_len = cfg.args.max_prompt_length + cfg.args.max_completion_length
     assert rollout.max_num_batched_tokens >= max_model_len, name
+    explicit = {"top_p": 1.0, "top_k": -1, "do_sample": True, "ignore_eos": False,
+                "max_num_seqs": 1024, "dtype": "bfloat16"}
+    assert {key: rollout[key] for key in explicit} == explicit, name
 
 
 @pytest.mark.parametrize("method", ["grpo", "rltt", "plc"])
