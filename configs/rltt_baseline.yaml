@@ -1,10 +1,11 @@
 # RLTT baseline (Williams & Tureci 2026, arXiv 2602.10520), paper Table 6 settings, except data
 # and lengths, which follow SAPD (as in grpo_baseline_8gpu.yaml): DeepMath-103K level >= 6 with
-# its own prompt, prompts up to 2,048 tokens, generations up to 16,384 (paper: MATH, 1,024 / 2,048).
+# its own prompt, prompts up to 2,048 tokens, generations up to 16,384 (paper: MATH, 1,024 / 2,048),
+# and the gradient accumulation: 1, one update per 32-prompt step (paper: 2).
 # RLTT member of the 2.6B comparison group with grpo_baseline_8gpu.yaml (see CLAUDE.md): the two
 # files share every setting that is not the method itself; the test
 # tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this.
-# The 1.4B group (one update per step) is rltt_baseline_1p4b_8gpu.yaml.
+# The 1.4B group is rltt_baseline_1p4b_8gpu.yaml; the two groups differ only in the model.
 # Launcher: python -m rltt_baseline.launch --config <this file> [overrides]
 # Overrides use dot-list syntax, e.g. args.learning_rate=2e-6 wandb.mode=online
 # Values follow RLTT rltt_experiments/run_rltt.slurm and the paper's Table 6. Paths come from
@@ -45,9 +46,9 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   max_grad_norm: 0.1
   warmup_ratio: 0.1
   lr_scheduler_type: constant   # grpo_train.py hard-codes constant
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step (as the 1.4B group)
   num_train_epochs: 5
-  max_steps: 140                # paper Table 6; -1 = run all epochs
+  max_steps: 140                # paper Table 6; one step = one update; -1 = run all epochs
   seed: 42
 
   # memory / rollout
@@ -95,7 +96,7 @@ verl_overrides:
     train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
   actor_rollout_ref:
     actor:
-      ppo_mini_batch_size: 64   # = 32 prompts x 2 accumulated batches -> one update per 2 steps
+      ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0
       optim:

@@ -1,13 +1,12 @@
 # GRPO on Ouro-1.4B-Thinking, one node with 8 GPUs, 16K generations, one optimizer update per step.
-# Differs from grpo_baseline_8gpu.yaml (Ouro-2.6B-Thinking) in two ways:
-# - the model (the RLTT paper trains both sizes with the same settings);
-# - no gradient accumulation: every 32-prompt step (256 rollouts) is one optimizer update, so the
-#   140 steps are 140 updates and the 10% warmup is 14 updates (2.6B: accumulation 2, 64 prompts
-#   per update, 70 updates).
+# Differs from grpo_baseline_8gpu.yaml (Ouro-2.6B-Thinking) only in the model (the RLTT paper
+#   trains both sizes with the same settings). Both have no gradient accumulation: every
+#   32-prompt step (256 rollouts) is one optimizer update, so the 140 steps are 140 updates and
+#   the 10% warmup is 14 updates.
 # Everything else is the same. Data and lengths follow SAPD: DeepMath-103K level >= 6 (57,046
 #   problems) with its own prompt, prompts up to 2,048 tokens, generations up to 16,384 tokens.
 # Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6) apart
-#   from the accumulation: 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+#   from the accumulation (paper: 2): 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 #   weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Memory settings are kept; with 24 layers x 4 loops the KV cache is about 0.79 MB per token, half
 #   of the 2.6B model's. vLLM takes 50% of GPU memory (free_cache_engine false: kept during training).

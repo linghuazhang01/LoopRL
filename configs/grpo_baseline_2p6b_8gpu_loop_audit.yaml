@@ -8,8 +8,9 @@
 #   prompts up to 2,048 tokens, generations up to 16,384 tokens.
 # Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
 # trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml:
-#   32 prompts x 8 rollouts per step, gradient accumulation 2 (one optimizer
-#   update per 64 prompts), 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+#   32 prompts x 8 rollouts per step, no gradient accumulation (paper: 2; one optimizer update per
+#   32-prompt step, so 140 steps = 140 updates and the 10% warmup = 14 updates), AdamW8bit
+#   lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 #   weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
 #   (PPO clip 0.2, token-mean). Ouro runs a fixed 4 loops. The vendor script differs from the
@@ -48,9 +49,9 @@ args:  # keys = dest names of grpo_train.py argparse options
   weight_decay: 0.1
   max_grad_norm: 0.1          # vendor only passes this to the (unused) critic; see verl_overrides
   warmup_ratio: 0.1
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step (as the 1.4B group)
   num_train_epochs: 5
-  max_steps: 140              # paper Table 6; one step = one 32-prompt rollout batch
+  max_steps: 140              # paper Table 6; one step = one 32-prompt rollout batch = one update
   seed: 42
 
   # memory / rollout
@@ -94,7 +95,7 @@ verl_overrides:
     use_kl_in_reward: false   # vendor GRPO adds KL to the reward; never in the reward here
   actor_rollout_ref:
     actor:
-      ppo_mini_batch_size: 64 # = 32 prompts x 2 accumulated batches -> one update per 2 steps
+      ppo_mini_batch_size: 32 # = the 32 prompts of one step -> one update per step
       grad_clip: 0.1          # vendor leaves the verl default 1.0
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0

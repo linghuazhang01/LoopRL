@@ -330,17 +330,17 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["ppo_epochs"] == 4  # vendor default, unused when use_ppo is false
     # RLTT paper Table 6 settings shared with the RLTT config
     assert vendor["num_prompts_per_batch"] == 32 and vendor["num_generations"] == 8
-    assert vendor["gradient_accumulation_steps"] == 2
+    assert vendor["gradient_accumulation_steps"] == 1  # one update per step (paper: 2)
     # SAPD data and lengths
     assert vendor["train_file"] == ENV["LOOPRL_TRAIN_FILE"]
     assert vendor["max_prompt_length"] == 2048 and vendor["max_completion_length"] == 16384
     for key in ("ppo_max_token_len", "log_prob_max_token_len"):
         assert vendor[key] >= 2048 + 16384
-    assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 0.0  # KL logged, not applied
+    assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 0.0  # KL off
     assert vendor["vllm_gpu_memory_utilization"] == 0.5
     over = resolved["verl_overrides"]
     actor = over["actor_rollout_ref"]["actor"]
-    assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 64
+    assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 32
     assert actor["grad_clip"] == 0.1 and actor["optim"]["betas"] == [0.9, 0.99]
     assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0  # KL off in every config
     assert over["algorithm"]["use_kl_in_reward"] is False
@@ -349,7 +349,7 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
 GRPO_1P4B_CONFIG = paths.config_file("grpo_baseline_1p4b_8gpu.yaml")
 
 
-def test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation(env):
+def test_grpo_1p4b_config_matches_2p6b_except_model(env):
     small = OmegaConf.to_container(rcfg.load_config(str(GRPO_1P4B_CONFIG)))
     large = OmegaConf.to_container(rcfg.load_config(str(GRPO_CONFIG)))
     assert small.pop("model") == {"num_hidden_layers": 24}
@@ -357,14 +357,7 @@ def test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation(env):
     assert small["wandb"].pop("tags") == ["grpo", "baseline", "ouro-1.4b-thinking",
                                           "deepmath-level6"]
     large["wandb"].pop("tags")
-    # one optimizer update per 32-prompt step (2.6B: two steps accumulated into one update)
-    assert small["args"].pop("gradient_accumulation_steps") == 1
-    assert large["args"].pop("gradient_accumulation_steps") == 2
-    small_actor = small["verl_overrides"]["actor_rollout_ref"]["actor"]
-    large_actor = large["verl_overrides"]["actor_rollout_ref"]["actor"]
-    assert small_actor.pop("ppo_mini_batch_size") == 32
-    assert large_actor.pop("ppo_mini_batch_size") == 64
-    assert small == large
+    assert small == large  # same accumulation (1) and mini-batch (32) in both sizes
     assert small["args"]["n_gpus"] == 8 and small["trainer"] == "grpo"
     assert small["args"]["max_prompt_length"] == 2048
     assert small["args"]["max_completion_length"] == 16384
@@ -461,12 +454,16 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
 
 
-def test_matched_1p4b_group_is_one_update_per_step(env):
-    for name in MATCHED_GROUPS["1.4B"].values():
+@pytest.mark.parametrize("group,layers", [("1.4B", 24), ("2.6B", 48)])
+def test_matched_groups_are_one_update_per_step(env, group, layers):
+    # both groups: 32 prompts per step, no accumulation, 140 steps = 140 optimizer updates
+    for name in MATCHED_GROUPS[group].values():
         cfg = rcfg.load_config(str(paths.config_file(name)))
         assert cfg.args.gradient_accumulation_steps == 1 and cfg.args.n_gpus == 8, name
         assert cfg.verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size == 32, name
-        assert cfg.model.num_hidden_layers == 24, name
+        assert cfg.verl_overrides.data.train_batch_size == 32 == cfg.args.num_prompts_per_batch
+        assert cfg.args.max_steps == 140, name
+        assert cfg.model.num_hidden_layers == layers, name
 
 
 def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):

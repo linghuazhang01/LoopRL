@@ -113,7 +113,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，梯度累积 2 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -125,7 +125,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 ### GRPO 8 卡配置要点（`configs/grpo_baseline_8gpu.yaml`）
 
 数据与长度按 SAPD，优化超参数按 RLTT 论文 Table 6（论文中 GRPO 与 RLTT 共用同一套设置），
-与 `configs/rltt_baseline.yaml` 一致：
+只有梯度累积改为 1；与 `configs/rltt_baseline.yaml` 一致：
 
 - 模型 Ouro-2.6B-Thinking 全参数，4 次循环。
 - 数据：SAPD 的数学训练集，即 G-OPD 发布的 DeepMath-103K 难度 ≥ 6 子集（57,046 题，
@@ -135,8 +135,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
   用 `math_verify` 判断与标准答案是否等价，0/1。
 - prompt 上限 2,048 tokens（按 Ouro chat template，最长的题 743 tokens，没有被过滤的），
   生成上限 16,384 tokens；每卡 token 上限 32,768（须 ≥ 2,048 + 16,384）。
-- 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 2，
-  即每 64 题做一次优化器更新（mini-batch = 64 题），共 140 步（70 次更新）。
+- 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 1（论文 2），
+  即每步做一次优化器更新（mini-batch = 32 题），共 140 步 = 140 次更新。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
   梯度裁剪 0.1；KL 关闭（`beta: 0`、`use_kl_loss: false`、`kl_loss_coef: 0`，所有配置相同）；
   clip 0.2，token-mean。
@@ -159,22 +159,18 @@ KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` �
 （GRPO 原作默认就是 true，所以配置里必须显式写 `false`）。
 
 `configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1）。
-注意 warmup 长度按步数算（140 × 10% = 14），但 verl 的学习率调度器每次更新才前进一次，
-梯度累积 2 时共 70 次更新，所以实际 warmup 占前 14 次更新（20%）。原作也是这样，这里不改。
+warmup 长度按步数算（140 × 10% = 14），verl 的学习率调度器每次更新前进一次；梯度累积 1 时步数等于
+更新次数，warmup 就是前 14 次更新（10%）。若以后改回累积 2，warmup 会占到更新数的 20%。
 - 原作 `grpo_train.py` 会**原地修改**模型目录里的 `modeling_ouro.py`。launcher 只接受
   `prepare_model` 生成的目录，拒绝官方目录，避免改动共享的模型文件。
 
 ### GRPO 1.4B 8 卡配置（`configs/grpo_baseline_1p4b_8gpu.yaml`）
 
-与 2.6B 配置有两处不同，其余（数据、prompt 2,048 / 生成 16,384、每步 32 题 × 8 条、140 步、优化器、KL、
-checkpoint、显存参数）都相同，测试 `test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation`
-检查这一点：
-
-1. 模型为 Ouro-1.4B-Thinking（RLTT 论文两种规模用同一套设置）。
-2. **每步都做一次优化器更新**：梯度累积 1，mini-batch 32 题（= 一步的题数），GRPO 只跑 1 个 epoch。
-   140 步即 140 次更新，每次用 256 条 rollout；warmup 10% 即前 14 次更新。2.6B 配置是梯度累积 2，
-   每 64 题更新一次，共 70 次更新，warmup 实际占 20%。
-   测试 `test_mini_batch_is_one_accumulated_update` 检查三份配置的 mini-batch 都等于“每步题数 × 累积步数”。
+与 2.6B 配置只差模型（Ouro-1.4B-Thinking；RLTT 论文两种规模用同一套设置），其余（数据、prompt 2,048 /
+生成 16,384、每步 32 题 × 8 条、梯度累积 1、mini-batch 32 题、140 步 = 140 次更新、优化器、KL、
+checkpoint、显存参数）都相同，测试 `test_grpo_1p4b_config_matches_2p6b_except_model` 检查这一点。
+每次更新用 256 条 rollout，GRPO 只跑 1 个 epoch；warmup 10% 即前 14 次更新。
+测试 `test_mini_batch_is_one_accumulated_update` 检查每份配置的 mini-batch 都等于“每步题数 × 累积步数”。
 
 - 模型 `ByteDance/Ouro-1.4B-Thinking` @ `3aaa2224`，`prepare_model.sh --model 1.4B` 下载并核对
   `model.safetensors`、`modeling_ouro.py`、`configuration_ouro.py`、`config.json` 的 SHA256。

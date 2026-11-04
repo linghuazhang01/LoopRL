@@ -21,7 +21,7 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，梯度累积 2 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
 
 组内**允许**不同的只有：
 
@@ -48,6 +48,9 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 4. 消融走同一份配置加覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`。
    PLC 配置加 `plc.gamma=0 plc.use_gate_loss=false` 是"与 PLC 完全同一条代码路径"的 RLTT 对照；
    `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。两者回答的问题不同，论文里都要有。
+
+两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48）：都是每步 32 题 × 8 条、
+梯度累积 1、mini-batch 32 题、140 步 = 140 次优化器更新（论文 Table 6 是累积 2，这里统一改为 1）。
 
 ## KL：全部关闭
 

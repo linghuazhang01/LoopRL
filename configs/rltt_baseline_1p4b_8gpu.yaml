@@ -7,9 +7,8 @@
 # tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this:
 # change a shared value in all files of the group at once.
 #
-# Differs from rltt_baseline.yaml (Ouro-2.6B-Thinking) in the model and the accumulation only:
-# accumulation 1 and mini-batch 32 prompts, so the 140 steps are 140 updates and the 10% warmup is
-# 14 updates (2.6B: accumulation 2, 64 prompts per update, 70 updates, warmup 20% of them).
+# Differs from rltt_baseline.yaml (Ouro-2.6B-Thinking) in the model only. Both use accumulation 1
+# and mini-batch 32 prompts, so the 140 steps are 140 updates and the 10% warmup is 14 updates.
 #
 # Objective: the vendor RLTT loss (third_party/RLTT rltt_experiments/verl_rltt): REINFORCE on
 #   sum_t w_t log P^(t)(y_j),  w = the model's exit distribution (loop_weighting exit_pdf),
