@@ -6,7 +6,7 @@
 # (gamma = 1: exact posterior of the exit mixture; gamma = 0 would be RLTT-exit), lam = 1 (no extra
 # final-loop GRPO term), plus the gate loss
 #   gate_coef * A * CE(sg[w], q_new) - gate_entropy_coef * H(q_new)
-# (gate_entropy_coef 0.05 = Ouro's last-stage entropy coefficient). KL (final loop, 1e-3) as RLTT.
+# (gate_entropy_coef 0.05 = Ouro's last-stage entropy coefficient). KL loss is disabled.
 # The gate loss needs an RLTT model directory built WITHOUT --detach-exit-pdf (the launcher checks
 # config.json); build it with `bash scripts/prepare_model.sh <models dir> --model 1.4B`.
 #
@@ -41,7 +41,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   # run name and logging consistent with the prior used here
   loop_weighting: exit_pdf
   progressive_alpha: 1.0
-  beta: 0.001                   # KL coefficient, final loop only
+  beta: 0.0                     # KL loss disabled, as in the GRPO comparison run
   num_generations: 8
   num_prompts_per_batch: 32
   temperature: 1.0
@@ -61,7 +61,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false
-  vllm_gpu_memory_utilization: 0.45
+  vllm_gpu_memory_utilization: 0.6
   vllm_tensor_parallel_size: 1
   vllm_enforce_eager: false
 
@@ -108,6 +108,8 @@ verl_overrides:
   actor_rollout_ref:
     actor:
       ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
+      use_kl_loss: false
+      kl_loss_coef: 0.0
       optim:
         betas: [0.9, 0.99]
       checkpoint:
