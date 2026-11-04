@@ -569,6 +569,115 @@ def test_online_launch_without_a_key_stops_before_ray(env, capsys, monkeypatch):
         launch.main(["--config", str(GRPO_1P4B_CONFIG)])
 
 
+# ---------- project rules enforced at launch (AGENTS.md 1, 2, 4) ----------
+
+def _parquet(path, rows):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"x": list(range(rows))}), path)
+    return path
+
+
+def _require_file(monkeypatch, path):
+    """Make ``path`` the required training file (its SHA256 and row count)."""
+    check = rcfg.train_file_check(path)
+    monkeypatch.setattr(rcfg, "REQUIRED_TRAIN_SHA256", check["sha256"])
+    monkeypatch.setattr(rcfg, "REQUIRED_TRAIN_ROWS", check["rows"])
+    return check
+
+
+def _violations(cfg, check):
+    args = types.SimpleNamespace(seed=cfg.args.seed)
+    return rcfg.policy_violations(cfg, args, rcfg.verl_overrides(cfg), check)
+
+
+def test_project_rules_pin_the_14684_row_training_set():
+    assert rcfg.REQUIRED_TRAIN_ROWS == 14684 and rcfg.REQUIRED_SEED == 42
+    assert rcfg.REQUIRED_TRAIN_SHA256 == (
+        "353b572a7c3a492b1e50d87e4d5195a461950018331c12258ff704d60c480b41")
+    assert rcfg.REQUIRED_WANDB == {"enabled": True, "mode": "online", "project": "looprl-ouro"}
+
+
+def test_train_file_check(tmp_path):
+    check = rcfg.train_file_check(_parquet(tmp_path / "t.parquet", 3))
+    assert check["exists"] and check["rows"] == 3 and len(check["sha256"]) == 64
+    missing = rcfg.train_file_check(tmp_path / "none.parquet")
+    assert missing == {"path": str(tmp_path / "none.parquet"), "exists": False, "sha256": None,
+                       "rows": None, "error": None}
+    (tmp_path / "t.jsonl").write_text("{}\n")
+    assert "row count" in rcfg.train_file_check(tmp_path / "t.jsonl")["error"]
+
+
+@pytest.mark.parametrize("name", sorted({n for g in MATCHED_GROUPS.values() for n in g.values()}))
+def test_matched_configs_pass_the_rules_on_the_required_file(env, tmp_path, monkeypatch, name):
+    check = _require_file(monkeypatch, _parquet(tmp_path / "train.parquet", 4))
+    assert _violations(rcfg.load_config(str(paths.config_file(name))), check) == []
+
+
+@pytest.mark.parametrize("override,rules", [
+    # data.seed interpolates ${args.seed}, so both seeds change
+    ("args.seed=7", ["rule 2 (seed): args.seed", "rule 2 (seed): verl_overrides.data.seed"]),
+    ("verl_overrides.data.seed=0", ["rule 2 (seed): verl_overrides.data.seed"]),
+    ("wandb.mode=offline", ["rule 4 (wandb): wandb.mode"]),
+    ("wandb.enabled=false", ["rule 4 (wandb): wandb.enabled"]),
+    ("wandb.project=other", ["rule 4 (wandb): wandb.project"]),
+])
+def test_rule_breaches_are_reported(env, tmp_path, monkeypatch, override, rules):
+    check = _require_file(monkeypatch, _parquet(tmp_path / "train.parquet", 4))
+    problems = _violations(rcfg.load_config(str(GRPO_1P4B_CONFIG), [override]), check)
+    assert len(problems) == len(rules)
+    assert all(problem.startswith(rule) for problem, rule in zip(problems, rules))
+
+
+def test_wrong_or_missing_training_data_is_reported(env, tmp_path, monkeypatch):
+    _require_file(monkeypatch, _parquet(tmp_path / "train.parquet", 4))
+    cfg = rcfg.load_config(str(GRPO_1P4B_CONFIG))
+    other = rcfg.train_file_check(_parquet(tmp_path / "other.parquet", 5))
+    problems = _violations(cfg, other)
+    assert [p.split(":")[0] for p in problems] == ["rule 1 (data)", "rule 1 (data)"]
+    assert "expected 4 rows" in problems[1]
+    missing = _violations(cfg, rcfg.train_file_check(tmp_path / "missing.parquet"))
+    assert len(missing) == 1 and "does not exist" in missing[0]
+
+
+def _launch_env(monkeypatch):
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+
+def test_dry_run_reports_breaches_and_a_launch_stops_on_them(env, tmp_path, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    _launch_env(monkeypatch)
+    train = _parquet(tmp_path / "train.parquet", 4)
+    _require_file(monkeypatch, train)
+    monkeypatch.setenv("LOOPRL_TRAIN_FILE", str(train))
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    assert launch.main(["--config", str(GRPO_1P4B_CONFIG), "--dry-run", "args.seed=7"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved["train_file_check"]["rows"] == 4
+    assert [p.split(":")[0] for p in resolved["policy_violations"]] == ["rule 2 (seed)"] * 2
+    with pytest.raises(SystemExit, match="refusing to train(.|\\n)*rule 2 \\(seed\\)"):
+        launch.main(["--config", str(GRPO_1P4B_CONFIG), "args.seed=7"])
+    with pytest.raises(SystemExit, match="rule 4 \\(wandb\\): wandb.mode"):
+        launch.main(["--config", str(GRPO_1P4B_CONFIG), "wandb.mode=offline"])
+
+
+def test_a_launch_that_follows_the_rules_gets_past_the_check(env, tmp_path, monkeypatch):
+    from rltt_baseline import launch
+
+    _launch_env(monkeypatch)
+    train = _parquet(tmp_path / "train.parquet", 4)
+    _require_file(monkeypatch, train)
+    monkeypatch.setenv("LOOPRL_TRAIN_FILE", str(train))
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    # the rules pass; it stops later, at the model-directory check (no model in the test)
+    with pytest.raises(FileNotFoundError, match="config.json"):
+        launch.main(["--config", str(GRPO_1P4B_CONFIG)])
+
+
 # ---------- vLLM token budget ----------
 
 @pytest.mark.parametrize("rollout,ok", [

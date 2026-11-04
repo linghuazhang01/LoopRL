@@ -13,8 +13,8 @@
 # config.json); build it with `bash scripts/prepare_model.sh <models dir> --model 1.4B`.
 #
 # Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
-# like the other configs here. For the RLTT paper's setting (MATH train, 2,048 generations) override
-#   args.train_file=<MATH train jsonl> args.max_completion_length=2048
+# like the other configs here; training uses only the 14,684-row merged filtered subset
+# (AGENTS.md rule 1), and the launcher refuses any other training file.
 # Optimisation follows RLTT Table 6 apart from the accumulation (1 here, paper 2): 140 steps =
 # 140 updates, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 # weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.

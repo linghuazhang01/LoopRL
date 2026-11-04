@@ -40,7 +40,8 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   no_gradient_checkpointing: false                   # GRPO script: checkpointing always on
   ref_offload: true                                  # GRPO config: ref.fsdp_config.param_offload
 
-  # data: SAPD math training set (deepmath_level6.parquet), prompts used unchanged;
+  # data: the 14,684-row merged filtered set (AGENTS.md rule 1; the launcher refuses any other
+  # file), prompts used unchanged;
   # MATH-500 for optional validation
   train_file: ${oc.env:LOOPRL_TRAIN_FILE}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}

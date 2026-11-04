@@ -9,6 +9,9 @@
 PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule，固定 commit，**不修改**）；
 本仓库的适配代码在 `rltt_baseline/`，配置在 `configs/`，细节见 README.md。
 
+launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 与行数、seed 42、wandb online 且项目
+`looprl-ouro`），违反就拒绝启动，没有跳过开关；对应常量在 `rltt_baseline/config.py`。
+
 ## 分支：代码统一在 main
 
 - **所有代码、配置和文档的修改都直接在 `main` 上进行。** 不再为新功能或新方法开长期分支；

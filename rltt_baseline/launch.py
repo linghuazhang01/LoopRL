@@ -33,7 +33,11 @@ What this adds around the vendor script (whose files are not modified; located b
     forward each step; ``rltt_baseline_resolved.json`` records the outcome as ``reference_policy``;
 12. variables in the local, gitignored ``env.local`` (repo root, or ``LOOPRL_ENV_FILE``) are loaded
     first without overriding the environment, e.g. ``WANDB_API_KEY``; the resolved config lists
-    only their names. A launch with ``wandb.mode=online`` and no ``WANDB_API_KEY`` stops before Ray.
+    only their names. A launch with ``wandb.mode=online`` and no ``WANDB_API_KEY`` stops before Ray;
+13. the project rules of AGENTS.md are enforced before Ray starts, with no override: the training
+    file must be the 14,684-row set (SHA256 and row count checked), ``args.seed`` and
+    ``data.seed`` must be 42, and wandb must be enabled, online, project ``looprl-ouro``. The
+    dry-run reports ``train_file_check`` and ``policy_violations`` without stopping.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -61,15 +65,17 @@ from rltt_baseline.config import (
     build_args,
     check_kl_not_in_reward,
     check_rollout_token_budget,
-    check_wandb_key,
     drop_unused_reference,
     env_file_path,
     load_config,
     load_env_file,
     plc_settings,
+    policy_violations,
     reference_policy_status,
+    train_file_check,
     verl_overrides,
     wandb_env,
+    wandb_key_problem,
     wandb_key_status,
 )
 from rltt_baseline.paths import SRC_DIR, rltt_source_dir
@@ -251,6 +257,8 @@ def main(argv=None) -> int:
     check_kl_not_in_reward(cfg.trainer, overrides)
     check_rollout_token_budget(overrides, args)
     loop_audit = (overrides.get("actor_rollout_ref") or {}).get("loop_audit")
+    train_check = train_file_check(args.train_file)
+    violations = policy_violations(cfg, args, overrides, train_check)
 
     resolved = {
         "trainer": cfg.trainer,
@@ -264,12 +272,18 @@ def main(argv=None) -> int:
         "env_file": {"path": str(env_file), "exists": env_file.is_file(),
                      "loaded_keys": env_file_keys},
         "wandb_api_key": wandb_key_status(cfg, os.environ),
+        "train_file_check": train_check,
+        "policy_violations": violations,  # non-empty: a real launch stops (AGENTS.md 1, 2, 4)
     }
     if opts.dry_run:
         print(json.dumps(resolved, indent=2, default=str))
         return 0
 
-    check_wandb_key(cfg, os.environ, env_file)
+    key_problem = wandb_key_problem(cfg, os.environ, env_file)
+    problems = violations + ([key_problem] if key_problem else [])
+    if problems:
+        raise SystemExit("refusing to train, project rules broken (AGENTS.md):\n  - "
+                         + "\n  - ".join(problems))
     n_gpus = args.n_gpus
     if n_gpus is None:
         import torch

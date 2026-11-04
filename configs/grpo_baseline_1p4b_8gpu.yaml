@@ -3,10 +3,12 @@
 #   trains both sizes with the same settings). Both have no gradient accumulation: every
 #   32-prompt step (256 rollouts) is one optimizer update, so the 140 steps are 140 updates and
 #   the 10% warmup is 14 updates.
-# Everything else is the same. Data and lengths follow SAPD: DeepMath-103K level >= 6 (57,046
-#   problems) with its own prompt, prompts up to 2,048 tokens, generations up to 16,384 tokens.
+# Everything else is the same. Data and lengths follow SAPD: DeepMath-103K level >= 6 with its
+#   own prompt (training uses the 14,684-row filtered subset, AGENTS.md rule 1), prompts up to
+#   2,048 tokens, generations up to 16,384 tokens.
 # Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6) apart
-#   from the accumulation (paper: 2): 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+#   from the accumulation (paper: 2): 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup,
+#   betas (0.9, 0.99),
 #   weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Memory settings are kept; with 24 layers x 4 loops the KV cache is about 0.79 MB per token, half
 #   of the 2.6B model's. vLLM takes 50% of GPU memory (free_cache_engine false: kept during training).
@@ -30,8 +32,8 @@ args:  # keys = dest names of grpo_train.py argparse options
   no_lora: true
   no_sft_checkpoint: true
 
-  # data: SAPD math training set (deepmath_level6.parquet from scripts/prepare_data.sh), a verl
-  # parquet whose prompts are used unchanged; a MATH JSONL instead gets the RLTT prompt.
+  # data: the 14,684-row merged filtered set (AGENTS.md rule 1; the launcher refuses any other
+  # file: SHA256 and row count are checked), a verl parquet whose prompts are used unchanged.
   # MATH-500 for optional validation (vendor conversion, RLTT prompt).
   train_file: ${oc.env:LOOPRL_TRAIN_FILE}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}

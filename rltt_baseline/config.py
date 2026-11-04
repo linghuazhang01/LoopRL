@@ -51,6 +51,7 @@ Values may use ``${oc.env:VAR}`` interpolation.
 
 import argparse
 import difflib
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -250,11 +251,77 @@ def wandb_key_status(cfg: DictConfig, environ: Mapping[str, str]) -> str:
     return "found" if environ.get("WANDB_API_KEY") else "missing"
 
 
-def check_wandb_key(cfg: DictConfig, environ: Mapping[str, str], env_file) -> None:
-    if wandb_key_status(cfg, environ) == "missing":
-        raise SystemExit(f"wandb.mode is online but WANDB_API_KEY is not set: put "
-                         f"WANDB_API_KEY=<key> in {env_file} (gitignored; see env.local.example) "
-                         "or export it before launching")
+def wandb_key_problem(cfg: DictConfig, environ: Mapping[str, str], env_file) -> Optional[str]:
+    if wandb_key_status(cfg, environ) != "missing":
+        return None
+    return (f"wandb.mode is online but WANDB_API_KEY is not set: put WANDB_API_KEY=<key> in "
+            f"{env_file} (gitignored; see env.local.example) or export it before launching")
+
+
+# ---------- project rules enforced at launch (AGENTS.md rules 1, 2 and 4) ----------
+
+# Rule 1: the 14,684-row merged filtered training set, icemoon28/LoopRL-DeepMath-14684 at revision
+# 6e0be984159c007d0abd3d717a55617774390907, data/train.parquet.
+REQUIRED_TRAIN_SHA256 = "353b572a7c3a492b1e50d87e4d5195a461950018331c12258ff704d60c480b41"
+REQUIRED_TRAIN_ROWS = 14684
+# Rule 2: training seed (driver and verl dataloader).
+REQUIRED_SEED = 42
+# Rule 4: wandb logging.
+REQUIRED_WANDB = {"enabled": True, "mode": "online", "project": "looprl-ouro"}
+
+
+def train_file_check(path) -> Dict[str, object]:
+    """SHA256 and row count of the training file, for the dry-run report and the launch check."""
+    path = Path(str(path))
+    result: Dict[str, object] = {"path": str(path), "exists": path.is_file(), "sha256": None,
+                                 "rows": None, "error": None}
+    if not result["exists"]:
+        return result
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    result["sha256"] = digest.hexdigest()
+    try:
+        import pyarrow.parquet as pq
+
+        result["rows"] = int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception as exc:  # not a parquet file, or pyarrow missing
+        result["error"] = f"cannot read the row count: {exc!r}"
+    return result
+
+
+def policy_violations(cfg: DictConfig, args: argparse.Namespace, overrides: dict,
+                      train_check: Dict[str, object]) -> List[str]:
+    """Breaches of the project rules (AGENTS.md 1, 2, 4); the launcher refuses to train on any."""
+    expected_sha256, expected_rows = REQUIRED_TRAIN_SHA256, REQUIRED_TRAIN_ROWS
+    problems = []
+    # rule 1: training data
+    if not train_check["exists"]:
+        problems.append(f"rule 1 (data): training file {train_check['path']} does not exist; "
+                        "LOOPRL_TRAIN_FILE must point to the 14,684-row set (README)")
+    else:
+        if train_check["sha256"] != expected_sha256:
+            problems.append(f"rule 1 (data): {train_check['path']} has SHA256 "
+                            f"{train_check['sha256']}, expected {expected_sha256}")
+        if train_check["rows"] != expected_rows:
+            detail = train_check["error"] or f"{train_check['rows']} rows"
+            problems.append(f"rule 1 (data): {train_check['path']}: {detail}, "
+                            f"expected {expected_rows} rows")
+    # rule 2: seed
+    if args.seed != REQUIRED_SEED:
+        problems.append(f"rule 2 (seed): args.seed is {args.seed}, must be {REQUIRED_SEED}")
+    data_seed = (overrides.get("data") or {}).get("seed")
+    if data_seed != REQUIRED_SEED:
+        problems.append(f"rule 2 (seed): verl_overrides.data.seed is {data_seed}, must be "
+                        f"{REQUIRED_SEED} (write data.seed: ${{args.seed}})")
+    # rule 4: wandb
+    wandb = cfg.wandb
+    for key, required in REQUIRED_WANDB.items():
+        if wandb.get(key) != required:
+            problems.append(f"rule 4 (wandb): wandb.{key} is {wandb.get(key)!r}, "
+                            f"must be {required!r}")
+    return problems
 
 
 def wandb_env(cfg: DictConfig) -> Dict[str, str]:

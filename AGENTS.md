@@ -3,6 +3,12 @@
 本文件适用于在本仓库工作的所有 agent（Claude、Codex 等）。`CLAUDE.md` 写配置对照组、KL、
 分支等细节；两者冲突时以本文件为准。下面四条规则没有例外，除非用户在对话里明确要求改变。
 
+规则 1、2、4 由 launcher 强制执行，对人和 agent 都一样：`rltt_baseline.launch` 在启动 Ray 之前
+检查训练文件（SHA256、行数）、seed 和 wandb 设置，任一项不符就拒绝训练，并一次列出所有问题；
+没有跳过检查的开关。dry-run 只报告，输出里的 `train_file_check` 和 `policy_violations` 就是检查结果，
+`policy_violations` 必须为空才能启动。规则对应的固定值在 `rltt_baseline/config.py` 的
+`REQUIRED_TRAIN_SHA256`、`REQUIRED_TRAIN_ROWS`、`REQUIRED_SEED`、`REQUIRED_WANDB`。
+
 ## 1. 训练数据：只用 14,684 条合并过滤训练集
 
 - 所有训练（GRPO、RLTT、PLC，1.4B 和 2.6B，正式实验和消融）都用同一份数据：
@@ -49,7 +55,8 @@
    - **配置文件**和全部**命令行覆盖**（`cli_overrides`）。
    - **环境变量**的实际值：`LOOPRL_TRAIN_FILE`、`LOOPRL_MODEL_DIR`、`LOOPRL_OURO_DIR`、
      `LOOPRL_MATH500_JSONL`、`LOOPRL_OUTPUT_DIR`。
-   - **数据核对结果**：训练文件的 SHA256 和行数（规则 1）。
+   - **数据核对结果**：dry-run 输出的 `train_file_check`（SHA256、行数），以及 `policy_violations`
+     （必须为空）。
    - **全部参数**：dry-run 输出中的 `vendor_args`（原作脚本的全部参数，包括配置没写、取默认值的）、
      `verl_overrides`（含 `max_num_batched_tokens`、KL、mini-batch、betas、审计设置）、
      `config.plc`、`config.rollout`、`config.audit`、`config.wandb`、`env`、`reference_policy`。

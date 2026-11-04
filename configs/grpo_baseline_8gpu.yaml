@@ -1,6 +1,7 @@
 # GRPO baseline on Ouro-2.6B-Thinking, one node with 8 GPUs (stage 1 of the loop-gradient study).
-# Data and lengths follow SAPD: DeepMath-103K level >= 6 (57,046 problems) with its own prompt,
-#   prompts up to 2,048 tokens, generations up to 16,384 tokens.
+# Data and lengths follow SAPD: DeepMath-103K level >= 6 with its own prompt (training uses the
+#   14,684-row filtered subset, AGENTS.md rule 1), prompts up to 2,048 tokens, generations up to
+#   16,384 tokens.
 # Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
 # trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml (the 2.6B
 # comparison group, see CLAUDE.md; test_matched_configs_share_all_non_method_settings):
@@ -24,8 +25,8 @@ args:  # keys = dest names of grpo_train.py argparse options
   no_lora: true
   no_sft_checkpoint: true
 
-  # data: SAPD math training set (deepmath_level6.parquet from scripts/prepare_data.sh), a verl
-  # parquet whose prompts are used unchanged; a MATH JSONL instead gets the RLTT prompt.
+  # data: the 14,684-row merged filtered set (AGENTS.md rule 1; the launcher refuses any other
+  # file: SHA256 and row count are checked), a verl parquet whose prompts are used unchanged.
   # MATH-500 for optional validation (vendor conversion, RLTT prompt).
   train_file: ${oc.env:LOOPRL_TRAIN_FILE}
   math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}

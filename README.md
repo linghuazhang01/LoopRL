@@ -61,7 +61,10 @@ third_party/ouro_source     官方 Ouro modeling 文件（Apache-2.0，见该目
 
 ## 使用
 
-在本仓库工作的 agent 须遵守 `AGENTS.md`：只用 14,684 条训练集、训练 seed 固定 42、每次启动训练前报告全部参数。
+在本仓库工作的 agent 须遵守 `AGENTS.md`：只用 14,684 条训练集、训练 seed 固定 42、wandb online、每次启动训练前报告全部参数。
+其中数据、seed 和 wandb 三条由 launcher 强制检查：训练文件的 SHA256 或行数不对、`args.seed` /
+`data.seed` 不是 42、wandb 不是 online 或项目不是 `looprl-ouro`，都会在启动 Ray 之前拒绝训练
+（dry-run 的 `policy_violations` 列出这些问题）。
 
 ```bash
 git clone --recurse-submodules https://github.com/linghuazhang01/LoopRL.git
