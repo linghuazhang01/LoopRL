@@ -1,0 +1,141 @@
+# RLTT baseline on Ouro-1.4B-Thinking, one node with 8 GPUs, one optimizer update per step.
+# This is the RLTT member of the 1.4B comparison group (see CLAUDE.md):
+#   grpo_baseline_1p4b_8gpu.yaml / rltt_baseline_1p4b_8gpu.yaml /
+#   plc_posterior_exit_gate_1p4b_8gpu.yaml
+# The three files share every setting that is not the method itself (data, lengths, 32 prompts x 8
+# rollouts, 140 steps, optimizer, KL, rollout, checkpoints, model check). The test
+# tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this:
+# change a shared value in all files of the group at once.
+#
+# Differs from rltt_baseline.yaml (Ouro-2.6B-Thinking) in the model and the accumulation only:
+# accumulation 1 and mini-batch 32 prompts, so the 140 steps are 140 updates and the 10% warmup is
+# 14 updates (2.6B: accumulation 2, 64 prompts per update, 70 updates, warmup 20% of them).
+#
+# Objective: the vendor RLTT loss (third_party/RLTT rltt_experiments/verl_rltt): REINFORCE on
+#   sum_t w_t log P^(t)(y_j),  w = the model's exit distribution (loop_weighting exit_pdf),
+# KL loss disabled (use_kl_loss false, coefficient 0), as in every config of the group.
+# The model directory built by prepare_model has rltt_detach_exit_pdf false (the PLC gate loss
+# needs it), so here the exit gate also receives gradient through the weights; GRPO never
+# touches the gate. For RLTT on exactly the PLC code path (per-loop PPO ratio, fixed detached
+# weights) run the PLC config with
+#   plc.gamma=0 plc.use_gate_loss=false
+#
+# Model directory: `bash scripts/prepare_model.sh <models dir> --model 1.4B`;
+#   LOOPRL_MODEL_DIR = <models dir>/Ouro-1.4B-Thinking-RLTT,
+#   LOOPRL_OURO_DIR = <models dir>/Ouro-1.4B-Thinking.
+#   model.num_hidden_layers (bottom) makes the launcher refuse a 2.6B directory.
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+
+trainer: rltt
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  # model: Ouro-1.4B-Thinking, full-parameter, fixed 4 loops; the per-loop model directory is
+  # rltt_model_path, model_path (official dir) only names the run
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model (1.4B)
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false                   # GRPO script: checkpointing always on
+  ref_offload: true                                  # GRPO config: ref.fsdp_config.param_offload
+
+  # data: SAPD math training set (deepmath_level6.parquet), prompts used unchanged;
+  # MATH-500 for optional validation
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 2048
+  max_completion_length: 16384
+
+  # RLTT objective
+  loop_weighting: exit_pdf      # uniform | progressive | exit_pdf | learned
+  progressive_alpha: 1.0
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
+  num_generations: 8
+  num_prompts_per_batch: 32
+  temperature: 1.0
+
+  # optimisation
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1            # passed by the vendor script as actor grad_clip
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant   # grpo_train.py hard-codes constant
+  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step
+  num_train_epochs: 5
+  max_steps: 140
+  seed: 42
+
+  # memory / rollout
+  ppo_max_token_len: 32768      # >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  # resources and outputs
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 10
+  logging_steps: 1
+
+  # validation (off, as in the RLTT paper runs)
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 16384
+
+wandb:
+  enabled: true
+  mode: offline
+  project: rltt-ouro-baseline
+  entity: null
+  run_name: null                # null = vendor name RLTT-<model>-<loop_weighting>
+  tags: [rltt, baseline, ouro-1.4b-thinking, deepmath-level6]
+  notes: null
+  dir: ${args.output_dir}
+
+# The vendor script differs from the paper in two places (batch read as prompts, betas), fixed
+# here; grad clip it already has.
+verl_overrides:
+  data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
+    train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
+  actor_rollout_ref:
+    actor:
+      ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
+      optim:
+        betas: [0.9, 0.99]      # paper Table 6; both vendor scripts use (0.9, 0.999)
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]  # hf_model: loadable by the probe
+  trainer:
+    logger: [wandb, console]
+
+rollout:
+  # full: stock vLLM (one KV cache per loop). decode_last: prompts keep every loop's KV,
+  # generated tokens keep only the last loop's (rltt_baseline.vllm_decode_last).
+  kv_layout: full
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
+
+model:
+  num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. Off by default: about 220 bytes per token before compression.
+  loop_distribution:
+    enabled: false
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory

@@ -104,7 +104,7 @@ def main(argv=None) -> int:
     parser.add_argument("--losses", default=",".join(LOSSES))
     parser.add_argument("--batches", type=int, default=4)
     parser.add_argument("--groups-per-batch", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=20261023)
+    parser.add_argument("--seed", type=int, default=42)  # project-wide default seed
     parser.add_argument("--max-len", type=int, default=12288)
     parser.add_argument("--no-checkpoint", action="store_true")
     parser.add_argument("--acc-device", default="cuda", choices=["cuda", "cpu"])

@@ -14,7 +14,7 @@
 # like the other configs here. For the RLTT paper's setting (MATH train, 2,048 generations) override
 #   args.train_file=<MATH train jsonl> args.max_completion_length=2048
 # Optimisation follows RLTT Table 6: 140 steps, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
-# weight decay 0.1, grad clip 0.1, BF16, binary reward, group-normalised advantage.
+# weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
 # Ablations by override, e.g. plc.gamma=0 (RLTT-exit), plc.lam=0 (GRPO), plc.use_gate_loss=false,
 #   plc.prior=uniform plc.use_gate_loss=false (PLC-uniform), plc.use_is_correction=true.
@@ -41,7 +41,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   # run name and logging consistent with the prior used here
   loop_weighting: exit_pdf
   progressive_alpha: 1.0
-  beta: 0.0                     # KL loss disabled, as in the GRPO comparison run
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
   num_generations: 8
   num_prompts_per_batch: 32
   temperature: 1.0
@@ -61,7 +61,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false
-  vllm_gpu_memory_utilization: 0.6
+  vllm_gpu_memory_utilization: 0.5
   vllm_tensor_parallel_size: 1
   vllm_enforce_eager: false
 
@@ -104,11 +104,12 @@ wandb:
 
 verl_overrides:
   data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
     train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
   actor_rollout_ref:
     actor:
       ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
-      use_kl_loss: false
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0
       optim:
         betas: [0.9, 0.99]

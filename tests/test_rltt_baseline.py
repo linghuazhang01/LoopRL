@@ -211,7 +211,7 @@ def test_default_config_resolves_to_paper_settings(env):
     env_vars = rcfg.wandb_env(cfg)
     assert env_vars["WANDB_MODE"] == "offline"
     assert env_vars["WANDB_DIR"] == ENV["LOOPRL_OUTPUT_DIR"]
-    assert env_vars["WANDB_TAGS"] == "rltt,baseline,ouro-2.6b-thinking"
+    assert env_vars["WANDB_TAGS"] == "rltt,baseline,ouro-2.6b-thinking,deepmath-level6"
 
 
 def test_cli_overrides_win(env):
@@ -222,8 +222,10 @@ def test_cli_overrides_win(env):
     assert args.learning_rate == 2e-6 and args.max_steps == 10
     assert rcfg.wandb_env(cfg)["WANDB_MODE"] == "online"
     overrides = rcfg.verl_overrides(cfg)
-    assert overrides["trainer"] == {"save_freq": 20, "experiment_name": "try1"}
-    assert overrides["data"] == {"train_batch_size": 32}  # paper: 32 prompts per rollout batch
+    assert overrides["trainer"] == {"save_freq": 20, "experiment_name": "try1",
+                                    "logger": ["wandb", "console"]}
+    # paper: 32 prompts per rollout batch; the shuffle seed follows args.seed
+    assert overrides["data"] == {"train_batch_size": 32, "seed": 42}
     assert overrides["actor_rollout_ref"]["actor"]["optim"]["betas"] == [0.9, 0.99]
 
 
@@ -334,12 +336,14 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["max_prompt_length"] == 2048 and vendor["max_completion_length"] == 16384
     for key in ("ppo_max_token_len", "log_prob_max_token_len"):
         assert vendor[key] >= 2048 + 16384
-    assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 1e-3
+    assert vendor["learning_rate"] == 1e-6 and vendor["beta"] == 0.0  # KL logged, not applied
+    assert vendor["vllm_gpu_memory_utilization"] == 0.5
     over = resolved["verl_overrides"]
     actor = over["actor_rollout_ref"]["actor"]
     assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 64
     assert actor["grad_clip"] == 0.1 and actor["optim"]["betas"] == [0.9, 0.99]
-    assert actor["use_kl_loss"] is True and over["algorithm"]["use_kl_in_reward"] is False
+    assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0  # KL off in every config
+    assert over["algorithm"]["use_kl_in_reward"] is False
 
 
 GRPO_1P4B_CONFIG = paths.config_file("grpo_baseline_1p4b_8gpu.yaml")
@@ -348,7 +352,8 @@ GRPO_1P4B_CONFIG = paths.config_file("grpo_baseline_1p4b_8gpu.yaml")
 def test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation(env):
     small = OmegaConf.to_container(rcfg.load_config(str(GRPO_1P4B_CONFIG)))
     large = OmegaConf.to_container(rcfg.load_config(str(GRPO_CONFIG)))
-    assert small.pop("model") == {"num_hidden_layers": 24} and large.pop("model") == {}
+    assert small.pop("model") == {"num_hidden_layers": 24}
+    assert large.pop("model") == {"num_hidden_layers": 48}
     assert small["wandb"].pop("tags") == ["grpo", "baseline", "ouro-1.4b-thinking",
                                           "deepmath-level6"]
     large["wandb"].pop("tags")
@@ -366,13 +371,102 @@ def test_grpo_1p4b_config_matches_2p6b_except_model_and_accumulation(env):
 
 
 @pytest.mark.parametrize("name", ["rltt_baseline.yaml", "grpo_baseline_8gpu.yaml",
-                                  "grpo_baseline_1p4b_8gpu.yaml"])
+                                  "grpo_baseline_1p4b_8gpu.yaml",
+                                  "rltt_baseline_1p4b_8gpu.yaml",
+                                  "plc_posterior_exit_gate_1p4b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
     cfg = rcfg.load_config(str(paths.config_file(name)))
     actor = cfg.verl_overrides.actor_rollout_ref.actor
     assert actor.ppo_mini_batch_size == (cfg.verl_overrides.data.train_batch_size
                                          * cfg.args.gradient_accumulation_steps)
+
+
+# ---------- comparison groups (CLAUDE.md) ----------
+
+# Configs in one group differ only in the method (trainer, loss, plc section, wandb naming);
+# every other setting must be identical so the runs can be compared.
+MATCHED_GROUPS = {
+    "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
+             "plc": "plc_posterior_exit_gate_1p4b_8gpu.yaml"},
+    "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},
+}
+# verl settings the GRPO configs must override because grpo_train.py lacks them; rltt_train.py
+# sets the same values from its own options (checked in _method_free_view)
+GRPO_ONLY_OVERRIDES = {
+    ("algorithm", "use_kl_in_reward"): False,
+    ("actor_rollout_ref", "actor", "grad_clip"): 0.1,
+    ("actor_rollout_ref", "ref", "fsdp_config", "param_offload"): True,
+}
+WANDB_NAMING_KEYS = ("project", "entity", "run_name", "tags", "notes")
+
+
+def _pop_path(d, path):
+    for key in path[:-1]:
+        d = d[key]
+    return d.pop(path[-1])
+
+
+def _drop_empty(d):
+    for key in list(d):
+        if isinstance(d[key], dict):
+            _drop_empty(d[key])
+            if not d[key]:
+                del d[key]
+
+
+def _method_free_view(name):
+    """The config without everything that is allowed to differ between methods."""
+    cfg = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(name))), resolve=True)
+    trainer = cfg.pop("trainer")
+    cfg.pop("plc", None)
+    for key in WANDB_NAMING_KEYS:
+        cfg["wandb"].pop(key, None)
+    args = cfg["args"]
+    if trainer == "grpo":
+        assert args.pop("use_ppo") is False
+        for path, value in GRPO_ONLY_OVERRIDES.items():
+            assert _pop_path(cfg["verl_overrides"], path) == value, (name, path)
+        _drop_empty(cfg["verl_overrides"])
+    else:
+        # rltt_train.py has its own options for the GRPO-only overrides: same values required
+        assert args.pop("ref_offload") is True, name
+        assert args.pop("no_gradient_checkpointing") is False, name  # grpo: always on
+        assert args.pop("lr_scheduler_type") == "constant", name  # grpo_train.py hard-codes it
+        assert args["max_grad_norm"] == 0.1, name  # passed as actor grad_clip by rltt_train.py
+        # the trained model is rltt_model_path (= the GRPO model_path); model_path only names it
+        assert args.pop("use_rltt_model") is True, name
+        assert args["model_path"] == ENV["LOOPRL_OURO_DIR"], name
+        args["model_path"] = args.pop("rltt_model_path")
+        for key in ("rltt_logprob_chunk_size", "loop_weighting", "progressive_alpha"):
+            args.pop(key)
+    return cfg
+
+
+@pytest.mark.parametrize("group", sorted(MATCHED_GROUPS))
+def test_matched_configs_share_all_non_method_settings(env, group):
+    views = {method: _method_free_view(name) for method, name in MATCHED_GROUPS[group].items()}
+    grpo = views.pop("grpo")
+    assert grpo["args"]["model_path"] == ENV["LOOPRL_MODEL_DIR"]
+    for method, view in views.items():
+        assert view == grpo, f"{group}: {method} differs from grpo outside the method"
+
+
+@pytest.mark.parametrize("name", sorted({n for g in MATCHED_GROUPS.values() for n in g.values()}))
+def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
+    cfg = rcfg.load_config(str(paths.config_file(name)))
+    actor = cfg.verl_overrides.actor_rollout_ref.actor
+    assert cfg.args.beta == 0.0 and actor.use_kl_loss is False and actor.kl_loss_coef == 0.0, name
+    assert cfg.args.vllm_gpu_memory_utilization == 0.5, name
+    assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
+
+
+def test_matched_1p4b_group_is_one_update_per_step(env):
+    for name in MATCHED_GROUPS["1.4B"].values():
+        cfg = rcfg.load_config(str(paths.config_file(name)))
+        assert cfg.args.gradient_accumulation_steps == 1 and cfg.args.n_gpus == 8, name
+        assert cfg.verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size == 32, name
+        assert cfg.model.num_hidden_layers == 24, name
 
 
 def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):

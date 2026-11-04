@@ -46,7 +46,8 @@ configs/grpo_baseline_8gpu.yaml  GRPO 8 卡训练配置（Ouro-2.6B-Thinking）
 configs/grpo_baseline_1p4b_8gpu.yaml  GRPO 8 卡训练配置（Ouro-1.4B-Thinking，生成 16K，每步更新一次）
 configs/grpo_baseline_2p6b_8gpu_loop_audit.yaml  同 grpo_baseline_8gpu，打开逐轮分布审计
 configs/grpo_baseline_1p4b_8gpu_loop_audit.yaml  同 grpo_baseline_1p4b_8gpu，打开逐轮分布审计
-configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置
+configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置（Ouro-2.6B-Thinking，与 grpo_baseline_8gpu 对齐）
+configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinking，与 GRPO 1.4B / PLC 配置对齐）
 configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
@@ -95,7 +96,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    ```bash
    CUDA_VISIBLE_DEVICES=0,1 bash scripts/smoke_grpo.sh
    ```
-6. **训练**（8 卡 GRPO；RLTT 用 `configs/rltt_baseline.yaml`）：
+6. **训练**（8 卡 GRPO；RLTT 用 `configs/rltt_baseline.yaml`（2.6B）或 `configs/rltt_baseline_1p4b_8gpu.yaml`（1.4B））：
    ```bash
    bash scripts/run_train.sh configs/grpo_baseline_8gpu.yaml
    bash scripts/run_train.sh configs/grpo_baseline_8gpu.yaml args.max_steps=100 wandb.run_name=try1
@@ -103,6 +104,23 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
    bash scripts/run_train.sh configs/grpo_baseline_1p4b_8gpu.yaml
    ```
    在 Slurm 集群上必须在 allocation 内运行；脚本检测到 `sbatch` 而没有 `SLURM_JOB_ID` 时会拒绝。
+
+### 配置对照组
+
+配置按对照组组织，组内文件除方法本身（`trainer`、loss、`plc` 段、wandb 命名）外每个参数都必须相同，
+这样三种方法可以直接对比：
+
+| 组 | GRPO | RLTT | PLC |
+|---|---|---|---|
+| 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
+| 2.6B，8 卡，梯度累积 2 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | 暂无 |
+
+测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
+`CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
+
+随机种子全部锁定 42：`args.seed: 42`，且 `verl_overrides.data.seed: ${args.seed}`（verl 0.6.1 的 dataloader
+打乱种子默认为空，不从 `args.seed` 派生）；vLLM 引擎 seed 在 verl 0.6.1 不可配置（固定 0，各方法相同）。
+诊断脚本 `rltt_baseline.diagnostics.rollouts` / `probe` 和原作评估脚本的默认 seed 也都是 42。
 
 ### GRPO 8 卡配置要点（`configs/grpo_baseline_8gpu.yaml`）
 
@@ -120,11 +138,12 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 - 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 2，
   即每 64 题做一次优化器更新（mini-batch = 64 题），共 140 步（70 次更新）。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
-  梯度裁剪 0.1；KL β = 0.001，按 RLTT 的方式作为 `low_var_kl` loss；clip 0.2，token-mean。
+  梯度裁剪 0.1；KL 关闭（`beta: 0`、`use_kl_loss: false`、`kl_loss_coef: 0`，所有配置相同）；
+  clip 0.2，token-mean。
 - 每 10 步存 checkpoint（含 `hf_model`，供逐轮梯度探测）；训练中不做验证（论文如此），
   需要时加 `args.no_validation=false`（MATH-500，用 RLTT prompt）。
 - 显存：Ouro 每次循环有独立的 KV cache（48 层 × 4 次 = 192 层），每 token 约 1.57 MB。
-  按此估算，vLLM 占 45% 显存时每张 H200 约能放 3.5 万 tokens 的 KV，即同时约 2 条满长度序列，
+  按此估算，vLLM 占 50% 显存时每张 H200 约能放 4 万 tokens 的 KV，即同时约 2 条满长度序列，
   长回答多时 rollout 会很慢（实际数值以 vLLM 日志为准）。
 
 原作 `grpo_train.py` 与论文有四处不一致，配置里用 `verl_overrides` 改正：
@@ -134,12 +153,12 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 每步题数 | `data.train_batch_size = 题数 × 8`，verl 当作题数（256 题） | 32 题 |
 | 梯度裁剪 | `max_grad_norm` 只传给未启用的 critic，actor 用 verl 默认 1.0 | 0.1 |
 | Adam betas | (0.9, 0.999)（RLTT 脚本相同） | (0.9, 0.99) |
-| KL | 加在 reward 上；组内奖励全同时，KL 噪声会给这组产生非零 advantage | `low_var_kl` loss，与 RLTT 相同 |
+| KL | 加在 reward 上；组内奖励全同时，KL 噪声会给这组产生非零 advantage | 不进 reward；KL loss 也关闭（见 `CLAUDE.md`） |
 
 KL 一律不放进 reward：最终 verl 配置的 `algorithm.use_kl_in_reward` 为 true 时，launcher 拒绝启动
 （GRPO 原作默认就是 true，所以配置里必须显式写 `false`）。
 
-`configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1 和 KL loss）。
+`configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1）。
 注意 warmup 长度按步数算（140 × 10% = 14），但 verl 的学习率调度器每次更新才前进一次，
 梯度累积 2 时共 70 次更新，所以实际 warmup 占前 14 次更新（20%）。原作也是这样，这里不改。
 - 原作 `grpo_train.py` 会**原地修改**模型目录里的 `modeling_ouro.py`。launcher 只接受
@@ -161,7 +180,7 @@ checkpoint、显存参数）都相同，测试 `test_grpo_1p4b_config_matches_2p
   `model.safetensors`、`modeling_ouro.py`、`configuration_ouro.py`、`config.json` 的 SHA256。
   它的 `modeling_ouro.py` 与 2.6B 只差空白；`configuration_ouro.py` 少一行 `self.pad_token_id = 2`，
   这行在 2.6B 中也会被 `PretrainedConfig.__init__` 覆盖，所以两者代码行为相同。chat template 相同。
-- 24 层 × 4 次循环，每 token 的 KV 约 0.79 MB，是 2.6B 的一半；同样 45% 显存时 vLLM 能放的序列约多一倍。
+- 24 层 × 4 次循环，每 token 的 KV 约 0.79 MB，是 2.6B 的一半；同样 50% 显存时 vLLM 能放的序列约多一倍。
 - 两份配置都从 `LOOPRL_MODEL_DIR` 读模型。1.4B 配置写了 `model.num_hidden_layers: 24`，
   launcher 训练前核对模型目录的 `config.json`，指向 2.6B 目录（48 层）时拒绝启动。
 - wandb 实验名由 verl 按模型目录名生成（`GRPO-Ouro-1.4B-Thinking-RLTT`），tag 为 `ouro-1.4b-thinking`。
@@ -203,7 +222,7 @@ log-prob，`q_t` 为退出深度的先验。
   `w = q`，就是 RLTT（先验 uniform / progressive / exit 分别对应 RLTT 的三种权重）。
 - **损失**：`-agg_j[(1-λ)·PPO^(T) + λ·Σ_t w[j,t]·PPO^(t)]`，每轮一个 PPO ratio `exp(ℓ_new - ℓ_old)`，
   clip 用 verl 的 `clip_ratio` / 双重 clip；λ=0 与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
-  熵项和 KL（`low_var_kl`，参考模型）只加在最后一轮，与原作相同。
+  熵项和 KL（`low_var_kl`）只加在最后一轮，与原作相同；对照组配置里 KL 关闭，熵系数为 0。
 - **gate 损失**（`use_gate_loss`，需要 `prior: exit`）：`gate_coef·agg[Â·CE(sg[w], q_new)] − gate_entropy_coef·agg[H(q_new)]`，
   即混合策略梯度中 gate 的那一项加 Ouro Stage I 的熵正则（Ouro 预训练 β=0.1，末阶段 0.05）。
   它要求模型目录没有用 `--detach-exit-pdf` 构建，launcher 训练前检查 `config.json`。

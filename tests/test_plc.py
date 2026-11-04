@@ -342,7 +342,8 @@ def test_plc_overrides_require_the_rltt_trainer_and_per_loop_model(env):
 
 
 def test_other_configs_have_plc_off(env):
-    for name in ("rltt_baseline.yaml", "grpo_baseline_1p4b_8gpu.yaml", "grpo_baseline_8gpu.yaml"):
+    for name in ("rltt_baseline.yaml", "rltt_baseline_1p4b_8gpu.yaml",
+                 "grpo_baseline_1p4b_8gpu.yaml", "grpo_baseline_8gpu.yaml"):
         assert not rcfg.plc_settings(rcfg.load_config(str(paths.config_file(name)))).enabled
 
 

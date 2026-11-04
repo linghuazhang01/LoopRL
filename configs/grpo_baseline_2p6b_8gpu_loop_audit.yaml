@@ -10,7 +10,7 @@
 # trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml:
 #   32 prompts x 8 rollouts per step, gradient accumulation 2 (one optimizer
 #   update per 64 prompts), 140 steps, AdamW8bit lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
-#   weight decay 0.1, grad clip 0.1, KL 1e-3, BF16, binary reward, group-normalised advantage.
+#   weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
 #   (PPO clip 0.2, token-mean). Ouro runs a fixed 4 loops. The vendor script differs from the
 #   paper in four places, fixed in verl_overrides below.
@@ -41,7 +41,7 @@ args:  # keys = dest names of grpo_train.py argparse options
   num_prompts_per_batch: 32   # vendor sets data.train_batch_size = this x num_generations;
                               # the real batch is set explicitly in verl_overrides below
   temperature: 1.0
-  beta: 0.001                 # KL coefficient (applied as a loss term, see verl_overrides)
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
 
   # optimisation
   learning_rate: 1.0e-6
@@ -59,7 +59,7 @@ args:  # keys = dest names of grpo_train.py argparse options
   dataloader_num_workers: 4
   use_vllm: true
   no_vllm: false
-  vllm_gpu_memory_utilization: 0.45
+  vllm_gpu_memory_utilization: 0.5
   vllm_tensor_parallel_size: 1
   vllm_enforce_eager: false
 
@@ -88,14 +88,16 @@ wandb:
 
 verl_overrides:
   data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
     train_batch_size: 32      # prompts per rollout batch -> 32 x 8 = 256 rollouts
   algorithm:
-    use_kl_in_reward: false   # vendor GRPO adds KL to the reward; RLTT uses a KL loss
+    use_kl_in_reward: false   # vendor GRPO adds KL to the reward; never in the reward here
   actor_rollout_ref:
     actor:
       ppo_mini_batch_size: 64 # = 32 prompts x 2 accumulated batches -> one update per 2 steps
       grad_clip: 0.1          # vendor leaves the verl default 1.0
-      use_kl_loss: true       # low_var_kl, coefficient args.beta (as in RLTT)
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
       optim:
         betas: [0.9, 0.99]    # paper Table 6; both vendor scripts use (0.9, 0.999)
       checkpoint:

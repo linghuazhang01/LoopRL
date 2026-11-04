@@ -316,7 +316,7 @@ def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:
     if in_reward:
         raise ValueError("KL must not be added to the reward: set "
                          "verl_overrides.algorithm.use_kl_in_reward=false "
-                         "(the KL is a loss term, actor.use_kl_loss=true)")
+                         "(the KL, if any, is a loss term: actor.use_kl_loss)")
 
 
 def apply_verl_overrides(config, overrides: dict):

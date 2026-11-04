@@ -34,7 +34,7 @@ def main(argv=None) -> int:
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=20261023)
+    parser.add_argument("--seed", type=int, default=42)  # project-wide default seed
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     args = parser.parse_args(argv)
     if args.out.exists():
