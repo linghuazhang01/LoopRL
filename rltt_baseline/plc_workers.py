@@ -276,11 +276,17 @@ class PLCActorRolloutRefWorker(ActorRolloutRefWorker):
     """verl worker that builds ``PLCActor`` and adds its per-loop old tensors to the batch."""
 
     def __init__(self, config, role: str, **kwargs):
-        super().__init__(config, role, **kwargs)
         raw = config.actor.get("plc", None)
         if raw is None:
             raise ValueError("actor_rollout_ref.actor.plc is missing")
-        self.settings = plc.PLCSettings.from_mapping(OmegaConf.to_container(raw, resolve=True))
+        settings = plc.PLCSettings.from_mapping(OmegaConf.to_container(raw, resolve=True))
+        # verl 0.6.1 materializes actor as FSDPActorConfig, which has no PLC field.
+        # Keep PLC settings on this worker and pass an isolated native config onward.
+        native_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        OmegaConf.set_struct(native_config.actor, False)
+        native_config.actor.pop("plc")
+        super().__init__(native_config, role, **kwargs)
+        self.settings = settings
         self.total_ut_steps = config.get("total_ut_steps", 4)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -288,7 +294,8 @@ class PLCActorRolloutRefWorker(ActorRolloutRefWorker):
         super().init_model()
         if self._is_actor:
             self.actor = PLCActor(
-                config=self.config.actor,
+                # Reuse verl's typed config, including its native actor defaults.
+                config=self.actor.config,
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer,
                 settings=self.settings,
