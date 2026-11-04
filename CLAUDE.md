@@ -25,7 +25,7 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 
 组内**允许**不同的只有：
 
-- `trainer`（`grpo` / `rltt`）、`plc` 段、`wandb` 的 `project / entity / run_name / tags / notes`；
+- `trainer`（`grpo` / `rltt`）、`plc` 段、`wandb` 的 `run_name / tags / notes`；
 - 两份原作脚本参数名不同但取值等价的键：GRPO 的 `use_ppo`；RLTT 的 `use_rltt_model`、
   `rltt_model_path`（= GRPO 的 `model_path`，即 `LOOPRL_MODEL_DIR`）、`rltt_logprob_chunk_size`、
   `loop_weighting`、`progressive_alpha`、`ref_offload: true`、`no_gradient_checkpointing: false`、
@@ -36,7 +36,9 @@ PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule�
 
 其余一切（数据、prompt / 生成长度、每步题数 × 采样数、步数、梯度累积、mini-batch、学习率与调度、
 betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参数、checkpoint 内容、`model.num_hidden_layers`、
-`rollout`、`env`、`audit`、`wandb.mode / dir`）组内必须一致。逐轮分布审计（`audit.loop_distribution`）
+`rollout`、`env`、`audit`、`wandb.mode / dir / project / entity`）组内必须一致。所有 run 都记到
+同一个 wandb 项目 `looprl-ouro`，靠 run 名和 tag 区分方法与规模；消融和多 seed 的 run 用
+`wandb.run_name=...` 起不同的名字。逐轮分布审计（`audit.loop_distribution`）
 在所有配置里都打开；它只读 `compute_log_prob` 那次前向的隐状态，不改变训练，但每次运行写几十 GB，
 要关或调稀疏时整组一起改。
 

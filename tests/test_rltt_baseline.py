@@ -207,7 +207,7 @@ def test_default_config_resolves_to_paper_settings(env):
     assert args.ppo_max_token_len >= args.max_prompt_length + args.max_completion_length
     assert args.num_prompts_per_batch == 32
     assert args.temperature == 1.0 and isinstance(args.learning_rate, float)
-    assert args.no_wandb is False and args.wandb_project == "rltt-ouro-baseline"
+    assert args.no_wandb is False and args.wandb_project == "looprl-ouro"
     env_vars = rcfg.wandb_env(cfg)
     assert env_vars["WANDB_MODE"] == "offline"
     assert env_vars["WANDB_DIR"] == ENV["LOOPRL_OUTPUT_DIR"]
@@ -393,7 +393,8 @@ GRPO_ONLY_OVERRIDES = {
     ("actor_rollout_ref", "actor", "grad_clip"): 0.1,
     ("actor_rollout_ref", "ref", "fsdp_config", "param_offload"): True,
 }
-WANDB_NAMING_KEYS = ("project", "entity", "run_name", "tags", "notes")
+# wandb project and entity are shared (every run logs to looprl-ouro); only run names differ
+WANDB_NAMING_KEYS = ("run_name", "tags", "notes")
 
 
 def _pop_path(d, path):
@@ -454,6 +455,7 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.beta == 0.0 and actor.use_kl_loss is False and actor.kl_loss_coef == 0.0, name
     assert cfg.args.vllm_gpu_memory_utilization == 0.5, name
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
+    assert cfg.wandb.project == "looprl-ouro" and cfg.wandb.entity is None, name
 
 
 @pytest.mark.parametrize("method", ["grpo", "rltt", "plc"])

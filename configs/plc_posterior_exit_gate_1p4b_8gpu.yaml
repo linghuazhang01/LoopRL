@@ -98,7 +98,7 @@ plc:
 wandb:
   enabled: true
   mode: offline
-  project: looprl-plc-ouro
+  project: looprl-ouro            # one wandb project for every method and size
   entity: null
   run_name: plc-posterior-exit-gate-1p4b
   tags: [plc, posterior, exit-prior, gate-loss, ouro-1.4b-thinking, deepmath-level6]

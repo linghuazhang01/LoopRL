@@ -79,7 +79,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
 wandb:
   enabled: true
   mode: offline                 # compute nodes: offline, then `wandb sync` from a login node
-  project: rltt-ouro-baseline
+  project: looprl-ouro            # one wandb project for every method and size
   entity: null
   run_name: null                # null = vendor name RLTT-<model>-<loop_weighting>
   tags: [rltt, baseline, ouro-2.6b-thinking, deepmath-level6]

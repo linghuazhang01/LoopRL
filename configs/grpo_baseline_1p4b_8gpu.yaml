@@ -83,8 +83,9 @@ args:  # keys = dest names of grpo_train.py argparse options
 wandb:
   enabled: true
   mode: offline
-  project: looprl-grpo-ouro
-  run_name: null
+  project: looprl-ouro            # one wandb project for every method and size
+  entity: null
+  run_name: null                # null = vendor name GRPO-<model dir name>
   tags: [grpo, baseline, ouro-1.4b-thinking, deepmath-level6]
   notes: null
   dir: ${args.output_dir}
