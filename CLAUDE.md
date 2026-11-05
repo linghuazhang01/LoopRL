@@ -30,6 +30,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
+| 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -62,10 +63,15 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 4. 消融走同一份配置加覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`。
    PLC 配置加 `plc.gamma=0 plc.use_gate_loss=false` 是"与 PLC 完全同一条代码路径"的 RLTT 对照；
    `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。两者回答的问题不同，论文里都要有。
+   例外：`plc_posterior_exit_nogate_1p4b_8gpu.yaml` 是用户 2026-11-05 要求单独存的 gate loss 消融，
+   等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。它登记在 `MATCHED_GROUPS` 里；
+   `tests/test_plc.py` 还检查它与 PLC 配置只差这一项和 wandb 命名，所以改 PLC 配置时要同步改它。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
-`test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 32 题 × 8 条、
-梯度累积 1、mini-batch 32 题、140 步 = 140 次优化器更新（论文 Table 6 是累积 2，这里统一改为 1）。
+`test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 64 题 × 8 条
+（512 条 rollout）、梯度累积 1、mini-batch 64 题、100 步 = 100 次优化器更新，warmup 10 步
+（用户 2026-11-05 指定；论文 Table 6 是每步 32 题、累积 2、140 步）。
+`test_matched_groups_are_one_update_per_step` 锁定这些值，改动要整组一起改。
 
 ## vLLM token 预算：32768
 

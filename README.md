@@ -48,6 +48,7 @@ configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置（Ouro-2.6B-Thin
 configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinking，与 GRPO 1.4B / PLC 配置对齐）
 configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
 configs/plc_posterior_exit_gate_2p6b_8gpu.yaml  同上，Ouro-2.6B-Thinking（与 1.4B 版只差模型）
+configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml  PLC 关闭 gate 损失的消融（Ouro-1.4B-Thinking，与 PLC 1.4B 版只差 `plc.use_gate_loss`）
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -119,6 +120,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 |---|---|---|---|
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
+| 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -146,8 +148,9 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
   `max_model_len` 18,432，开着 chunked prefill 时 vLLM 会拒绝启动，launcher 在 dry-run 阶段就会报错。
   同一处还显式写出 `top_p` 1.0、`top_k` -1、`do_sample` true、`ignore_eos` false、`max_num_seqs` 1024、
   `dtype` bfloat16，取值与 verl 默认值相同，所有配置一致。
-- 每步 32 题 × 8 条 = 256 条 rollout，temperature 1.0；梯度累积 1（论文 2），
-  即每步做一次优化器更新（mini-batch = 32 题），共 140 步 = 140 次更新。
+- 每步 64 题 × 8 条 = 512 条 rollout，temperature 1.0；梯度累积 1，
+  即每步做一次优化器更新（mini-batch = 64 题），共 100 步 = 100 次更新
+  （论文：每步 32 题、累积 2、140 步）。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
   梯度裁剪 0.1；KL 关闭（`beta: 0`、`use_kl_loss: false`、`kl_loss_coef: 0`，所有配置相同）；
   clip 0.2，token-mean。
@@ -161,7 +164,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 
 | 项 | 原作脚本 | 本配置 |
 |---|---|---|
-| 每步题数 | `data.train_batch_size = 题数 × 8`，verl 当作题数（256 题） | 32 题 |
+| 每步题数 | `data.train_batch_size = 题数 × 8`，verl 当作题数（512 题） | 64 题 |
 | 梯度裁剪 | `max_grad_norm` 只传给未启用的 critic，actor 用 verl 默认 1.0 | 0.1 |
 | Adam betas | (0.9, 0.999)（RLTT 脚本相同） | (0.9, 0.99) |
 | KL | 加在 reward 上；组内奖励全同时，KL 噪声会给这组产生非零 advantage | 不进 reward；KL loss 也关闭（见 `CLAUDE.md`） |
@@ -174,7 +177,7 @@ launcher 在构造 trainer 前去掉这个角色，GRPO 就和 RLTT / PLC 一样
 `rltt_baseline_resolved.json` 的 `reference_policy` 字段写明是否去掉。重新打开 KL loss 时参考模型照常加载。
 
 `configs/rltt_baseline.yaml` 同样改正了每步题数和 betas（RLTT 脚本本身已有梯度裁剪 0.1）。
-warmup 长度按步数算（140 × 10% = 14），verl 的学习率调度器每次更新前进一次；梯度累积 1 时步数等于
+warmup 长度按步数算（100 × 10% = 10），verl 的学习率调度器每次更新前进一次；梯度累积 1 时步数等于
 更新次数，warmup 就是前 14 次更新（10%）。若以后改回累积 2，warmup 会占到更新数的 20%。
 - 原作 `grpo_train.py` 会**原地修改**模型目录里的 `modeling_ouro.py`。launcher 只接受
   `prepare_model` 生成的目录，拒绝官方目录，避免改动共享的模型文件。
@@ -182,9 +185,9 @@ warmup 长度按步数算（140 × 10% = 14），verl 的学习率调度器每�
 ### GRPO 1.4B 8 卡配置（`configs/grpo_baseline_1p4b_8gpu.yaml`）
 
 与 2.6B 配置只差模型（Ouro-1.4B-Thinking；RLTT 论文两种规模用同一套设置），其余（数据、prompt 2,048 /
-生成 16,384、每步 32 题 × 8 条、梯度累积 1、mini-batch 32 题、140 步 = 140 次更新、优化器、KL、
+生成 16,384、每步 64 题 × 8 条、梯度累积 1、mini-batch 64 题、100 步 = 100 次更新、优化器、KL、
 checkpoint、显存参数）都相同，测试 `test_grpo_1p4b_config_matches_2p6b_except_model` 检查这一点。
-每次更新用 256 条 rollout，GRPO 只跑 1 个 epoch；warmup 10% 即前 14 次更新。
+每次更新用 512 条 rollout，GRPO 只跑 1 个 epoch；warmup 10% 即前 10 次更新。
 测试 `test_mini_batch_is_one_accumulated_update` 检查每份配置的 mini-batch 都等于“每步题数 × 累积步数”。
 
 - 模型 `ByteDance/Ouro-1.4B-Thinking` @ `3aaa2224`，`prepare_model.sh --model 1.4B` 下载并核对
@@ -262,8 +265,8 @@ macOS 可将校验命令替换为 `shasum -a 256 -c SHA256SUMS`。下载并校�
 export LOOPRL_TRAIN_FILE=$PWD/data/deepmath_level6_filter12k_passes1to3_no_yesno_01_truefalse/train_filtered_level6_passes1to3_no_yesno_01_truefalse.parquet
 ```
 
-这份 2,865 条数据已纳入上述合并训练集。单独使用时，140 步 × 32 题需要 4,480 题，
-它只够约 89 步不重复。规则和构成见该目录的 README。
+这份 2,865 条数据已纳入上述合并训练集。单独使用时，100 步 × 64 题需要 6,400 题，
+它只够约 44 步不重复。规则和构成见该目录的 README。
 
 ### PLC：Posterior Loop Credit（`configs/plc_posterior_exit_gate_1p4b_8gpu.yaml`）
 
@@ -290,6 +293,8 @@ log-prob，`q_t` 为退出深度的先验。
 
 消融用命令行覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`、
 `plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`。
+关闭 gate 损失的消融另存为 `configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml`（用户 2026-11-05 要求），
+等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。
 状态：只有 CPU 单元测试和 tiny 随机模型测试（`tests/test_plc.py`、`test_rltt_baseline_modeling.py`），
 没有在真实权重或 GPU 上运行过。
 
@@ -381,7 +386,7 @@ audit:
 
 审计不加前向：它挂在训练本来就要做的 `compute_log_prob` 那次前向上，读出各轮隐状态再算
 `lm_head`，所以不改变 loss 和梯度，只多花 `lm_head` 的计算和磁盘。逐 token 数组压缩前约每 token
-220 字节：每步 256 条回答，平均每条 6K token 时约 340 MB/步，140 步约 47 GB/次运行（满长 16K 时约
+220 字节：每步 512 条回答，平均每条 6K token 时约 680 MB/步，100 步约 68 GB/次运行（满长 16K 时约
 2.5 倍）。磁盘不够时可以整组一起改 `save_tokens: false`（只留汇总）或调大 `every_n_steps`。
 
 命令行写 `audit.loop_distribution.enabled=false` 可以临时关掉；关闭时不装 hook，GRPO 仍用原作的
@@ -421,8 +426,8 @@ token["topk_probs"][17, 0]         # 对应的概率
   多加一次前向时，每层 FSDP 都要做 collective，各 rank 的前向次数必须相同；`lm_head` 属于 root
   FSDP 单元，各 rank 调用次数不同也不会卡住。
 - **不存完整分布。** 一个词表的 float32 约 200 KB，每个 token 四轮约 800 KB，所以只存 top-k。
-- **磁盘。** 压缩前每个 token 约 218 字节（四轮、top-5）。256 条回答、平均 7,738 token
-  时约 430 MB/步，140 步约 60 GB；压缩比尚未在真实数据上测过。用 `every_n_steps` 或
+- **磁盘。** 压缩前每个 token 约 218 字节（四轮、top-5）。512 条回答、平均 7,738 token
+  时约 860 MB/步，100 步约 86 GB；压缩比尚未在真实数据上测过。用 `every_n_steps` 或
   `save_tokens: false` 减少占用。
 - **前几轮是假设分布。** 实际采样只来自最后一轮；其余各轮表示“在这个上下文下若停在第 t 轮”的分布，
   上下文都是实际生成的 token。

@@ -5,8 +5,8 @@
 # Optimisation follows the RLTT paper (Williams & Tureci 2026, arXiv 2602.10520, Table 6), which
 # trains GRPO and RLTT with the same settings, and configs/rltt_baseline.yaml (the 2.6B
 # comparison group, see CLAUDE.md; test_matched_configs_share_all_non_method_settings):
-#   32 prompts x 8 rollouts per step, no gradient accumulation (paper: 2; one optimizer update per
-#   32-prompt step, so 140 steps = 140 updates and the 10% warmup = 14 updates), AdamW8bit
+#   64 prompts x 8 rollouts per step, no gradient accumulation, 100 steps (paper: 32 prompts,
+#   accumulation 2, 140 steps; here every step is one update and the 10% warmup = 10), AdamW8bit
 #   lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 #   weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Trainer: RLTT repository grpo_experiments/grpo_train.py = standard verl 0.6.1 GRPO
@@ -36,7 +36,7 @@ args:  # keys = dest names of grpo_train.py argparse options
   # GRPO
   use_ppo: false
   num_generations: 8          # rollouts per prompt (group size)
-  num_prompts_per_batch: 32   # vendor sets data.train_batch_size = this x num_generations;
+  num_prompts_per_batch: 64   # vendor sets data.train_batch_size = this x num_generations;
                               # the real batch is set explicitly in verl_overrides below
   temperature: 1.0
   beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
@@ -46,9 +46,9 @@ args:  # keys = dest names of grpo_train.py argparse options
   weight_decay: 0.1
   max_grad_norm: 0.1          # vendor only passes this to the (unused) critic; see verl_overrides
   warmup_ratio: 0.1
-  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step (as the 1.4B group)
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step (as the 1.4B group)
   num_train_epochs: 5
-  max_steps: 140              # paper Table 6; one step = one 32-prompt rollout batch = one update
+  max_steps: 100              # paper Table 6; one step = one 64-prompt rollout batch = one update
   seed: 42
 
   # memory / rollout
@@ -88,7 +88,7 @@ wandb:
 verl_overrides:
   data:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
-    train_batch_size: 32      # prompts per rollout batch -> 32 x 8 = 256 rollouts
+    train_batch_size: 64      # prompts per rollout batch -> 64 x 8 = 512 rollouts
   algorithm:
     use_kl_in_reward: false   # vendor GRPO adds KL to the reward; never in the reward here
   actor_rollout_ref:
@@ -104,7 +104,7 @@ verl_overrides:
       max_num_seqs: 1024             # vLLM concurrent sequences cap
       dtype: bfloat16                # vLLM weights / activations
     actor:
-      ppo_mini_batch_size: 32 # = the 32 prompts of one step -> one update per step
+      ppo_mini_batch_size: 64 # = the 64 prompts of one step -> one update per step
       grad_clip: 0.1          # vendor leaves the verl default 1.0
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0

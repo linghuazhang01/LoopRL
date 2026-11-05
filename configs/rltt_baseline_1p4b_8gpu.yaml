@@ -2,13 +2,13 @@
 # This is the RLTT member of the 1.4B comparison group (see CLAUDE.md):
 #   grpo_baseline_1p4b_8gpu.yaml / rltt_baseline_1p4b_8gpu.yaml /
 #   plc_posterior_exit_gate_1p4b_8gpu.yaml
-# The three files share every setting that is not the method itself (data, lengths, 32 prompts x 8
-# rollouts, 140 steps, optimizer, KL, rollout, checkpoints, model check). The test
+# The three files share every setting that is not the method itself (data, lengths, 64 prompts x 8
+# rollouts, 100 steps, optimizer, KL, rollout, checkpoints, model check). The test
 # tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this:
 # change a shared value in all files of the group at once.
 #
 # Differs from rltt_baseline.yaml (Ouro-2.6B-Thinking) in the model only. Both use accumulation 1
-# and mini-batch 32 prompts, so the 140 steps are 140 updates and the 10% warmup is 14 updates.
+# and mini-batch 64 prompts, so the 100 steps are 100 updates and the 10% warmup is 10 updates.
 #
 # Objective: the vendor RLTT loss (third_party/RLTT rltt_experiments/verl_rltt): REINFORCE on
 #   sum_t w_t log P^(t)(y_j),  w = the model's exit distribution (loop_weighting exit_pdf),
@@ -53,7 +53,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   progressive_alpha: 1.0
   beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
   num_generations: 8
-  num_prompts_per_batch: 32
+  num_prompts_per_batch: 64
   temperature: 1.0
 
   # optimisation
@@ -62,9 +62,9 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   max_grad_norm: 0.1            # passed by the vendor script as actor grad_clip
   warmup_ratio: 0.1
   lr_scheduler_type: constant   # grpo_train.py hard-codes constant
-  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
   num_train_epochs: 5
-  max_steps: 140
+  max_steps: 100
   seed: 42
 
   # memory / rollout
@@ -106,7 +106,7 @@ wandb:
 verl_overrides:
   data:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
-    train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
@@ -120,7 +120,7 @@ verl_overrides:
       max_num_seqs: 1024             # vLLM concurrent sequences cap
       dtype: bfloat16                # vLLM weights / activations
     actor:
-      ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0
       optim:

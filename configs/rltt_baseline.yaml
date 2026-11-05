@@ -1,7 +1,8 @@
 # RLTT baseline (Williams & Tureci 2026, arXiv 2602.10520), paper Table 6 settings, except data
 # and lengths, which follow SAPD (as in grpo_baseline_8gpu.yaml): DeepMath-103K level >= 6 with
 # its own prompt, prompts up to 2,048 tokens, generations up to 16,384 (paper: MATH, 1,024 / 2,048),
-# and the gradient accumulation: 1, one update per 32-prompt step (paper: 2).
+# and batch and length of run: 64 prompts x 8 rollouts per step, accumulation 1 (one update per
+# step), 100 steps (paper: 32 prompts, accumulation 2, 140 steps).
 # RLTT member of the 2.6B comparison group with grpo_baseline_8gpu.yaml (see CLAUDE.md): the two
 # files share every setting that is not the method itself; the test
 # tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this.
@@ -38,7 +39,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   progressive_alpha: 1.0
   beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
   num_generations: 8
-  num_prompts_per_batch: 32
+  num_prompts_per_batch: 64
   temperature: 1.0
 
   # optimisation
@@ -47,9 +48,9 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   max_grad_norm: 0.1
   warmup_ratio: 0.1
   lr_scheduler_type: constant   # grpo_train.py hard-codes constant
-  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step (as the 1.4B group)
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step (as the 1.4B group)
   num_train_epochs: 5
-  max_steps: 140                # paper Table 6; one step = one update; -1 = run all epochs
+  max_steps: 100                # paper Table 6; one step = one update; -1 = run all epochs
   seed: 42
 
   # memory / rollout
@@ -88,13 +89,13 @@ wandb:
   dir: ${args.output_dir}
 
 # Any verl key, merged last. The vendor script differs from the paper in two places:
-# - it sets data.train_batch_size = num_prompts_per_batch x num_generations (256), which verl
+# - it sets data.train_batch_size = num_prompts_per_batch x num_generations (512), which verl
 #   reads as a prompt count, and ppo_mini_batch_size = min(128, that);
 # - Adam betas are (0.9, 0.999); Table 6 lists (0.9, 0.99).
 verl_overrides:
   data:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
-    train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
@@ -108,7 +109,7 @@ verl_overrides:
       max_num_seqs: 1024             # vLLM concurrent sequences cap
       dtype: bfloat16                # vLLM weights / activations
     actor:
-      ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0
       optim:

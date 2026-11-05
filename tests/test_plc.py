@@ -12,6 +12,7 @@ from rltt_baseline import paths, plc
 from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates
 
 CONFIG = paths.config_file("plc_posterior_exit_gate_1p4b_8gpu.yaml")
+NOGATE_CONFIG = paths.config_file("plc_posterior_exit_nogate_1p4b_8gpu.yaml")
 ENV = {
     "LOOPRL_OURO_DIR": "/models/Ouro-1.4B-Thinking",
     "LOOPRL_MODEL_DIR": "/models/Ouro-1.4B-Thinking-RLTT",
@@ -314,7 +315,7 @@ def test_plc_config_resolves_to_gamma1_lam1_with_gate_loss(env):
     overrides = rcfg.add_plc_overrides(cfg, rcfg.verl_overrides(cfg), _args())
     actor = overrides["actor_rollout_ref"]["actor"]
     assert actor["plc"]["gamma"] == 1.0 and actor["plc"]["use_gate_loss"] is True
-    assert actor["ppo_mini_batch_size"] == 32 and overrides["data"]["train_batch_size"] == 32
+    assert actor["ppo_mini_batch_size"] == 64 and overrides["data"]["train_batch_size"] == 64
     assert rcfg.wandb_env(cfg)["WANDB_TAGS"].startswith("plc,")
 
 
@@ -340,6 +341,20 @@ def test_plc_overrides_require_the_rltt_trainer_and_per_loop_model(env):
                             ["plc.enabled=true", "plc.prior=uniform", "plc.use_gate_loss=false"])
     with pytest.raises(ValueError, match="trainer=rltt"):
         rcfg.add_plc_overrides(grpo, {}, _args())
+
+
+def test_nogate_config_is_the_plc_config_with_the_gate_loss_off(env):
+    # the gate-loss ablation keeps every key of the PLC config but use_gate_loss and wandb naming
+    gate = OmegaConf.to_container(rcfg.load_config(str(CONFIG)))
+    nogate = OmegaConf.to_container(rcfg.load_config(str(NOGATE_CONFIG)))
+    assert gate["plc"].pop("use_gate_loss") is True
+    assert nogate["plc"].pop("use_gate_loss") is False
+    for cfg in (gate, nogate):
+        for key in ("run_name", "tags"):
+            cfg["wandb"].pop(key)
+    assert nogate == gate
+    s = rcfg.plc_settings(rcfg.load_config(str(NOGATE_CONFIG)))
+    assert s.enabled and s.prior == "exit" and s.needs_exit_pdf and not s.use_gate_loss
 
 
 def test_other_configs_have_plc_off(env):

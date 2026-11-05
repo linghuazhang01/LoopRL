@@ -204,10 +204,10 @@ def test_default_config_resolves_to_paper_settings(env):
     args = rcfg.build_args(cfg, _defaults())
     assert args.model_path == ENV["LOOPRL_OURO_DIR"]
     assert args.use_rltt_model and args.loop_weighting == "exit_pdf"
-    assert args.max_completion_length == 16384 and args.max_steps == 140  # lengths: SAPD
+    assert args.max_completion_length == 16384 and args.max_steps == 100  # lengths: SAPD
     assert args.max_prompt_length == 2048 and args.train_file == ENV["LOOPRL_TRAIN_FILE"]
     assert args.ppo_max_token_len >= args.max_prompt_length + args.max_completion_length
-    assert args.num_prompts_per_batch == 32
+    assert args.num_prompts_per_batch == 64
     assert args.temperature == 1.0 and isinstance(args.learning_rate, float)
     assert args.no_wandb is False and args.wandb_project == "looprl-ouro"
     env_vars = rcfg.wandb_env(cfg)
@@ -226,8 +226,8 @@ def test_cli_overrides_win(env):
     overrides = rcfg.verl_overrides(cfg)
     assert overrides["trainer"] == {"save_freq": 20, "experiment_name": "try1",
                                     "logger": ["wandb", "console"]}
-    # paper: 32 prompts per rollout batch; the shuffle seed follows args.seed
-    assert overrides["data"] == {"train_batch_size": 32, "seed": 42}
+    # 64 prompts per rollout batch (paper: 32); the shuffle seed follows args.seed
+    assert overrides["data"] == {"train_batch_size": 64, "seed": 42}
     assert overrides["actor_rollout_ref"]["actor"]["optim"]["betas"] == [0.9, 0.99]
 
 
@@ -330,8 +330,8 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["model_path"] == ENV["LOOPRL_MODEL_DIR"] and vendor["use_ppo"] is False
     assert vendor["max_steps"] == 3 and vendor["n_gpus"] == 8
     assert vendor["ppo_epochs"] == 4  # vendor default, unused when use_ppo is false
-    # RLTT paper Table 6 settings shared with the RLTT config
-    assert vendor["num_prompts_per_batch"] == 32 and vendor["num_generations"] == 8
+    # batch shared with the RLTT config (paper Table 6: 32 prompts)
+    assert vendor["num_prompts_per_batch"] == 64 and vendor["num_generations"] == 8
     assert vendor["gradient_accumulation_steps"] == 1  # one update per step (paper: 2)
     # SAPD data and lengths
     assert vendor["train_file"] == ENV["LOOPRL_TRAIN_FILE"]
@@ -342,7 +342,7 @@ def test_grpo_dry_run_resolves_with_vendor_grpo_defaults(env, capsys, monkeypatc
     assert vendor["vllm_gpu_memory_utilization"] == 0.5
     over = resolved["verl_overrides"]
     actor = over["actor_rollout_ref"]["actor"]
-    assert over["data"]["train_batch_size"] == 32 and actor["ppo_mini_batch_size"] == 32
+    assert over["data"]["train_batch_size"] == 64 and actor["ppo_mini_batch_size"] == 64
     assert actor["grad_clip"] == 0.1 and actor["optim"]["betas"] == [0.9, 0.99]
     assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0  # KL off in every config
     assert over["algorithm"]["use_kl_in_reward"] is False
@@ -369,6 +369,7 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
                                   "grpo_baseline_1p4b_8gpu.yaml",
                                   "rltt_baseline_1p4b_8gpu.yaml",
                                   "plc_posterior_exit_gate_1p4b_8gpu.yaml",
+                                  "plc_posterior_exit_nogate_1p4b_8gpu.yaml",
                                   "plc_posterior_exit_gate_2p6b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
@@ -384,7 +385,8 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 # every other setting must be identical so the runs can be compared.
 MATCHED_GROUPS = {
     "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
-             "plc": "plc_posterior_exit_gate_1p4b_8gpu.yaml"},
+             "plc": "plc_posterior_exit_gate_1p4b_8gpu.yaml",
+             "plc_nogate": "plc_posterior_exit_nogate_1p4b_8gpu.yaml"},  # gate-loss ablation
     "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml",
              "plc": "plc_posterior_exit_gate_2p6b_8gpu.yaml"},
 }
@@ -484,13 +486,13 @@ def test_each_method_differs_between_sizes_only_in_the_model(env, method):
 
 @pytest.mark.parametrize("group,layers", [("1.4B", 24), ("2.6B", 48)])
 def test_matched_groups_are_one_update_per_step(env, group, layers):
-    # both groups: 32 prompts per step, no accumulation, 140 steps = 140 optimizer updates
+    # both groups: 64 prompts per step, no accumulation, 100 steps = 100 optimizer updates
     for name in MATCHED_GROUPS[group].values():
         cfg = rcfg.load_config(str(paths.config_file(name)))
         assert cfg.args.gradient_accumulation_steps == 1 and cfg.args.n_gpus == 8, name
-        assert cfg.verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size == 32, name
-        assert cfg.verl_overrides.data.train_batch_size == 32 == cfg.args.num_prompts_per_batch
-        assert cfg.args.max_steps == 140, name
+        assert cfg.verl_overrides.actor_rollout_ref.actor.ppo_mini_batch_size == 64, name
+        assert cfg.verl_overrides.data.train_batch_size == 64 == cfg.args.num_prompts_per_batch
+        assert cfg.args.max_steps == 100, name
         assert cfg.model.num_hidden_layers == layers, name
 
 
@@ -504,10 +506,10 @@ def test_grpo_1p4b_dry_run(env, capsys, monkeypatch):
     resolved = json.loads(capsys.readouterr().out)
     vendor = resolved["vendor_args"]
     assert vendor["model_path"] == ENV["LOOPRL_MODEL_DIR"] and vendor["n_gpus"] == 8
-    assert vendor["max_steps"] == 140 and vendor["num_prompts_per_batch"] == 32
+    assert vendor["max_steps"] == 100 and vendor["num_prompts_per_batch"] == 64
     assert vendor["gradient_accumulation_steps"] == 1
     assert vendor["max_completion_length"] == 16384
-    assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 32
+    assert resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 64
     assert resolved["config"]["model"] == {"num_hidden_layers": 24}
     assert resolved["verl_overrides"]["algorithm"]["use_kl_in_reward"] is False
     assert resolved["reference_policy"].startswith("dropped")

@@ -15,8 +15,9 @@
 # Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
 # like the other configs here; training uses only the 14,684-row merged filtered subset
 # (AGENTS.md rule 1), and the launcher refuses any other training file.
-# Optimisation follows RLTT Table 6 apart from the accumulation (1 here, paper 2): 140 steps =
-# 140 updates, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+# Optimisation follows RLTT Table 6 apart from batch and length of run: 64 prompts x 8 rollouts
+# per step, accumulation 1, 100 steps = 100 updates (paper: 32 prompts, accumulation 2, 140
+# steps); lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
 # weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
 # Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
 # Ablations by override, e.g. plc.gamma=0 (RLTT-exit), plc.lam=0 (GRPO), plc.use_gate_loss=false,
@@ -46,7 +47,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   progressive_alpha: 1.0
   beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
   num_generations: 8
-  num_prompts_per_batch: 32
+  num_prompts_per_batch: 64
   temperature: 1.0
 
   learning_rate: 1.0e-6
@@ -54,9 +55,9 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   max_grad_norm: 0.1
   warmup_ratio: 0.1
   lr_scheduler_type: constant
-  gradient_accumulation_steps: 1  # one optimizer update per 32-prompt step
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
   num_train_epochs: 5
-  max_steps: 140
+  max_steps: 100
   seed: 42
 
   ppo_max_token_len: 32768      # >= prompt + generation (18,432)
@@ -108,7 +109,7 @@ wandb:
 verl_overrides:
   data:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
-    train_batch_size: 32        # prompts per rollout batch -> 32 x 8 = 256 rollouts
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
@@ -122,7 +123,7 @@ verl_overrides:
       max_num_seqs: 1024             # vLLM concurrent sequences cap
       dtype: bfloat16                # vLLM weights / activations
     actor:
-      ppo_mini_batch_size: 32   # = the 32 prompts of one step -> one update per step
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
       use_kl_loss: false        # KL loss disabled in every config of the comparison groups
       kl_loss_coef: 0.0
       optim:
