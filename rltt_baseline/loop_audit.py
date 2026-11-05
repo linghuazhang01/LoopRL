@@ -10,6 +10,17 @@ far (loops are compared on the same context):
 - ``topk_ids``, ``topk_probs`` (n, T, k): each loop's k most likely tokens, most likely first.
   Full distributions are not stored: one vocabulary of float32 is about 200 KB per token and loop.
 
+With ``loop_weights`` the audit also records the loop weights of each token (n, T):
+
+- ``exit_pdf``: the exit gate's distribution over loops, ``q_t = lambda_t prod_{s<t}(1 - lambda_s)``
+  with the last loop taking the rest (all methods; RLTT's ``loop_weighting: exit_pdf`` weight);
+- ``plc_weight``: the PLC loop weights ``w = softmax_t(log q_t + gamma * ell_old)`` (with
+  ``eps_floor``) that ``PLCActor.update_policy`` applies to this step, computed from the actor's
+  own per-loop log-probs and exit PDF of the same pass. PLC runs only; for GRPO and RLTT runs the
+  posterior can be formed afterwards from ``exit_pdf`` and ``sampled_log_prob``.
+
+The probability of the sampled token at each loop is ``exp(sampled_log_prob)``.
+
 Distributions come from the training forward (full per-loop KV), also with decode_last rollouts.
 
 No forward pass is added. A temporary hook on ``OuroModel`` reads the per-loop hidden states of
@@ -36,8 +47,12 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
+from rltt_baseline import plc
+from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates
+
 PREFIX = "loop_audit/"
 TOKEN_ARRAYS = ("sampled_token", "sampled_log_prob", "entropy", "kl", "topk_ids", "topk_probs")
+WEIGHT_ARRAYS = ("exit_pdf", "plc_weight")  # with loop_weights; plc_weight in PLC runs only
 
 
 def step_dir_name(step: int) -> str:
@@ -138,6 +153,9 @@ class LoopAudit:
         self.top_k = int(config["top_k"])
         self.save_tokens = bool(config["save_tokens"])
         self.chunk_tokens = int(config["chunk_tokens"])
+        self.loop_weights = bool(config.get("loop_weights", False))
+        settings = getattr(actor, "settings", None)
+        self.plc_settings = settings if isinstance(settings, plc.PLCSettings) else None
         self._calls = 0
         self._active = False
         self._micro_batch = None
@@ -152,13 +170,23 @@ class LoopAudit:
         for name in ("_forward_micro_batch", "_forward_micro_batch_rltt",
                      "_forward_micro_batch_plc"):
             if hasattr(actor, name):
-                setattr(actor, name, self._remember_micro_batch(getattr(actor, name)))
+                setattr(actor, name, self._remember_micro_batch(getattr(actor, name),
+                                                                name == "_forward_micro_batch_plc"))
 
-    def _remember_micro_batch(self, forward):
+    def _remember_micro_batch(self, forward, returns_plc_tensors: bool = False):
         def wrapped(micro_batch, *args, **kwargs):
-            if self._active:
-                self._micro_batch = micro_batch
-            return forward(micro_batch, *args, **kwargs)
+            if not self._active:
+                return forward(micro_batch, *args, **kwargs)
+            self._micro_batch = micro_batch
+            records = len(self._records)
+            result = forward(micro_batch, *args, **kwargs)
+            if (returns_plc_tensors and self.loop_weights and self.plc_settings is not None
+                    and self._error is None and len(self._records) == records + 1):
+                try:
+                    self._add_plc_weights(self._records[-1], micro_batch, result[1], result[2])
+                except Exception as exc:  # the audit must not stop training
+                    self._error = repr(exc)
+            return result
         return wrapped
 
     def compute_log_prob(self, data, *args, **kwargs):
@@ -184,11 +212,12 @@ class LoopAudit:
         if micro_batch is None or self._error is not None:
             return
         try:
-            self._records.append(self._measure(micro_batch, output[1]))
+            self._records.append(self._measure(micro_batch, output[1], output[2]))
         except Exception as exc:  # the audit must not stop training
             self._error = repr(exc)
 
-    def _measure(self, micro_batch: dict, hiddens: Sequence[torch.Tensor]) -> dict:
+    def _measure(self, micro_batch: dict, hiddens: Sequence[torch.Tensor],
+                 gates: Sequence[torch.Tensor]) -> dict:
         input_ids = micro_batch["input_ids"]
         attention_mask = micro_batch["attention_mask"]
         responses = micro_batch["responses"]
@@ -208,7 +237,29 @@ class LoopAudit:
         record["prompt_tokens"] = attention_mask[:, :-response_length].sum(-1).cpu().numpy()
         ids, mask = input_ids.cpu().numpy(), attention_mask.cpu().numpy()
         record["row_keys"] = np.array([row_key(i, m) for i, m in zip(ids, mask)])
+        if self.loop_weights:
+            if len(gates) != len(hiddens):
+                raise ValueError(f"{len(gates)} exit gates for {len(hiddens)} loops")
+            with torch.no_grad():
+                pdf = exit_pdf_from_gates([g.reshape(-1, 1)[positions] for g in gates])
+            record["exit_pdf"] = pdf.cpu().numpy()
         return record
+
+    @torch.no_grad()
+    def _add_plc_weights(self, record: dict, micro_batch: dict, ell: torch.Tensor,
+                         exit_pdf: Optional[torch.Tensor]) -> None:
+        """``record["plc_weight"]``: the weights ``PLCActor.update_policy`` forms from ``ell``
+        ``[B, L, T]`` and ``exit_pdf`` (the old-policy tensors of this pass)."""
+        settings = self.plc_settings
+        response_length = micro_batch["responses"].size(-1)
+        rows, tokens = micro_batch["attention_mask"][:, -response_length:].bool().nonzero(
+            as_tuple=True)
+        ell = ell.float()
+        logq = plc.loop_prior_logq(settings.prior, ell.shape[-1], settings.progressive_alpha,
+                                   exit_pdf, like=ell)
+        weights = plc.compute_loop_weights(ell, logq, settings.gamma, settings.weight_mode,
+                                           settings.eps_floor)
+        record["plc_weight"] = weights[rows, tokens].cpu().numpy()
 
     def _write(self, step: int) -> None:
         step_dir = self.directory / step_dir_name(step)
@@ -217,6 +268,8 @@ class LoopAudit:
             if self._error is not None:
                 raise RuntimeError(self._error)
             names = TOKEN_ARRAYS + ("response_tokens", "prompt_tokens", "row_keys")
+            names += tuple(name for name in WEIGHT_ARRAYS
+                           if self._records and all(name in r for r in self._records))
             arrays = {name: np.concatenate([r[name] for r in self._records]) for name in names}
             arrays["offsets"] = np.concatenate([[0], np.cumsum(arrays["response_tokens"])])
             arrays["temperature"] = np.array(self._temperature)
@@ -240,6 +293,13 @@ def token_metrics(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     ids, probs = arrays["topk_ids"], arrays["topk_probs"]
     columns = {}
     loops = entropy.shape[1]
+    steps = np.arange(1, loops + 1, dtype=np.float32)
+    for name in WEIGHT_ARRAYS:
+        if name in arrays:
+            weights = arrays[name]
+            for t in range(loops):
+                columns[f"{name}/loop_{t + 1}"] = weights[:, t]
+            columns[f"{name}/expected_loop"] = weights @ steps
     for t in range(loops):
         columns[f"entropy/loop_{t + 1}"] = entropy[:, t]
         columns[f"sampled_log_prob/loop_{t + 1}"] = arrays["sampled_log_prob"][:, t]
@@ -369,7 +429,8 @@ def read_response(step_dir, rank: int, index: int, tokenizer=None) -> Dict[str, 
     """
     with np.load(Path(step_dir) / f"tokens_rank{rank:02d}.npz") as data:
         start, stop = data["offsets"][index], data["offsets"][index + 1]
-        out = {name: data[name][start:stop] for name in TOKEN_ARRAYS}
+        out = {name: data[name][start:stop] for name in TOKEN_ARRAYS + WEIGHT_ARRAYS
+               if name in data.files}
     if tokenizer is not None:
         out["topk_tokens"] = [[tokenizer.convert_ids_to_tokens(ids.tolist()) for ids in loops]
                               for loops in out["topk_ids"]]

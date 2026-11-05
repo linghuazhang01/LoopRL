@@ -21,7 +21,7 @@
 | `env` | driver 和 Ray worker 的环境变量 | 共享 |
 | `rollout` | `kv_layout: full`（标准 vLLM）或 `decode_last`（实验性 KV 布局） | 共享 |
 | `model` | `num_hidden_layers`：launcher 开训前核对模型目录 `config.json`，防止 1.4B 配置跑到 2.6B 权重（24 = 1.4B，48 = 2.6B） | 共享 |
-| `audit` | `loop_distribution`：逐轮分布审计，写 `<output_dir>/audit/`；所有配置都打开，只读不改训练，每次运行几十 GB | 共享 |
+| `audit` | `loop_distribution`：逐轮分布审计，写 `<output_dir>/audit/`；所有配置都打开，只读不改训练，每次运行几十 GB。其中 `loop_weights` 另记逐 token 的 `exit_pdf` 和 PLC 运行的 `plc_weight` | 共享 |
 | `plc` | Posterior Loop Credit 的全部开关（见下） | 方法 |
 
 ## `args`：模型与数据

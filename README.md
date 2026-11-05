@@ -382,7 +382,19 @@ audit:
     top_k: 5
     save_tokens: true   # false 时不留逐 token 数组，只留 summary.json 和 responses.jsonl
     chunk_tokens: 512   # 每次 lm_head 处理的 token 数；显存不够时调小
+    loop_weights: true  # 另记每个 token 的逐轮权重：exit_pdf，PLC 运行还有 plc_weight
 ```
+
+`loop_weights` 打开时，每个 token 另记两组逐轮权重（各为 (n, T)，每 token 16 字节）：
+
+- `exit_pdf`：exit gate 给出的各轮退出概率 `q_t = λ_t ∏_{s<t}(1 − λ_s)`，最后一轮取剩余部分。
+  三种方法都记；它也是 RLTT（`loop_weighting: exit_pdf`）loss 用的逐轮权重。
+- `plc_weight`：PLC 的逐轮权重 `w = softmax_t(log q_t + γ·ℓ_old)`（含 `eps_floor`），用 PLC actor 在同一次
+  `compute_log_prob` 里算出的逐轮 log-prob 和 exit PDF 求得，等于这一步 `update_policy` 实际使用的权重。
+  只在 PLC 运行（`plc.enabled`）里有；GRPO / RLTT 运行可以事后用 `exit_pdf` 和 `sampled_log_prob` 自己算后验。
+
+每一轮上采样 token 的概率就是已有的 `exp(sampled_log_prob)`，不另存。这个开关只控制上面两组新增数组，
+关掉后审计与之前完全相同。
 
 审计不加前向：它挂在训练本来就要做的 `compute_log_prob` 那次前向上，读出各轮隐状态再算
 `lm_head`，所以不改变 loss 和梯度，只多花 `lm_head` 的计算和磁盘。逐 token 数组压缩前约每 token
@@ -398,7 +410,7 @@ worker。之前的 `*_loop_audit.yaml` 诊断变体在审计全部打开后与�
 |---|---|
 | `summary.json` | 全步所有 token 汇总的 mean、p5、p95，以及 token 数、回答数、错误记录 |
 | `responses.jsonl` | 每条回答一行：`uid`、`rank`、`index`、长度、reward、是否答对、是否截断，以及该回答的 mean、p5、p95 |
-| `tokens_rank<r>.npz` | 逐 token 数组：`kl` (n, T, T)、`entropy`、`sampled_log_prob` (n, T)、`topk_ids`、`topk_probs` (n, T, k)、`sampled_token` |
+| `tokens_rank<r>.npz` | 逐 token 数组：`kl` (n, T, T)、`entropy`、`sampled_log_prob` (n, T)、`topk_ids`、`topk_probs` (n, T, k)、`sampled_token`；`loop_weights` 打开时还有 `exit_pdf`、`plc_weight` (n, T) |
 
 | 指标 | 含义 |
 |---|---|
@@ -407,6 +419,8 @@ worker。之前的 `*_loop_audit.yaml` 诊断变体在审计全部打开后与�
 | `sampled_log_prob/loop_<t>` | 实际采样的 token 在第 t 轮的 log-prob |
 | `top1_prob/loop_<t>`、`topk_mass/loop_<t>` | 第 t 轮最大概率、前 k 个 token 的概率和 |
 | `top1_agree/<t>_<s>`、`topk_overlap/<t>_<s>` | 两轮 top-1 是否相同、top-k 集合的重合比例 |
+| `exit_pdf/loop_<t>`、`exit_pdf/expected_loop` | `loop_weights`：第 t 轮的退出概率、期望退出轮次 `Σ_t t·q_t` |
+| `plc_weight/loop_<t>`、`plc_weight/expected_loop` | `loop_weights`，PLC 运行：第 t 轮的 PLC 权重、`Σ_t t·w_t` |
 
 同样的统计也写入 wandb：`loop_audit/<指标>/<mean|p5|p95>`。读取某条回答的逐 token 结果
 （`rank`、`index` 来自 `responses.jsonl`）：

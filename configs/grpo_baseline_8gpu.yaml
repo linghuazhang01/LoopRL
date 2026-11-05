@@ -142,3 +142,5 @@ audit:
     top_k: 5
     save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
     chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory
+    loop_weights: true  # also per-token exit_pdf (n, T) and, in PLC runs, the PLC loop weights
+                        # plc_weight (n, T); 16 bytes per token each

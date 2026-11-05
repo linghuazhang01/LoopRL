@@ -34,7 +34,9 @@ A config file has these top-level keys:
     ``<output_dir>/audit/step_<step>/`` (``rltt_baseline.loop_audit``). Keys: ``enabled``
     (default false), ``every_n_steps`` (default 1; steps 1, 1 + n, ...), ``top_k`` (default 5),
     ``save_tokens`` (default true; false keeps ``summary.json`` and ``responses.jsonl`` only),
-    ``chunk_tokens`` (default 512; response tokens per ``lm_head`` call).
+    ``chunk_tokens`` (default 512; response tokens per ``lm_head`` call), ``loop_weights``
+    (default false; also record each token's exit-gate distribution ``exit_pdf`` and, in PLC runs,
+    the PLC loop weights ``plc_weight``).
 ``plc``
     Posterior Loop Credit (``rltt_baseline.plc``), ``trainer: rltt`` only. Keys and defaults are
     the fields of ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (posterior | rltt),
@@ -72,7 +74,7 @@ ROLLOUT_KEYS = {"kv_layout", "log_probs"}
 MODEL_KEYS = {"num_hidden_layers"}
 AUDIT_KEYS = {"loop_distribution"}
 LOOP_AUDIT_DEFAULTS = {"enabled": False, "every_n_steps": 1, "top_k": 5, "save_tokens": True,
-                       "chunk_tokens": 512}
+                       "chunk_tokens": 512, "loop_weights": False}
 KV_LAYOUTS = ("full", "decode_last")
 # Vendor default of verl ``algorithm.use_kl_in_reward``: the GRPO script adds the KL to the
 # reward, the RLTT script uses a KL loss. This project never puts the KL in the reward.
