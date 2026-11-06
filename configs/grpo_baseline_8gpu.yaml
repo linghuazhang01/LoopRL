@@ -65,7 +65,7 @@ args:  # keys = dest names of grpo_train.py argparse options
   n_gpus: 8
   nnodes: 1
   output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
-  save_steps: 10              # checkpoints feed the per-loop gradient probe (condition B)
+  save_steps: 1               # checkpoints feed the per-loop gradient probe (condition B)
   logging_steps: 1
 
   # validation (off, as in the RLTT paper runs)

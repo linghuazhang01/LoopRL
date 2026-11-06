@@ -49,6 +49,8 @@ configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinkin
 configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
 configs/plc_posterior_exit_gate_2p6b_8gpu.yaml  同上，Ouro-2.6B-Thinking（与 1.4B 版只差模型）
 configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml  PLC 关闭 gate 损失的消融（Ouro-1.4B-Thinking，与 PLC 1.4B 版只差 `plc.use_gate_loss`）
+configs/plc_logp_softmax_1p4b_8gpu.yaml  PLC 代码路径 + `softmax_t(ℓ_old)` 权重（IDEA Two，均匀先验，无 gate 损失），1.4B
+configs/plc_rltt_progressive_1p4b_8gpu.yaml  PLC 代码路径 + RLTT-progressive 权重 `t^α`（α=1，无 gate 损失），1.4B
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -121,6 +123,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
 | 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
+| 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
+| 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -154,7 +158,10 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
   梯度裁剪 0.1；KL 关闭（`beta: 0`、`use_kl_loss: false`、`kl_loss_coef: 0`，所有配置相同）；
   clip 0.2，token-mean。
-- 每 10 步存 checkpoint（含 `hf_model`，供逐轮梯度探测）；训练中不做验证（论文如此），
+- 每步存 checkpoint（`save_steps: 1`，用户 2026-11-07 要求；含 `hf_model`，供逐轮梯度探测）。
+  内容是 model + optimizer + extra + hf_model，verl 默认全部保留，100 步就是 100 份；粗估每份 1.4B 约 20 GB、
+  2.6B 约 40 GB（未实测），要留足磁盘，或整组一起加 `verl_overrides.trainer.max_actor_ckpt_to_keep`。
+  训练中不做验证（论文如此），
   需要时加 `args.no_validation=false`（MATH-500，用 RLTT prompt）。
 - 显存：Ouro 每次循环有独立的 KV cache（48 层 × 4 次 = 192 层），每 token 约 1.57 MB。
   按此估算，vLLM 占 50% 显存时每张 H200 约能放 4 万 tokens 的 KV，即同时约 2 条满长度序列，
@@ -277,6 +284,9 @@ log-prob，`q_t` 为退出深度的先验。
 - **权重**：`w[j,t] = softmax_t(log q_t + γ·ℓ_old[j,t])`，用旧策略（`compute_log_prob` 那次 forward）的
   逐轮 log-prob 计算，detach，整个更新内固定。γ=1 是退出混合策略 `Σ_t q_t P^(t)` 的精确后验；γ=0 时
   `w = q`，就是 RLTT（先验 uniform / progressive / exit 分别对应 RLTT 的三种权重）。
+  `weight_mode` 另有两种不用先验的写法（都要求 `prior: uniform`，忽略 γ）：`uniform` 是 `w = 1/T`
+  （RLTT-uniform）；`logp_softmax` 是 `w = softmax_t(ℓ_old[j,t]) = P^(t)(y_j) / Σ_s P^(s)(y_j)`（IDEA Two），
+  即最大化 `Â·log (1/T)Σ_t P^(t)(y_j)` 的梯度系数，数值上等于 `posterior` + 均匀先验 + γ=1。
 - **损失**：`-agg_j[(1-λ)·PPO^(T) + λ·Σ_t w[j,t]·PPO^(t)]`，每轮一个 PPO ratio `exp(ℓ_new - ℓ_old)`，
   clip 用 verl 的 `clip_ratio` / 双重 clip；λ=0 与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
   熵项和 KL（`low_var_kl`）只加在最后一轮，与原作相同；对照组配置里 KL 关闭，熵系数为 0。
@@ -292,7 +302,9 @@ log-prob，`q_t` 为退出深度的先验。
   `old_log_probs` 就是前者的最后一轮。
 
 消融用命令行覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`、
-`plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`。
+`plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`、
+`plc.weight_mode=uniform plc.prior=uniform plc.use_gate_loss=false`（逐轮 1/T）、
+`plc.weight_mode=logp_softmax plc.prior=uniform plc.use_gate_loss=false`（softmax(logp)）。
 关闭 gate 损失的消融另存为 `configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml`（用户 2026-11-05 要求），
 等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。
 状态：只有 CPU 单元测试和 tiny 随机模型测试（`tests/test_plc.py`、`test_rltt_baseline_modeling.py`），

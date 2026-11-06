@@ -31,6 +31,8 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
 | 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
+| 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
+| 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -66,6 +68,10 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
    例外：`plc_posterior_exit_nogate_1p4b_8gpu.yaml` 是用户 2026-11-05 要求单独存的 gate loss 消融，
    等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。它登记在 `MATCHED_GROUPS` 里；
    `tests/test_plc.py` 还检查它与 PLC 配置只差这一项和 wandb 命名，所以改 PLC 配置时要同步改它。
+   同样是用户要求单独存的（2026-11-07）：`plc_logp_softmax_1p4b_8gpu.yaml`（`plc.weight_mode=logp_softmax
+   plc.prior=uniform`）和 `plc_rltt_progressive_1p4b_8gpu.yaml`（`plc.weight_mode=rltt plc.prior=progressive`），
+   都等于 nogate 配置改这两个 `plc` 键和 `args.loop_weighting`（只影响原作脚本的 run 名）。`tests/test_plc.py`
+   检查这一点，改 nogate 配置时要同步改它们。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
 `test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 64 题 × 8 条

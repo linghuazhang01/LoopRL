@@ -104,7 +104,7 @@
 
 ## `plc` 段（方法键，只在 PLC 配置里开）
 
-`enabled`、`weight_mode`（posterior / rltt）、`prior`（uniform / progressive / exit）、`progressive_alpha`、
+`enabled`、`weight_mode`（posterior / rltt / uniform / logp_softmax；后两种要求 `prior: uniform`）、`prior`（uniform / progressive / exit）、`progressive_alpha`、
 `gamma`（0 = RLTT 同先验）、`lam`（0 = GRPO，只算最后一轮）、`eps_floor`、`use_gate_loss`（需 `prior: exit`
 且模型目录 `rltt_detach_exit_pdf: false`）、`gate_coef`、`gate_entropy_coef`、`use_is_correction`、`is_clip`、
 `log_weight_stats`。其他配置里这段必须不存在或 `enabled: false`。消融用命令行覆盖这些键，不另存文件。

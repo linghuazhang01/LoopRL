@@ -39,9 +39,10 @@ A config file has these top-level keys:
     the PLC loop weights ``plc_weight``).
 ``plc``
     Posterior Loop Credit (``rltt_baseline.plc``), ``trainer: rltt`` only. Keys and defaults are
-    the fields of ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (posterior | rltt),
-    ``prior`` (uniform | progressive | exit), ``progressive_alpha``, ``gamma`` (1; 0 = RLTT),
-    ``lam`` (1; 0 = GRPO), ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
+    the fields of ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (posterior | rltt |
+    uniform | logp_softmax; the last two need ``prior: uniform``), ``prior`` (uniform |
+    progressive | exit), ``progressive_alpha``, ``gamma`` (1; 0 = RLTT), ``lam`` (1; 0 = GRPO),
+    ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
     ``gate_coef``, ``gate_entropy_coef``, ``use_is_correction``, ``is_clip``,
     ``log_weight_stats``. When enabled the section is passed to the workers as
     ``actor_rollout_ref.actor.plc`` and the launcher uses ``PLCActorRolloutRefWorker``.

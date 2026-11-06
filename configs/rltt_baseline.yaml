@@ -67,7 +67,7 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   n_gpus: 8
   nnodes: 1
   output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
-  save_steps: 10
+  save_steps: 1
   logging_steps: 1
 
   # validation (off in the paper runs; the paper validates MATH-500 at 3,072 tokens, the GRPO

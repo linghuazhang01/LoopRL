@@ -11,7 +11,16 @@ Notation, for a batch ``B`` of responses of length ``L`` from a ``T``-loop model
 
 ``gamma = 1`` is the exact posterior ``q_t P^(t)(y_j) / sum_s q_s P^(s)(y_j)``, the policy-gradient
 coefficient of the exit mixture ``pi_q = sum_t q_t P^(t)``; ``gamma = 0`` gives ``w = q``, i.e. RLTT
-with that prior. The policy loss mixes the final-loop PPO term with the loop-weighted one:
+with that prior. Two prior-free modes name the uniform-prior special cases explicitly (they need
+``prior = uniform`` and ignore ``gamma``):
+
+    weight_mode = uniform        w[b, j, t] = 1 / T                      (RLTT-uniform)
+    weight_mode = logp_softmax   w[b, j, t] = softmax_t(ell_old[b, j, t])
+                                            = P^(t)(y_j) / sum_s P^(s)(y_j)
+
+``logp_softmax`` is the policy-gradient coefficient of ``log (1/T) sum_t P^(t)(y_j)``.
+
+The policy loss mixes the final-loop PPO term with the loop-weighted one:
 
     loss_pg = -agg_j[ (1 - lam) * PPO_j^(T) + lam * sum_t w[j, t] * PPO_j^(t) ]
 
@@ -34,7 +43,8 @@ from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 
-WEIGHT_MODES = ("rltt", "posterior")
+WEIGHT_MODES = ("rltt", "posterior", "uniform", "logp_softmax")
+PRIOR_FREE_WEIGHT_MODES = ("uniform", "logp_softmax")
 PRIORS = ("uniform", "progressive", "exit")
 LOSS_AGG_MODES = ("token-mean", "seq-mean-token-sum", "seq-mean-token-mean",
                   "seq-mean-token-sum-norm")
@@ -46,7 +56,7 @@ class PLCSettings:
     """The ``plc`` config section; ``from_mapping`` validates a dict of user values."""
 
     enabled: bool = False
-    weight_mode: str = "posterior"      # rltt | posterior
+    weight_mode: str = "posterior"      # rltt | posterior | uniform | logp_softmax
     prior: str = "uniform"              # uniform | progressive | exit
     progressive_alpha: float = 1.0      # prior=progressive: q_t ∝ t^alpha
     gamma: float = 1.0                  # posterior temperature; 0 = RLTT
@@ -101,6 +111,9 @@ class PLCSettings:
             raise ValueError("plc.is_clip must be positive")
         if self.use_gate_loss and self.prior != "exit":
             raise ValueError("plc.use_gate_loss needs plc.prior=exit (the gate is the prior)")
+        if self.weight_mode in PRIOR_FREE_WEIGHT_MODES and self.prior != "uniform":
+            # the weights do not use the prior, but the IS correction does; keep both uniform
+            raise ValueError(f"plc.weight_mode={self.weight_mode} needs plc.prior=uniform")
 
     @property
     def needs_exit_pdf(self) -> bool:
@@ -143,13 +156,17 @@ def compute_loop_weights(ell_old: torch.Tensor, logq: torch.Tensor, gamma: float
     """``w[b, j, t]``, detached, ``sum_t = 1``.
 
     ``ell_old``: ``[B, L, T]`` old-policy per-loop log-probs of the sampled token;
-    ``logq``: broadcastable to it.
+    ``logq``: broadcastable to it (``uniform`` and ``logp_softmax`` ignore it and ``gamma``).
     """
     ell_old = ell_old.detach().float()
     if weight_mode == "rltt":
         z = logq.expand_as(ell_old)
     elif weight_mode == "posterior":
         z = logq + gamma * ell_old
+    elif weight_mode == "uniform":
+        z = torch.zeros_like(ell_old)
+    elif weight_mode == "logp_softmax":
+        z = ell_old
     else:
         raise ValueError(f"unknown weight_mode {weight_mode!r}")
     w = torch.softmax(z, dim=-1)
@@ -343,7 +360,7 @@ def entropy_from_log_probs(logq: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "PLCSettings", "WEIGHT_MODES", "PRIORS", "LOSS_AGG_MODES",
+    "PLCSettings", "WEIGHT_MODES", "PRIOR_FREE_WEIGHT_MODES", "PRIORS", "LOSS_AGG_MODES",
     "loop_prior_logq", "compute_loop_weights", "importance_weights",
     "agg_loss", "ppo_objective", "plc_policy_loss", "gate_loss",
     "weight_stats", "low_var_kl", "entropy_from_log_probs",

@@ -13,6 +13,15 @@ from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates
 
 CONFIG = paths.config_file("plc_posterior_exit_gate_1p4b_8gpu.yaml")
 NOGATE_CONFIG = paths.config_file("plc_posterior_exit_nogate_1p4b_8gpu.yaml")
+# weight-mode configs: the no-gate config with these plc / args keys changed (and wandb naming)
+WEIGHT_MODE_CONFIGS = {
+    "plc_logp_softmax_1p4b_8gpu.yaml": {
+        "plc": {"weight_mode": "logp_softmax", "prior": "uniform"},
+        "args": {"loop_weighting": "uniform"}},
+    "plc_rltt_progressive_1p4b_8gpu.yaml": {
+        "plc": {"weight_mode": "rltt", "prior": "progressive"},
+        "args": {"loop_weighting": "progressive"}},
+}
 ENV = {
     "LOOPRL_OURO_DIR": "/models/Ouro-1.4B-Thinking",
     "LOOPRL_MODEL_DIR": "/models/Ouro-1.4B-Thinking-RLTT",
@@ -41,7 +50,7 @@ def _uniform_logq(like):
 
 # ---------- weights ----------
 
-@pytest.mark.parametrize("weight_mode", ["rltt", "posterior"])
+@pytest.mark.parametrize("weight_mode", plc.WEIGHT_MODES)
 @pytest.mark.parametrize("prior", ["uniform", "progressive", "exit"])
 @pytest.mark.parametrize("eps_floor", [0.0, 0.1])
 def test_weights_sum_to_one(weight_mode, prior, eps_floor):
@@ -82,6 +91,49 @@ def test_toy_values_from_the_spec():
                              [0.2268, 0.2542, 0.2590, 0.2597]])
     assert torch.allclose(w[0], expected, atol=1e-3)
     assert torch.allclose(w, probs / probs.sum(-1, keepdim=True), atol=1e-6)
+
+
+@pytest.mark.parametrize("eps_floor", [0.0, 0.1])
+def test_uniform_mode_is_one_over_T_and_matches_rltt_uniform(eps_floor):
+    ell_old, _, _, _ = _random_batch()
+    logq = _uniform_logq(ell_old)
+    w = plc.compute_loop_weights(ell_old, logq, gamma=1.0, weight_mode="uniform",
+                                 eps_floor=eps_floor)
+    assert torch.equal(w, torch.full_like(ell_old, 1.0 / T))
+    for same in (plc.compute_loop_weights(ell_old, logq, 1.0, "rltt", eps_floor),
+                 plc.compute_loop_weights(ell_old, logq, 0.0, "posterior", eps_floor)):
+        assert torch.allclose(w, same, atol=1e-6)
+
+
+@pytest.mark.parametrize("eps_floor", [0.0, 0.1])
+def test_logp_softmax_mode_is_the_probability_share_of_each_loop(eps_floor):
+    ell_old, _, _, _ = _random_batch()
+    logq = _uniform_logq(ell_old)
+    w = plc.compute_loop_weights(ell_old, logq, gamma=0.0, weight_mode="logp_softmax",
+                                 eps_floor=eps_floor)
+    probs = ell_old.exp()
+    share = probs / probs.sum(-1, keepdim=True)
+    assert torch.allclose(w, (1 - eps_floor) * share + eps_floor / T, atol=1e-6)
+    # = PLC with the uniform prior and gamma = 1
+    assert torch.allclose(w, plc.compute_loop_weights(ell_old, logq, 1.0, "posterior", eps_floor),
+                          atol=1e-6)
+    # gamma and logq are ignored
+    other = plc.compute_loop_weights(ell_old, logq + torch.randn(T), gamma=3.0,
+                                     weight_mode="logp_softmax", eps_floor=eps_floor)
+    assert torch.allclose(w, other, atol=1e-6)
+
+
+def test_logp_softmax_weights_give_the_gradient_of_the_mean_loop_likelihood():
+    """``sum_t sg[softmax_t(ell)] grad ell_t = grad log (1/T) sum_t P^(t)(y)``."""
+    torch.manual_seed(0)
+    V = 7
+    logits = torch.randn(2, 3, T, V, requires_grad=True)
+    y = torch.randint(V, (2, 3))
+    logp = F.log_softmax(logits, -1).gather(-1, y[..., None, None].expand(2, 3, T, 1)).squeeze(-1)
+    w = plc.compute_loop_weights(logp, _uniform_logq(logp), gamma=1.0, weight_mode="logp_softmax")
+    grad = torch.autograd.grad((w * logp).sum(), logits, retain_graph=True)[0]
+    target = torch.log(logp.exp().mean(-1)).sum()
+    assert torch.allclose(grad, torch.autograd.grad(target, logits)[0], atol=1e-6)
 
 
 def test_exit_prior_uses_the_model_exit_pdf():
@@ -287,6 +339,14 @@ def test_settings_defaults_and_validation():
         plc.PLCSettings.from_mapping({"enabled": "yes"})
     with pytest.raises(ValueError, match="weight_mode"):
         plc.PLCSettings.from_mapping({"weight_mode": "delta"})
+    for mode in plc.PRIOR_FREE_WEIGHT_MODES:
+        s = plc.PLCSettings.from_mapping({"enabled": True, "weight_mode": mode})
+        assert s.weight_mode == mode and not s.needs_exit_pdf
+        with pytest.raises(ValueError, match="needs plc.prior=uniform"):
+            plc.PLCSettings.from_mapping({"weight_mode": mode, "prior": "exit"})
+        with pytest.raises(ValueError, match="prior"):
+            plc.PLCSettings.from_mapping({"weight_mode": mode, "prior": "exit",
+                                          "use_gate_loss": True})
 
 
 # ---------- config plumbing ----------
@@ -329,6 +389,19 @@ def test_plc_section_is_validated_and_can_be_overridden(env):
         rcfg.load_config(str(CONFIG), ["plc.prior=uniform"])
 
 
+@pytest.mark.parametrize("mode", plc.PRIOR_FREE_WEIGHT_MODES)
+def test_prior_free_weight_modes_are_overrides_of_the_plc_config(env, mode):
+    cfg = rcfg.load_config(str(CONFIG), [f"plc.weight_mode={mode}", "plc.prior=uniform",
+                                         "plc.use_gate_loss=false"])
+    s = rcfg.plc_settings(cfg)
+    assert s.weight_mode == mode and s.prior == "uniform" and not s.needs_exit_pdf
+    actor = rcfg.add_plc_overrides(cfg, rcfg.verl_overrides(cfg), _args())["actor_rollout_ref"][
+        "actor"]
+    assert actor["plc"]["weight_mode"] == mode
+    with pytest.raises(ValueError, match="needs plc.prior=uniform"):
+        rcfg.load_config(str(CONFIG), [f"plc.weight_mode={mode}", "plc.use_gate_loss=false"])
+
+
 def test_plc_overrides_require_the_rltt_trainer_and_per_loop_model(env):
     cfg = rcfg.load_config(str(CONFIG))
     with pytest.raises(ValueError, match="use_rltt_model"):
@@ -355,6 +428,35 @@ def test_nogate_config_is_the_plc_config_with_the_gate_loss_off(env):
     assert nogate == gate
     s = rcfg.plc_settings(rcfg.load_config(str(NOGATE_CONFIG)))
     assert s.enabled and s.prior == "exit" and s.needs_exit_pdf and not s.use_gate_loss
+
+
+@pytest.mark.parametrize("name", sorted(WEIGHT_MODE_CONFIGS))
+def test_weight_mode_configs_are_the_nogate_config_with_other_weights(env, name):
+    nogate = OmegaConf.to_container(rcfg.load_config(str(NOGATE_CONFIG)))
+    cfg = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(name))))
+    for section, values in WEIGHT_MODE_CONFIGS[name].items():
+        for key, value in values.items():
+            assert cfg[section].pop(key) == value, (name, section, key)
+            nogate[section].pop(key)
+    for c in (cfg, nogate):
+        for key in ("run_name", "tags"):
+            c["wandb"].pop(key)
+    assert cfg == nogate
+    s = rcfg.plc_settings(rcfg.load_config(str(paths.config_file(name))))
+    assert s.enabled and not s.needs_exit_pdf and not s.use_gate_loss and s.lam == 1.0
+
+
+def test_weight_mode_configs_give_the_intended_weights(env):
+    ell_old, _, _, _ = _random_batch()
+    expected = {
+        "plc_logp_softmax_1p4b_8gpu.yaml": torch.softmax(ell_old, -1),
+        "plc_rltt_progressive_1p4b_8gpu.yaml": torch.tensor([0.1, 0.2, 0.3, 0.4]).expand_as(ell_old),
+    }
+    for name, want in expected.items():
+        s = rcfg.plc_settings(rcfg.load_config(str(paths.config_file(name))))
+        logq = plc.loop_prior_logq(s.prior, T, s.progressive_alpha, like=ell_old)
+        w = plc.compute_loop_weights(ell_old, logq, s.gamma, s.weight_mode, s.eps_floor)
+        assert torch.allclose(w, want, atol=1e-6), name
 
 
 def test_other_configs_have_plc_off(env):

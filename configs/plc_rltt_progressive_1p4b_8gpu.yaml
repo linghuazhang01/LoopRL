@@ -1,0 +1,159 @@
+# RLTT-progressive loop weights on the PLC code path, Ouro-1.4B-Thinking: lam = 1, no gate loss.
+# One node with 8 GPUs, one optimizer update per step. Method config in the 1.4B comparison group
+# (see CLAUDE.md), saved as its own file at the user's request (2026-11-07): it is
+# plc_posterior_exit_nogate_1p4b_8gpu.yaml with plc.weight_mode rltt and plc.prior progressive
+# (args.loop_weighting progressive to match, which only names the vendor run) and its own wandb run
+# name / tags; every other key is the same (tests/test_plc.py checks this). No 2.6B copy.
+#
+# Objective (rltt_baseline.plc): the RLTT per-loop objective with loop weights that depend on the
+# loop index only,
+#   w[j, t] = t^alpha / sum_s s^alpha,  alpha = plc.progressive_alpha = 1 -> (0.1, 0.2, 0.3, 0.4),
+# with a per-loop PPO ratio and clip like the other PLC configs (gamma is unused by weight_mode
+# rltt). This is RLTT's progressive weighting on the PLC code path, not the vendor's REINFORCE
+# trainer (rltt_baseline_1p4b_8gpu.yaml with args.loop_weighting=progressive). lam = 1, no gate
+# loss and no exit prior, so the loss sends no gradient to the gate head. KL loss is disabled.
+# Same LOOPRL_MODEL_DIR as the other 1.4B configs.
+#
+# Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
+# like the other configs here; training uses only the 14,684-row merged filtered subset
+# (AGENTS.md rule 1), and the launcher refuses any other training file.
+# Optimisation follows RLTT Table 6 apart from batch and length of run: 64 prompts x 8 rollouts
+# per step, accumulation 1, 100 steps = 100 updates (paper: 32 prompts, accumulation 2, 140
+# steps); lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+# weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+# Further ablations by override, e.g. plc.lam=0 (GRPO on the PLC code path), plc.eps_floor=0.1.
+
+trainer: rltt
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model (1.4B)
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false
+  ref_offload: true
+
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 2048
+  max_completion_length: 16384
+
+  # vendor loop weighting is replaced by the plc section below; this value only keeps the
+  # vendor's run name and logging consistent with the weights used here
+  loop_weighting: progressive
+  progressive_alpha: 1.0
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
+  num_generations: 8
+  num_prompts_per_batch: 64
+  temperature: 1.0
+
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
+  num_train_epochs: 5
+  max_steps: 100
+  seed: 42
+
+  ppo_max_token_len: 32768      # >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 1
+  logging_steps: 1
+
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 16384
+
+plc:
+  enabled: true
+  weight_mode: rltt             # posterior | rltt | uniform | logp_softmax
+  prior: progressive            # q_t ∝ t^progressive_alpha
+  progressive_alpha: 1.0
+  gamma: 1.0                    # unused by weight_mode rltt
+  lam: 1.0                      # 0 = GRPO (final loop only)
+  eps_floor: 0.0
+  use_gate_loss: false          # needs prior: exit
+  gate_coef: 1.0
+  gate_entropy_coef: 0.05       # Ouro Stage I entropy regulariser, last-stage value
+  use_is_correction: false
+  is_clip: 5.0
+  log_weight_stats: true
+
+wandb:
+  enabled: true
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
+  project: looprl-ouro            # one wandb project for every method and size
+  entity: null
+  run_name: plc-rltt-progressive-1p4b
+  tags: [plc, rltt-weights, progressive-prior, no-gate-loss, ouro-1.4b-thinking, deepmath-level6]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides:
+  data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
+  actor_rollout_ref:
+    rollout:
+      max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
+                                     # below max_model_len 18,432, which verl refuses with
+                                     # chunked prefill on (both vendor scripts turn it on)
+      # sampling and engine settings written out (verl 0.6.1 defaults, same for every method)
+      top_p: 1.0                     # no nucleus truncation
+      top_k: -1                      # no top-k truncation
+      do_sample: true                # sample at args.temperature, not greedy
+      ignore_eos: false              # stop at EOS
+      max_num_seqs: 1024             # vLLM concurrent sequences cap
+      dtype: bfloat16                # vLLM weights / activations
+    actor:
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
+      optim:
+        betas: [0.9, 0.99]
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]
+  trainer:
+    logger: [wandb, console]
+
+rollout:
+  kv_layout: full
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
+
+model:
+  num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. On in every config of the comparison groups (shared key):
+  # read-only, no extra forward (hooks the compute_log_prob pass), so the loss is unchanged; it
+  # costs an lm_head call per loop on the response tokens and about 220 bytes per token on disk
+  # before compression.
+  loop_distribution:
+    enabled: true
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory
+    loop_weights: true  # also per-token exit_pdf (n, T) and, in PLC runs, the PLC loop weights
+                        # plc_weight (n, T); 16 bytes per token each
