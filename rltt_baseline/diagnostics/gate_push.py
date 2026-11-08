@@ -33,8 +33,8 @@ Token weights: ``--norm token`` (default) weights every response token of the st
 verl's token-mean over the whole step; ``--norm sequence`` weights each response's tokens by
 1/(|y| * responses), the paper's (1/g) sum_i (1/|y_i|).
 
-    python -m rltt_baseline.diagnostics.gate_push --audit-dir <output_dir>/audit \
-        [--audit-dir <resumed run>/audit ...] --out gate_push.csv [--steps 20-100] [--stride 5]
+    python -m rltt_baseline.diagnostics.gate_push --audit-dir <attempt 1>/audit@1-28 \
+        [--audit-dir <attempt 2>/audit@29-100 ...] --out gate_push.csv [--steps 20-100]
 """
 
 import argparse
@@ -127,14 +127,28 @@ def parse_steps(text: Optional[str]) -> Optional[Tuple[int, int]]:
     return int(low), int(high or low)
 
 
-def step_dirs(audit_dirs: Sequence[Path], steps: Optional[Tuple[int, int]],
+def parse_audit_dir(text: str) -> Tuple[Path, Optional[Tuple[int, int]]]:
+    """``DIR`` or ``DIR@LOW-HIGH``: the steps this directory may supply (inclusive)."""
+    path, _, steps = str(text).rpartition("@") if "@" in str(text) else (str(text), "", "")
+    return Path(path), parse_steps(steps)
+
+
+def step_dirs(audit_dirs: Sequence, steps: Optional[Tuple[int, int]],
               stride: int) -> List[Tuple[int, Path]]:
-    """Audited steps with token shards; a step found in several directories uses the last one."""
+    """Audited steps with token shards; a step found in several directories uses the last one.
+
+    Each entry of ``audit_dirs`` is ``DIR`` or ``DIR@LOW-HIGH``; with a range the directory only
+    supplies those steps (a resumed run's earlier attempt also holds steps that were replayed).
+    """
     found: Dict[int, Path] = {}
-    for directory in audit_dirs:
-        for path in sorted(Path(directory).glob("step_*")):
+    for entry in audit_dirs:
+        directory, allowed = parse_audit_dir(entry)
+        for path in sorted(directory.glob("step_*")):
+            step = int(path.name.split("_")[-1])
+            if allowed is not None and not allowed[0] <= step <= allowed[1]:
+                continue
             if (path / "responses.jsonl").exists() and any(path.glob("tokens_rank*.npz")):
-                found[int(path.name.split("_")[-1])] = path
+                found[step] = path
     chosen = sorted(s for s in found if steps is None or steps[0] <= s <= steps[1])
     if stride > 1 and chosen:
         chosen = [s for s in chosen if (s - chosen[0]) % stride == 0]
@@ -157,19 +171,23 @@ def _weights(arrays: Dict[str, np.ndarray], weighting: str, loops: int) -> np.nd
         return w
     if weighting == "uniform":
         return np.full((n, loops), 1.0 / loops)
-    if weighting not in arrays:
-        raise SystemExit(f"--weighting {weighting}: the audit has no {weighting!r} array "
-                         "(needs loop_weights: true; plc_weight exists in PLC runs only)")
     return arrays[weighting].astype(np.float64)
 
 
-def analyze_step(step_dir: Path, weighting: str = "exit_pdf", norm: str = "token") -> dict:
-    """Metrics of one audited step (see the module docstring)."""
+def analyze_step(step_dir: Path, weighting: str = "exit_pdf",
+                 norm: str = "token") -> Optional[dict]:
+    """Metrics of one audited step (see the module docstring).
+
+    Returns None when ``weighting`` is ``exit_pdf`` or ``plc_weight`` and the step's audit has no
+    such array (audits without ``loop_weights: true``; ``plc_weight`` exists in PLC runs only).
+    """
     advantages = response_advantages(step_dir)
     shards = []
     for shard in sorted(step_dir.glob("tokens_rank*.npz")):
         rank = int(shard.stem[-2:])
         with np.load(shard) as data:
+            if weighting in ("exit_pdf", "plc_weight") and weighting not in data.files:
+                return None
             arrays = {name: data[name] for name in NEEDED + ("exit_pdf", "plc_weight")
                       if name in data.files}
         lengths = np.diff(arrays.pop("offsets"))
@@ -210,7 +228,8 @@ def analyze_step(step_dir: Path, weighting: str = "exit_pdf", norm: str = "token
                 vec[f"gate_dw_{sign}"] += gate_dw(ell[mask], arrays["exit_pdf"][mask],
                                                   coef[mask])
 
-    row = {"step": int(step_dir.name.split("_")[-1]), "responses": responses, "tokens": tokens}
+    row = {"step": int(step_dir.name.split("_")[-1]), "source": str(step_dir.parent),
+           "responses": responses, "tokens": tokens}
     signed = sums["tokens_pos"] + sums["tokens_neg"]
     row["neg_token_share"] = sums["tokens_neg"] / signed if signed else math.nan
     total_abs = sums["abs_adv_pos"] + sums["abs_adv_neg"]
@@ -235,11 +254,13 @@ def analyze_step(step_dir: Path, weighting: str = "exit_pdf", norm: str = "token
 def sign_agreement(rows: List[dict], predicted: str, observed: str) -> Dict[str, dict]:
     """Per loop: how often sign(predicted at step s) equals sign(observed(s') - observed(s))."""
     out = {}
-    loops = sorted({k.split("/")[1] for k in rows[0] if k.startswith(predicted + "/loop_")}
-                   ) if rows else []
+    loops = sorted({k.split("/")[1] for r in rows for k in r
+                    if k.startswith(predicted + "/loop_")})
     for loop in loops:
         hits = total = 0
         for a, b in zip(rows, rows[1:]):
+            if b["step"] != a["step"] + 1:  # only consecutive steps (--stride 1)
+                continue
             p = a.get(f"{predicted}/{loop}")
             d = b.get(f"{observed}/{loop}", math.nan) - a.get(f"{observed}/{loop}", math.nan)
             if p is None or not np.isfinite(d) or p == 0 or d == 0:
@@ -256,18 +277,24 @@ def summarize(rows: List[dict]) -> dict:
     summary: Dict[str, object] = {"steps": [r["step"] for r in rows]}
     if not rows:
         return summary
+    sources = defaultdict(list)
+    for r in rows:
+        sources[r["source"]].append(r["step"])
+    summary["sources"] = {s: [min(v), max(v), len(v)] for s, v in sources.items()}
     for key in ("neg_token_share", "neg_weight_share", "gap_last_minus_first/pos",
                 "gap_last_minus_first/neg"):
         summary[key] = float(np.nanmean([r[key] for r in rows]))
     totals = {}
-    for key in rows[0]:
+    keys = dict.fromkeys(k for r in rows for k in r)  # steps without exit_pdf lack gate columns
+    for key in keys:
         if key.count("/") == 1 and key.split("/")[0] in ("gate_push", "gate_dw", "entropy_push"):
-            pos = sum(r[f"{key}/pos"] for r in rows)
-            neg = sum(r[f"{key}/neg"] for r in rows)
+            have = [r for r in rows if key in r]
+            pos = sum(r[f"{key}/pos"] for r in have)
+            neg = sum(r[f"{key}/neg"] for r in have)
             totals[key] = {"total": pos + neg, "from_pos": pos, "from_neg": neg,
-                           "steps_positive": sum(r[key] > 0 for r in rows)}
+                           "steps": len(have), "steps_positive": sum(r[key] > 0 for r in have)}
     summary["totals"] = totals
-    if "gate_dw/loop_1" in rows[0]:
+    if "gate_dw/loop_1" in keys:
         summary["gate_dw_vs_next_pdf_mean"] = sign_agreement(rows, "gate_dw", "pdf_mean")
     summary["entropy_push_vs_next_entropy_mean"] = sign_agreement(rows, "entropy_push",
                                                                   "entropy_mean")
@@ -285,8 +312,9 @@ def write_csv(rows: Iterable[dict], path: Path) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--audit-dir", type=Path, action="append", required=True,
-                        help="an audit directory; repeat for resumed runs (later ones win)")
+    parser.add_argument("--audit-dir", action="append", required=True,
+                        help="DIR or DIR@LOW-HIGH; repeat for resumed runs, giving each attempt "
+                        "the steps it owns in the run's lineage (later ones win)")
     parser.add_argument("--out", type=Path, required=True, help="per-step CSV; summary is "
                         "written next to it as <out>.summary.json")
     parser.add_argument("--weighting", default="exit_pdf", choices=WEIGHTINGS,
@@ -296,9 +324,14 @@ def main(argv=None) -> int:
     parser.add_argument("--stride", type=int, default=1)
     args = parser.parse_args(argv)
 
-    rows = []
+    rows, skipped = [], []
     for step, path in step_dirs(args.audit_dir, parse_steps(args.steps), args.stride):
         row = analyze_step(path, args.weighting, args.norm)
+        if row is None:
+            skipped.append(step)
+            print(json.dumps({"step": step, "skipped": f"no {args.weighting} in {path}"}),
+                  flush=True)
+            continue
         rows.append(row)
         print(json.dumps({k: (round(v, 6) if isinstance(v, float) else v)
                           for k, v in row.items() if "/" not in k or k.endswith("loop_1")
@@ -308,8 +341,8 @@ def main(argv=None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     write_csv(rows, args.out)
     summary = summarize(rows)
-    summary.update({"weighting": args.weighting, "norm": args.norm,
-                    "audit_dirs": [str(d) for d in args.audit_dir]})
+    summary.update({"skipped_steps": skipped, "weighting": args.weighting, "norm": args.norm,
+                    "audit_dirs": list(args.audit_dir)})
     summary_path = args.out.with_suffix(args.out.suffix + ".summary.json")
     summary_path.write_text(json.dumps(summary, indent=1, default=float) + "\n")
     print(json.dumps(summary, indent=1, default=float))

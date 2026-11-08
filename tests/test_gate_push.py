@@ -81,7 +81,7 @@ def test_positive_advantage_on_the_top_token_lowers_entropy():
     assert gp.entropy_push(ell, entropy, probs, np.array([[-1.0]]))[0, 0] > 0
 
 
-def write_step(audit, step, rewards, lengths, pdf_first):
+def write_step(audit, step, rewards, lengths, pdf_first, with_pdf=True):
     """One audited step: one prompt group, one rank; loop 1 is the worst loop on every token."""
     step_dir = audit / step_dir_name(step)
     step_dir.mkdir(parents=True)
@@ -91,10 +91,12 @@ def write_step(audit, step, rewards, lengths, pdf_first):
                     -0.6 - 0.1 * rng.random(n), -0.5 - 0.1 * rng.random(n)], -1)
     top = np.sort(rng.dirichlet(np.ones(5), size=(n, LOOPS)), -1)[..., ::-1] * 0.9
     pdf = np.tile([pdf_first, 0.2, 0.3, 0.5 - pdf_first], (n, 1))
-    np.savez_compressed(
-        step_dir / "tokens_rank00.npz", sampled_log_prob=ell.astype(np.float32),
-        entropy=np.full((n, LOOPS), 1.0, np.float32), topk_probs=top.astype(np.float32),
-        exit_pdf=pdf.astype(np.float32), offsets=np.concatenate([[0], np.cumsum(lengths)]))
+    arrays = {"sampled_log_prob": ell.astype(np.float32), "topk_probs": top.astype(np.float32),
+              "entropy": np.full((n, LOOPS), 1.0, np.float32),
+              "offsets": np.concatenate([[0], np.cumsum(lengths)])}
+    if with_pdf:
+        arrays["exit_pdf"] = pdf.astype(np.float32)
+    np.savez_compressed(step_dir / "tokens_rank00.npz", **arrays)
     with open(step_dir / "responses.jsonl", "w") as fh:
         for i, reward in enumerate(rewards):
             fh.write(json.dumps({"rank": 0, "index": i, "uid": "g0", "reward": reward}) + "\n")
@@ -121,3 +123,29 @@ def test_end_to_end_on_a_synthetic_audit(tmp_path):
     assert [s for s, _ in rows] == [21, 22]
     row = gp.analyze_step(rows[0][1], weighting="last")
     assert row["tokens"] == 22 and row["entropy_push/loop_1"] == 0.0
+
+
+def test_resumed_attempts_supply_only_their_own_steps(tmp_path):
+    rewards, lengths = [1.0, 0.0], [3, 9]
+    first, second = tmp_path / "a01" / "audit", tmp_path / "a02" / "audit"
+    for step in (1, 2, 3):  # a01 ran past its last lineage step (2); a02 replays 3
+        write_step(first, step, rewards, lengths, 0.1, with_pdf=False)
+    write_step(second, 3, rewards, lengths, 0.1)
+    (second / step_dir_name(4)).mkdir()  # a step a02 never finished
+    picked = gp.step_dirs([f"{first}@1-2", f"{second}@3-100"], None, 1)
+    assert [(s, p.parent) for s, p in picked] == [(1, first), (2, first), (3, second)]
+    assert gp.parse_audit_dir(str(first)) == (first, None)
+
+    out = tmp_path / "push.csv"
+    assert gp.main(["--audit-dir", f"{first}@1-2", "--audit-dir", f"{second}@3-100",
+                    "--out", str(out)]) == 0
+    summary = json.loads(out.with_suffix(".csv.summary.json").read_text())
+    assert summary["steps"] == [3] and summary["skipped_steps"] == [1, 2]  # no exit_pdf
+    assert summary["sources"] == {str(second): [3, 3, 1]}
+
+    assert gp.main(["--audit-dir", f"{first}@1-2", "--audit-dir", f"{second}@3-100",
+                    "--weighting", "last", "--out", str(out)]) == 0
+    summary = json.loads(out.with_suffix(".csv.summary.json").read_text())
+    assert summary["sources"] == {str(first): [1, 2, 2], str(second): [3, 3, 1]}
+    assert summary["totals"]["gate_push/loop_1"]["steps"] == 1  # only step 3 has exit_pdf
+    assert summary["totals"]["entropy_push/loop_4"]["steps"] == 3
