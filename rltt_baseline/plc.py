@@ -36,18 +36,41 @@ mixture-policy gradient plus Ouro's Stage I entropy regulariser:
 stage, arXiv 2510.25741 Table 2 / Section 4.) The optional importance factor
 ``is_j = min(sum_t q_t exp(ell_old[j, t] - ell_old[j, T]), is_clip)`` on the loop term turns the
 self-normalised weights into plain per-loop importance weights ``q_t P^(t) / P^(T)``.
+
+GRPO with a loop auxiliary term (``objective = additive``, ``weight_mode = is_trunc``,
+``loop_baseline = group``, ``loop_agg_mode = seq-mean-token-mean``):
+
+    loss = -agg_j[ PPO_j^(T)(A) ]
+           - lam * seq-mean_i token-mean_j[ sum_{t<T} w[j, t] PPO_j^(t)(A~) ]
+    w[j, t]   = alpha_t * min(1, P_old^(t)(y_j) / P_old^(T)(y_j))  for t < T,  w[j, T] = 0
+    A~[i, t]  = A_i - b[g(i), t],  b[g, t] = sum_{i in g} A_i m_it / sum_{i in g} m_it
+
+with ``alpha`` the prior restricted to t < T and renormalised, and ``m_it`` the weight mass of
+response i at loop t under the loop aggregation (the token mean of ``w`` for seq-mean-token-mean,
+the token sum for token-mean). The final-loop term is GRPO unchanged (``lam = 0`` is GRPO). The
+loop term is the per-loop policy gradient on rollouts of the final loop: the truncated ratio moves
+the effective sampling distribution of loop t towards its own, and the per-group, per-loop
+baseline makes the weighted advantage mass of every group zero at every loop, which removes the
+part of the update that does not depend on which sample was good (the drift that sharpens or
+flattens the intermediate loops when the mass is not zero). The gate gets no gradient.
 """
 
 from dataclasses import asdict, dataclass, fields
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-WEIGHT_MODES = ("rltt", "posterior", "uniform", "logp_softmax")
+WEIGHT_MODES = ("rltt", "posterior", "uniform", "logp_softmax", "is_trunc", "early_prior")
+# weight modes of the additive loop term: earlier loops only, the final loop has weight 0
+EARLY_LOOP_WEIGHT_MODES = ("is_trunc", "early_prior")
 PRIOR_FREE_WEIGHT_MODES = ("uniform", "logp_softmax")
 PRIORS = ("uniform", "progressive", "exit")
+OBJECTIVES = ("mix", "additive")
+LOOP_BASELINES = ("none", "group")
 LOSS_AGG_MODES = ("token-mean", "seq-mean-token-sum", "seq-mean-token-mean",
                   "seq-mean-token-sum-norm")
+# loop aggregations under which the group baseline zeroes the weighted advantage mass exactly
+BASELINE_AGG_MODES = ("token-mean", "seq-mean-token-mean")
 LOG_EPS = 1e-8
 
 
@@ -56,11 +79,15 @@ class PLCSettings:
     """The ``plc`` config section; ``from_mapping`` validates a dict of user values."""
 
     enabled: bool = False
-    weight_mode: str = "posterior"      # rltt | posterior | uniform | logp_softmax
+    weight_mode: str = "posterior"      # rltt | posterior | uniform | logp_softmax | is_trunc |
+                                        # early_prior
     prior: str = "uniform"              # uniform | progressive | exit
     progressive_alpha: float = 1.0      # prior=progressive: q_t ∝ t^alpha
     gamma: float = 1.0                  # posterior temperature; 0 = RLTT
-    lam: float = 1.0                    # loop-weighted share of the policy loss; 0 = GRPO
+    lam: float = 1.0                    # loop term coefficient (mix: its share); 0 = GRPO
+    objective: str = "mix"              # mix: (1-lam) final + lam loop | additive: final + lam loop
+    loop_baseline: str = "none"         # none | group: per-group, per-loop advantage baseline
+    loop_agg_mode: str = "same"         # aggregation of the loop term; same = actor loss_agg_mode
     eps_floor: float = 0.0              # w <- (1 - eps) w + eps / T
     use_gate_loss: bool = False         # needs prior=exit
     gate_coef: float = 1.0
@@ -99,8 +126,28 @@ class PLCSettings:
             raise ValueError(f"plc.prior must be one of {PRIORS}")
         if self.gamma < 0:
             raise ValueError("plc.gamma must be >= 0")
-        if not 0.0 <= self.lam <= 1.0:
-            raise ValueError("plc.lam must be in [0, 1]")
+        if self.objective not in OBJECTIVES:
+            raise ValueError(f"plc.objective must be one of {OBJECTIVES}")
+        if self.loop_baseline not in LOOP_BASELINES:
+            raise ValueError(f"plc.loop_baseline must be one of {LOOP_BASELINES}")
+        if self.loop_agg_mode != "same" and self.loop_agg_mode not in LOSS_AGG_MODES:
+            raise ValueError(f"plc.loop_agg_mode must be 'same' or one of {LOSS_AGG_MODES}")
+        baseline_modes = ("same",) + BASELINE_AGG_MODES
+        if self.loop_baseline == "group" and self.loop_agg_mode not in baseline_modes:
+            raise ValueError(f"plc.loop_baseline=group needs plc.loop_agg_mode in "
+                             f"{BASELINE_AGG_MODES} (or same)")
+        if self.lam < 0 or (self.objective == "mix" and self.lam > 1.0):
+            raise ValueError("plc.lam must be in [0, 1] (objective=mix) or >= 0 (additive)")
+        if self.weight_mode in EARLY_LOOP_WEIGHT_MODES:
+            # alpha comes from a static prior; is_trunc already is an importance weight
+            mode = f"plc.weight_mode={self.weight_mode}"
+            if self.prior not in ("uniform", "progressive"):
+                raise ValueError(f"{mode} needs plc.prior uniform or progressive")
+            if self.objective != "additive":
+                raise ValueError(f"{mode} needs plc.objective=additive "
+                                 "(its loop term has no final-loop weight)")
+            if self.eps_floor != 0.0 or self.use_is_correction:
+                raise ValueError(f"{mode} needs eps_floor 0 and use_is_correction false")
         if not 0.0 <= self.eps_floor < 1.0:
             raise ValueError("plc.eps_floor must be in [0, 1)")
         if self.progressive_alpha < 0:
@@ -121,8 +168,10 @@ class PLCSettings:
 
     def describe(self) -> str:
         return (f"weight_mode={self.weight_mode} prior={self.prior} gamma={self.gamma} "
-                f"lam={self.lam} eps_floor={self.eps_floor} gate_loss={self.use_gate_loss} "
-                f"gate_coef={self.gate_coef} gate_entropy_coef={self.gate_entropy_coef} "
+                f"lam={self.lam} objective={self.objective} loop_baseline={self.loop_baseline} "
+                f"loop_agg_mode={self.loop_agg_mode} eps_floor={self.eps_floor} "
+                f"gate_loss={self.use_gate_loss} gate_coef={self.gate_coef} "
+                f"gate_entropy_coef={self.gate_entropy_coef} "
                 f"is_correction={self.use_is_correction}")
 
 
@@ -153,12 +202,22 @@ def loop_prior_logq(prior: str, num_loops: int, alpha: float = 1.0,
 
 def compute_loop_weights(ell_old: torch.Tensor, logq: torch.Tensor, gamma: float,
                          weight_mode: str = "posterior", eps_floor: float = 0.0) -> torch.Tensor:
-    """``w[b, j, t]``, detached, ``sum_t = 1``.
+    """``w[b, j, t]``, detached; ``sum_t = 1`` except for ``is_trunc`` and ``early_prior``.
 
     ``ell_old``: ``[B, L, T]`` old-policy per-loop log-probs of the sampled token;
     ``logq``: broadcastable to it (``uniform`` and ``logp_softmax`` ignore it and ``gamma``).
+    ``is_trunc``: ``w[.., t] = alpha_t * min(1, exp(ell_old[.., t] - ell_old[.., T]))`` for
+    t < T with ``alpha = softmax(logq[.., :T-1])`` (the prior restricted to t < T), and
+    ``w[.., T] = 0``; ``gamma`` is ignored. Rows do not sum to 1. ``early_prior``: the same
+    without the ratio, ``w[.., t] = alpha_t`` for t < T and 0 for the final loop.
     """
     ell_old = ell_old.detach().float()
+    if weight_mode in EARLY_LOOP_WEIGHT_MODES:
+        alpha = torch.softmax(logq.expand_as(ell_old)[..., :-1].float(), dim=-1)
+        if weight_mode == "is_trunc":
+            alpha = alpha * torch.exp((ell_old[..., :-1] - ell_old[..., -1:]).clamp(max=0.0))
+        w = torch.cat([alpha, torch.zeros_like(ell_old[..., -1:])], dim=-1)
+        return w.detach()
     if weight_mode == "rltt":
         z = logq.expand_as(ell_old)
     elif weight_mode == "posterior":
@@ -173,6 +232,52 @@ def compute_loop_weights(ell_old: torch.Tensor, logq: torch.Tensor, gamma: float
     if eps_floor > 0:
         w = (1.0 - eps_floor) * w + eps_floor / w.shape[-1]
     return w.detach()
+
+
+def sequence_weight_mass(weights: torch.Tensor, response_mask: torch.Tensor,
+                         loop_agg_mode: str) -> torch.Tensor:
+    """``m[i, t]``: the share of response i's tokens in loop t's term, up to a factor that is
+    the same for every response of the step. ``[B, L, T]`` weights -> ``[B, T]``.
+
+    seq-mean-token-mean weighs response i by ``1 / L_i`` (token mean of ``w``); token-mean
+    weighs every token alike (token sum of ``w``).
+    """
+    mask = response_mask.to(weights.dtype)[..., None]
+    total = (weights * mask).sum(dim=1)
+    if loop_agg_mode == "token-mean":
+        return total
+    if loop_agg_mode == "seq-mean-token-mean":
+        return total / mask.sum(dim=1).clamp_min(1.0)
+    raise ValueError(f"the group baseline needs loop_agg_mode in {BASELINE_AGG_MODES}, "
+                     f"got {loop_agg_mode!r}")
+
+
+def sequence_advantages(advantages: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """``A_i`` from verl's token-level outcome advantages ``[B, L]`` (constant on the response)."""
+    mask = response_mask.to(advantages.dtype)
+    return (advantages * mask).sum(-1) / mask.sum(-1).clamp_min(1.0)
+
+
+def group_loop_baseline(seq_adv: torch.Tensor, mass: torch.Tensor,
+                        group_ids: Sequence) -> torch.Tensor:
+    """``b[i, t] = sum_{k in g(i)} A_k m_kt / sum_{k in g(i)} m_kt``, shape ``[B, T]``.
+
+    With ``A~[i, t] = A_i - b[i, t]`` the weighted advantage mass ``sum_{i in g} m_it A~[i, t]``
+    of every group is zero at every loop. A group whose mass at a loop is zero gets ``b = 0``.
+    """
+    if len(group_ids) != seq_adv.shape[0] or mass.shape[0] != seq_adv.shape[0]:
+        raise ValueError("seq_adv, mass and group_ids must cover the same responses")
+    index: Dict[object, int] = {}
+    groups = torch.tensor([index.setdefault(g, len(index)) for g in group_ids],
+                          dtype=torch.long, device=seq_adv.device)
+    mass = mass.double()
+    adv = seq_adv.double()[:, None]
+    num = torch.zeros(len(index), mass.shape[1], dtype=torch.float64, device=mass.device)
+    den = torch.zeros_like(num)
+    num.index_add_(0, groups, adv * mass)
+    den.index_add_(0, groups, mass)
+    b = torch.where(den > 0, num / den.clamp_min(1e-300), torch.zeros_like(num))
+    return b[groups].to(seq_adv.dtype)
 
 
 def importance_weights(ell_old: torch.Tensor, logq: torch.Tensor, is_clip: float) -> torch.Tensor:
@@ -243,45 +348,71 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
                     response_mask: torch.Tensor, weights: torch.Tensor, lam: float,
                     clip_ratio: float, loss_agg_mode: str = "token-mean",
                     clip_ratio_low: Optional[float] = None, clip_ratio_high: Optional[float] = None,
-                    clip_ratio_c: float = 3.0, is_weights: Optional[torch.Tensor] = None
+                    clip_ratio_c: float = 3.0, is_weights: Optional[torch.Tensor] = None,
+                    objective: str = "mix", loop_advantages: Optional[torch.Tensor] = None,
+                    loop_agg_mode: Optional[str] = None
                     ) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """``-agg_j[(1 - lam) PPO^(T) + lam sum_t w PPO^(t)]`` and its metrics.
+    """The PLC policy loss and its metrics.
 
-    ``logp_new`` / ``logp_old``: ``[B, L, T]``; ``advantages``: ``[B]`` or ``[B, L]``;
-    ``response_mask``: ``[B, L]``; ``weights``: ``[B, L, T]`` (treated as constants);
-    ``is_weights``: optional ``[B, L]`` factor on the loop term.
+    ``objective = mix``:      ``-agg_j[(1 - lam) PPO^(T) + lam sum_t w PPO^(t)]``
+    ``objective = additive``: ``-agg_j[PPO^(T)] - lam * agg'_j[sum_t w PPO^(t)]``
+
+    ``agg`` uses ``loss_agg_mode`` and ``agg'`` uses ``loop_agg_mode`` (default: the same).
+    ``logp_new`` / ``logp_old``: ``[B, L, T]``; ``advantages``: ``[B]`` or ``[B, L]``, used by
+    the final-loop term; ``loop_advantages``: optional ``[B, L, T]`` advantages of the loop term
+    (default: ``advantages`` for every loop); ``response_mask``: ``[B, L]``; ``weights``:
+    ``[B, L, T]`` (treated as constants); ``is_weights``: optional ``[B, L]`` factor on the loop
+    term.
     """
     if logp_new.shape != logp_old.shape or logp_new.dim() != 3:
         raise ValueError("logp_new and logp_old must both have shape [B, L, T]")
+    if objective not in OBJECTIVES:
+        raise ValueError(f"objective must be one of {OBJECTIVES}")
+    loop_mode = loss_agg_mode if loop_agg_mode in (None, "same") else loop_agg_mode
     if advantages.dim() == 1:
         advantages = advantages[:, None]
     adv3 = advantages.to(logp_new.dtype)[..., None]
     weights = weights.detach().to(logp_new.dtype)
-    objective, info = ppo_objective(logp_new, logp_old.detach(), adv3, clip_ratio,
-                                    clip_ratio_low, clip_ratio_high, clip_ratio_c)
-    loop_term = (weights * objective).sum(-1)
+    clip = (clip_ratio, clip_ratio_low, clip_ratio_high, clip_ratio_c)
+    ppo, info = ppo_objective(logp_new, logp_old.detach(), adv3, *clip)
+    if loop_advantages is None:
+        loop_ppo, loop_info = ppo, info
+    else:
+        if loop_advantages.shape != logp_new.shape:
+            raise ValueError("loop_advantages must have shape [B, L, T]")
+        loop_ppo, loop_info = ppo_objective(logp_new, logp_old.detach(),
+                                            loop_advantages.detach().to(logp_new.dtype), *clip)
+    loop_term = (weights * loop_ppo).sum(-1)
     if is_weights is not None:
         loop_term = loop_term * is_weights.detach().to(loop_term.dtype)
-    final_term = objective[..., -1]
-    per_token = (1.0 - lam) * final_term + lam * loop_term
-    loss = -agg_loss(per_token, response_mask, loss_agg_mode)
+    final_term = ppo[..., -1]
+    if objective == "mix" and loop_mode == loss_agg_mode:
+        per_token = (1.0 - lam) * final_term + lam * loop_term
+        loss = -agg_loss(per_token, response_mask, loss_agg_mode)
+    else:
+        final_coef = (1.0 - lam) if objective == "mix" else 1.0
+        loss = -(final_coef * agg_loss(final_term, response_mask, loss_agg_mode)
+                 + lam * agg_loss(loop_term, response_mask, loop_mode))
 
     with torch.no_grad():
-        mask = response_mask.to(objective.dtype)
-        mask3 = mask[..., None].expand_as(objective)
+        mask = response_mask.to(ppo.dtype)
+        mask3 = mask[..., None].expand_as(ppo)
         metrics = {
             "actor/pg_clipfrac": agg_loss(info["clipped"][..., -1], mask, "token-mean").item(),
             "actor/ppo_kl": agg_loss(-info["negative_approx_kl"][..., -1], mask,
                                      "token-mean").item(),
             "actor/pg_clipfrac_lower": agg_loss(info["clipped_lower"][..., -1], mask,
                                                 "token-mean").item(),
-            "plc/clipfrac_per_loop": _masked_mean_per_loop(info["clipped"], mask3),
-            "plc/ratio_mean_per_loop": _masked_mean_per_loop(info["ratio"], mask3),
+            "plc/clipfrac_per_loop": _masked_mean_per_loop(loop_info["clipped"], mask3),
+            "plc/ratio_mean_per_loop": _masked_mean_per_loop(loop_info["ratio"], mask3),
             "plc/loop_term_mean": agg_loss(loop_term, mask, "token-mean").item(),
             "plc/final_term_mean": agg_loss(final_term, mask, "token-mean").item(),
         }
         if is_weights is not None:
             metrics["plc/is_weight_mean"] = agg_loss(is_weights.float(), mask, "token-mean").item()
+        if loop_advantages is not None:
+            metrics["plc/loop_adv_abs_mean_per_loop"] = _masked_mean_per_loop(
+                loop_advantages.abs().to(mask.dtype), mask3)
     return loss, metrics
 
 
@@ -360,8 +491,11 @@ def entropy_from_log_probs(logq: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "PLCSettings", "WEIGHT_MODES", "PRIOR_FREE_WEIGHT_MODES", "PRIORS", "LOSS_AGG_MODES",
+    "PLCSettings", "WEIGHT_MODES", "EARLY_LOOP_WEIGHT_MODES", "PRIOR_FREE_WEIGHT_MODES", "PRIORS",
+    "LOSS_AGG_MODES",
+    "OBJECTIVES", "LOOP_BASELINES", "BASELINE_AGG_MODES",
     "loop_prior_logq", "compute_loop_weights", "importance_weights",
+    "sequence_weight_mass", "sequence_advantages", "group_loop_baseline",
     "agg_loss", "ppo_objective", "plc_policy_loss", "gate_loss",
     "weight_stats", "low_var_kl", "entropy_from_log_probs",
 ]

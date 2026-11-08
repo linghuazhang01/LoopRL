@@ -44,8 +44,11 @@ A config file has these top-level keys:
     progressive | exit), ``progressive_alpha``, ``gamma`` (1; 0 = RLTT), ``lam`` (1; 0 = GRPO),
     ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
     ``gate_coef``, ``gate_entropy_coef``, ``use_is_correction``, ``is_clip``,
-    ``log_weight_stats``. When enabled the section is passed to the workers as
-    ``actor_rollout_ref.actor.plc`` and the launcher uses ``PLCActorRolloutRefWorker``.
+    ``log_weight_stats``, and for GRPO + loop auxiliary term ``objective`` (mix | additive),
+    ``loop_baseline`` (none | group), ``loop_agg_mode`` (same | a verl loss_agg_mode) with
+    ``weight_mode`` is_trunc | early_prior (both need ``objective: additive``). When enabled
+    the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
+    uses ``PLCActorRolloutRefWorker``.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
 ``args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.mode=online``.

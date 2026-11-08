@@ -14,6 +14,10 @@ and replaces the vendor's REINFORCE loss:
 - ``update_policy`` recomputes the per-loop log-probs with gradient, forms the loop weights
   from the old tensors (fixed for the whole update, as RLTT's weights are) and backpropagates
   ``plc_policy_loss`` + the vendor's entropy bonus and final-loop KL + ``gate_loss``.
+- With ``loop_baseline = group`` it first forms, for the whole step, every response's advantage
+  ``A_i`` and loop weight mass ``m_it``, gathers them from all ranks (one ``all_gather_object``
+  of a few floats per response, so a group split across ranks is still handled) and subtracts the
+  per-group, per-loop baseline ``b[g, t]`` from the loop term's advantages.
 
 Per-token weight statistics and the gate metrics are logged under ``plc/`` and ``gate/``.
 """
@@ -24,6 +28,7 @@ from typing import Dict, Optional, Tuple
 
 import ray
 import torch
+import torch.distributed as dist
 from omegaconf import OmegaConf
 from verl import DataProto
 from verl.single_controller.base.decorator import (
@@ -46,6 +51,7 @@ from rltt_baseline.workers import MetricsRLTTActor
 
 OLD_LOOPS_KEY = "old_log_probs_loops"
 OLD_EXIT_PDF_KEY = "old_exit_pdf"
+LOOP_BASELINE_KEY = "plc_loop_baseline"
 
 
 class PLCActor(MetricsRLTTActor):
@@ -161,12 +167,71 @@ class PLCActor(MetricsRLTTActor):
             "clip_ratio_c": float(cfg.get("clip_ratio_c", 3.0)),
         }
 
+    def _loop_weights(self, batch, ell_old: torch.Tensor) -> Tuple[torch.Tensor, Optional[
+            torch.Tensor]]:
+        """Loop weights ``[B, L, T]`` and IS factors ``[B, L]`` (or None) from old tensors."""
+        settings = self.settings
+        exit_pdf_old = batch[OLD_EXIT_PDF_KEY].float() if settings.prior == "exit" else None
+        logq = plc.loop_prior_logq(settings.prior, ell_old.shape[-1], settings.progressive_alpha,
+                                   exit_pdf_old, like=ell_old)
+        weights = plc.compute_loop_weights(ell_old, logq, settings.gamma, settings.weight_mode,
+                                           settings.eps_floor)
+        is_weights = (plc.importance_weights(ell_old, logq, settings.is_clip)
+                      if settings.use_is_correction else None)
+        return weights, is_weights
+
+    def _group_loop_baseline(self, data: DataProto, batch, loop_agg_mode: str
+                             ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        """Per-response baseline ``b[i, t]`` ``[B, T]`` over the groups of the whole step."""
+        uids = data.non_tensor_batch.get("uid") if data.non_tensor_batch else None
+        if uids is None:
+            raise KeyError("plc.loop_baseline=group needs the 'uid' of every response")
+        uids = [str(u) for u in uids]
+        response_length = batch["responses"].size(1)
+        mask = batch["attention_mask"][:, -response_length:].float()
+        ell_old = batch[OLD_LOOPS_KEY].float()
+        weights, is_weights = self._loop_weights(batch, ell_old)
+        if is_weights is not None:
+            weights = weights * is_weights[..., None]
+        mass = plc.sequence_weight_mass(weights, mask, loop_agg_mode).cpu()
+        seq_adv = plc.sequence_advantages(batch["advantages"].float(), mask).cpu()
+
+        rank, world = 0, 1
+        if dist.is_available() and dist.is_initialized():
+            rank, world = dist.get_rank(), dist.get_world_size()
+        if world > 1:
+            gathered = [None] * world
+            dist.all_gather_object(gathered, (uids, seq_adv.tolist(), mass.tolist()))
+            offset = sum(len(g[0]) for g in gathered[:rank])
+            all_uids = [u for g in gathered for u in g[0]]
+            all_adv = torch.tensor([a for g in gathered for a in g[1]], dtype=torch.float64)
+            all_mass = torch.tensor([m for g in gathered for m in g[2]], dtype=torch.float64)
+            split = len({u for u in uids} & {u for k, g in enumerate(gathered) if k != rank
+                                              for u in g[0]})
+        else:
+            offset, all_uids = 0, uids
+            all_adv, all_mass = seq_adv.double(), mass.double()
+            split = 0
+        b_all = plc.group_loop_baseline(all_adv, all_mass, all_uids)
+        residual = (all_mass * (all_adv[:, None] - b_all)).sum(0) / all_mass.sum(0).clamp_min(1e-12)
+        baseline = b_all[offset:offset + len(uids)].float()
+        metrics = {
+            "plc/loop_baseline_mean_per_loop": b_all.mean(0).tolist(),
+            "plc/loop_baseline_abs_mean_per_loop": b_all.abs().mean(0).tolist(),
+            "plc/loop_adv_mass_residual_per_loop": residual.tolist(),  # ~0 by construction
+            "plc/loop_weight_mass_per_loop": all_mass.mean(0).tolist(),
+            "plc/groups_split_across_ranks": float(split),
+        }
+        return baseline.to(batch["advantages"].device), metrics
+
     def update_policy(self, data: DataProto) -> Dict[str, object]:
         settings = self.settings
         self._pending = []
         self.actor_module.train()
         temperature = data.meta_info["temperature"]
         loss_agg_mode = self.config.loss_agg_mode
+        loop_agg_mode = (loss_agg_mode if settings.loop_agg_mode == "same"
+                         else settings.loop_agg_mode)
         clip = self._clip_settings()
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids",
@@ -181,9 +246,15 @@ class PLCActor(MetricsRLTTActor):
         if use_ref_log_prob:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
+        metrics: Dict[str, object] = {}
+        if settings.loop_baseline == "group":
+            # once per step, before the mini-batch split: the baseline is a property of the
+            # whole groups, which may span mini-batches and ranks
+            baseline, baseline_metrics = self._group_loop_baseline(data, batch, loop_agg_mode)
+            batch[LOOP_BASELINE_KEY] = baseline
+            append_to_dict(metrics, baseline_metrics)
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        metrics: Dict[str, object] = {}
         for _ in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
                 if self.config.use_dynamic_bsz:
@@ -203,24 +274,21 @@ class PLCActor(MetricsRLTTActor):
                     response_mask = micro["attention_mask"][:, -response_length:]
                     advantages = micro["advantages"]
                     ell_old = micro[OLD_LOOPS_KEY].float()
-                    exit_pdf_old = None
-                    if settings.prior == "exit":
-                        exit_pdf_old = micro[OLD_EXIT_PDF_KEY].float()
-
-                    logq = plc.loop_prior_logq(settings.prior, ell_old.shape[-1],
-                                               settings.progressive_alpha, exit_pdf_old,
-                                               like=ell_old)
-                    weights = plc.compute_loop_weights(ell_old, logq, settings.gamma,
-                                                       settings.weight_mode, settings.eps_floor)
-                    is_weights = (plc.importance_weights(ell_old, logq, settings.is_clip)
-                                  if settings.use_is_correction else None)
+                    weights, is_weights = self._loop_weights(micro, ell_old)
+                    loop_advantages = None
+                    if settings.loop_baseline == "group":
+                        b = micro[LOOP_BASELINE_KEY].float()                       # [b, T]
+                        loop_advantages = ((advantages.float()[..., None] - b[:, None, :])
+                                           * response_mask.float()[..., None])     # [b, L, T]
 
                     entropy, ell_new, exit_pdf_new = self._forward_micro_batch_plc(
                         micro, temperature)
 
                     pg_loss, step_metrics = plc.plc_policy_loss(
                         ell_new, ell_old, advantages, response_mask, weights, settings.lam,
-                        loss_agg_mode=loss_agg_mode, is_weights=is_weights, **clip)
+                        loss_agg_mode=loss_agg_mode, is_weights=is_weights,
+                        objective=settings.objective, loop_advantages=loop_advantages,
+                        loop_agg_mode=loop_agg_mode, **clip)
                     policy_loss = pg_loss
 
                     entropy_loss = plc.agg_loss(entropy, response_mask, loss_agg_mode)

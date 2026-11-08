@@ -33,6 +33,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
 | 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
 | 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
+| 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -72,6 +73,11 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
    plc.prior=uniform`）和 `plc_rltt_progressive_1p4b_8gpu.yaml`（`plc.weight_mode=rltt plc.prior=progressive`），
    都等于 nogate 配置改这两个 `plc` 键和 `args.loop_weighting`（只影响原作脚本的 run 名）。`tests/test_plc.py`
    检查这一点，改 nogate 配置时要同步改它们。
+   同样是用户要求单独存的（2026-11-08）：`plc_grpo_loopaux_1p4b_8gpu.yaml`（GRPO + 中间轮辅助项：
+   `plc.weight_mode=is_trunc plc.prior=uniform plc.lam=0.1 plc.objective=additive plc.loop_baseline=group
+   plc.loop_agg_mode=seq-mean-token-mean`，`args.loop_weighting=uniform`），等于 nogate 配置改这些键，
+   `tests/test_plc.py` 同样检查。它的消融走覆盖：`plc.loop_baseline=none`（只修采样）、
+   `plc.weight_mode=early_prior`（只配平、不乘截断重要性权重）、`plc.lam=0.3`、`plc.lam=0`（GRPO）。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
 `test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 64 题 × 8 条

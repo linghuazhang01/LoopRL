@@ -50,7 +50,8 @@ def _uniform_logq(like):
 
 # ---------- weights ----------
 
-@pytest.mark.parametrize("weight_mode", plc.WEIGHT_MODES)
+@pytest.mark.parametrize("weight_mode",
+                         [m for m in plc.WEIGHT_MODES if m not in plc.EARLY_LOOP_WEIGHT_MODES])
 @pytest.mark.parametrize("prior", ["uniform", "progressive", "exit"])
 @pytest.mark.parametrize("eps_floor", [0.0, 0.1])
 def test_weights_sum_to_one(weight_mode, prior, eps_floor):
@@ -493,3 +494,192 @@ def test_plc_dry_run(env, capsys, monkeypatch):
     assert resolved["vendor_args"]["use_rltt_model"] is True
     assert resolved["vendor_args"]["rltt_model_path"] == ENV["LOOPRL_MODEL_DIR"]
     assert resolved["vendor_args"]["n_gpus"] == 8
+
+
+# ---------- GRPO + loop auxiliary term (objective additive, is_trunc, group baseline) ----------
+
+LOOPAUX_CONFIG = paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")
+# the loop-aux config: the no-gate config with these plc / args keys changed (and wandb naming)
+LOOPAUX_CHANGES = {
+    "plc": {"weight_mode": "is_trunc", "prior": "uniform", "lam": 0.1, "objective": "additive",
+            "loop_baseline": "group", "loop_agg_mode": "seq-mean-token-mean"},
+    "args": {"loop_weighting": "uniform"},
+}
+
+
+def _groups(B, size=2):
+    return [f"g{i // size}" for i in range(B)]
+
+
+def test_early_loop_weights_are_the_prior_on_earlier_loops_times_the_truncated_ratio():
+    ell_old, _, _, _ = _random_batch(B=4, L=6, seed=10)
+    for prior, alpha in (("uniform", torch.full((T - 1,), 1 / 3)),
+                         ("progressive", torch.tensor([1.0, 2.0, 3.0]) / 6)):
+        logq = plc.loop_prior_logq(prior, T, 1.0, like=ell_old)
+        early = plc.compute_loop_weights(ell_old, logq, 1.0, "early_prior")
+        trunc = plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc")
+        ratio = torch.exp(ell_old[..., :-1] - ell_old[..., -1:]).clamp(max=1.0)
+        assert torch.allclose(early[..., :-1], alpha.expand_as(ratio), atol=1e-6)
+        assert torch.allclose(trunc[..., :-1], alpha * ratio, atol=1e-6)
+        assert (early[..., -1] == 0).all() and (trunc[..., -1] == 0).all()
+        assert (trunc <= early + 1e-7).all() and not trunc.requires_grad
+
+
+def test_sequence_weight_mass_follows_the_loop_aggregation():
+    w = torch.rand(3, 5, T)
+    mask = torch.ones(3, 5)
+    mask[0, 3:] = 0
+    total = (w * mask[..., None]).sum(1)
+    assert torch.allclose(plc.sequence_weight_mass(w, mask, "token-mean"), total)
+    assert torch.allclose(plc.sequence_weight_mass(w, mask, "seq-mean-token-mean"),
+                          total / mask.sum(1, keepdim=True))
+    with pytest.raises(ValueError, match="group baseline"):
+        plc.sequence_weight_mass(w, mask, "seq-mean-token-sum")
+    adv = torch.tensor([1.5, -0.5, 0.0])[:, None] * mask
+    assert torch.allclose(plc.sequence_advantages(adv, mask), torch.tensor([1.5, -0.5, 0.0]))
+
+
+def test_group_baseline_zeroes_the_weighted_advantage_mass_of_every_group_and_loop():
+    g = torch.Generator().manual_seed(42)
+    B = 12
+    seq_adv = torch.randn(B, generator=g)
+    mass = torch.rand(B, T, generator=g)
+    mass[4:8, 1] = 0.0                       # group g1 has no mass at loop 2
+    groups = [f"g{i // 4}" for i in range(B)]
+    b = plc.group_loop_baseline(seq_adv, mass, groups)
+    assert b.shape == (B, T)
+    resid = mass * (seq_adv[:, None] - b)
+    for k in range(3):
+        assert torch.allclose(resid[4 * k:4 * k + 4].sum(0), torch.zeros(T), atol=1e-6)
+        assert torch.allclose(b[4 * k], b[4 * k + 3])          # one baseline per group
+    assert (b[4:8, 1] == 0).all()
+    # a constant shift of a group's advantages moves its baseline by the same amount
+    b2 = plc.group_loop_baseline(seq_adv + torch.tensor([3.0] * 4 + [0.0] * 8), mass, groups)
+    assert torch.allclose(b2[:4], b[:4] + 3.0, atol=1e-5) and torch.allclose(b2[4:], b[4:])
+    with pytest.raises(ValueError, match="same responses"):
+        plc.group_loop_baseline(seq_adv, mass, groups[:-1])
+
+
+@pytest.mark.parametrize("loss_agg_mode", plc.LOSS_AGG_MODES)
+def test_additive_lam0_is_verl_grpo_on_the_final_loop(loss_agg_mode):
+    ell_old, ell_new, adv, mask = _random_batch(seed=11)
+    ell_new[0, 0, -1] += 3.0
+    adv[1] = -2.0
+    ell_new[1, 1, -1] += 2.0
+    w = plc.compute_loop_weights(ell_old, _uniform_logq(ell_old), 1.0, "is_trunc")
+    loop_adv = torch.randn_like(ell_old)
+    ell_new = ell_new.requires_grad_(True)
+    loss, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.0, clip_ratio=0.2,
+                                  loss_agg_mode=loss_agg_mode, objective="additive",
+                                  loop_advantages=loop_adv, loop_agg_mode="seq-mean-token-mean")
+    expected = _verl_vanilla_loss(ell_old[..., -1], ell_new[..., -1], adv, mask,
+                                  loss_agg_mode=loss_agg_mode)
+    assert torch.allclose(loss, expected, atol=1e-6)
+    assert torch.all(torch.autograd.grad(loss, ell_new)[0][..., :-1] == 0)
+
+
+def test_additive_loss_is_grpo_plus_lam_times_the_loop_term():
+    ell_old, ell_new, adv, mask = _random_batch(seed=12)
+    w = plc.compute_loop_weights(ell_old, _uniform_logq(ell_old), 1.0, "is_trunc")
+    loop_adv = torch.randn_like(ell_old)
+    kw = dict(clip_ratio=0.2, objective="additive", loop_advantages=loop_adv,
+              loop_agg_mode="seq-mean-token-mean")
+    l0, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.0, **kw)
+    l1, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=1.0, **kw)
+    l3, metrics = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.3, **kw)
+    assert torch.allclose(l3, l0 + 0.3 * (l1 - l0), atol=1e-6)
+    assert len(metrics["plc/loop_adv_abs_mean_per_loop"]) == T
+    # the mix objective with the default loop aggregation is unchanged
+    lm, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.3, clip_ratio=0.2)
+    per = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.3, clip_ratio=0.2,
+                              loop_agg_mode="token-mean")[0]
+    assert torch.allclose(lm, per, atol=1e-6)
+
+
+def test_loop_gradient_has_zero_mass_in_every_group_at_the_on_policy_point():
+    # the constant part of the update: sum over a group's tokens of dL/dell_t is zero, t < T
+    B, L = 8, 7
+    ell_old, _, _, mask = _random_batch(B=B, L=L, seed=13)
+    mask[3, 2:] = 0
+    mask[6, 4:] = 0
+    g = torch.Generator().manual_seed(13)
+    seq_adv = torch.randn(B, generator=g)
+    adv = seq_adv[:, None] * mask
+    groups = _groups(B, size=4)
+    w = plc.compute_loop_weights(ell_old, _uniform_logq(ell_old), 1.0, "is_trunc")
+    mass = plc.sequence_weight_mass(w, mask, "seq-mean-token-mean")
+    b = plc.group_loop_baseline(plc.sequence_advantages(adv, mask), mass, groups)
+    loop_adv = (adv[..., None] - b[:, None, :]) * mask[..., None]
+    ell_new = ell_old.clone().requires_grad_(True)
+    loss, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                                  objective="additive", loop_advantages=loop_adv,
+                                  loop_agg_mode="seq-mean-token-mean")
+    grad = torch.autograd.grad(loss, ell_new)[0]
+    for k in range(2):
+        rows = slice(4 * k, 4 * k + 4)
+        assert torch.allclose(grad[rows, :, :-1].sum(dim=(0, 1)), torch.zeros(T - 1), atol=1e-7)
+    # per token: -lam * w * A~ / (M * L_i) on the earlier loops, GRPO's -A / N on the final loop
+    lengths = mask.sum(1, keepdim=True)
+    expected_loop = -0.1 * w[..., :-1] * loop_adv[..., :-1] / (B * lengths[..., None])
+    assert torch.allclose(grad[..., :-1], expected_loop, atol=1e-7)
+    assert torch.allclose(grad[..., -1], -adv / mask.sum(), atol=1e-7)
+    # without the baseline the mass is not zero
+    loss_nb, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                                     objective="additive", loop_agg_mode="seq-mean-token-mean")
+    grad_nb = torch.autograd.grad(loss_nb, ell_new)[0]
+    assert grad_nb[:4, :, :-1].sum(dim=(0, 1)).abs().max() > 1e-4
+
+
+@pytest.mark.parametrize("values, match", [
+    ({"weight_mode": "is_trunc"}, "objective=additive"),
+    ({"weight_mode": "is_trunc", "objective": "additive", "prior": "exit"}, "prior uniform"),
+    ({"weight_mode": "early_prior", "objective": "additive", "eps_floor": 0.1}, "eps_floor 0"),
+    ({"weight_mode": "is_trunc", "objective": "additive", "use_is_correction": True},
+     "use_is_correction"),
+    ({"loop_baseline": "group", "loop_agg_mode": "seq-mean-token-sum"}, "loop_baseline=group"),
+    ({"objective": "mix", "lam": 1.5}, "lam"),
+    ({"objective": "sum"}, "objective"),
+    ({"loop_agg_mode": "token-sum"}, "loop_agg_mode"),
+])
+def test_loop_aux_settings_are_validated(values, match):
+    with pytest.raises(ValueError, match=match):
+        plc.PLCSettings.from_mapping({"enabled": True, **values})
+    ok = plc.PLCSettings.from_mapping({"enabled": True, "weight_mode": "is_trunc",
+                                       "objective": "additive", "lam": 2.0,
+                                       "loop_baseline": "group"})
+    assert ok.lam == 2.0 and "objective=additive" in ok.describe()
+
+
+def test_loopaux_config_is_the_nogate_config_with_the_loop_aux_keys(env):
+    nogate = OmegaConf.to_container(rcfg.load_config(str(NOGATE_CONFIG)))
+    cfg = OmegaConf.to_container(rcfg.load_config(str(LOOPAUX_CONFIG)))
+    for section, values in LOOPAUX_CHANGES.items():
+        for key, value in values.items():
+            assert cfg[section].pop(key) == value, (section, key)
+            nogate[section].pop(key, None)
+    for c in (cfg, nogate):
+        for key in ("run_name", "tags"):
+            c["wandb"].pop(key)
+    assert cfg == nogate
+    s = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG)))
+    assert s.enabled and not s.needs_exit_pdf and not s.use_gate_loss
+    assert s.objective == "additive" and s.loop_baseline == "group" and s.lam == 0.1
+    gamma0 = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG), ["plc.lam=0"]))
+    assert gamma0.lam == 0.0
+    ablation = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG),
+                                                  ["plc.weight_mode=early_prior"]))
+    assert ablation.weight_mode == "early_prior"
+
+
+def test_loopaux_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(LOOPAUX_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    actor = resolved["verl_overrides"]["actor_rollout_ref"]["actor"]
+    assert actor["plc"]["objective"] == "additive" and actor["plc"]["loop_baseline"] == "group"
+    assert actor["plc"]["loop_agg_mode"] == "seq-mean-token-mean" and actor["plc"]["lam"] == 0.1
+    assert actor["ppo_mini_batch_size"] == 64 and actor["use_kl_loss"] is False

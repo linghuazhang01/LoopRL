@@ -51,6 +51,7 @@ configs/plc_posterior_exit_gate_2p6b_8gpu.yaml  同上，Ouro-2.6B-Thinking（�
 configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml  PLC 关闭 gate 损失的消融（Ouro-1.4B-Thinking，与 PLC 1.4B 版只差 `plc.use_gate_loss`）
 configs/plc_logp_softmax_1p4b_8gpu.yaml  PLC 代码路径 + `softmax_t(ℓ_old)` 权重（IDEA Two，均匀先验，无 gate 损失），1.4B
 configs/plc_rltt_progressive_1p4b_8gpu.yaml  PLC 代码路径 + RLTT-progressive 权重 `t^α`（α=1，无 gate 损失），1.4B
+configs/plc_grpo_loopaux_1p4b_8gpu.yaml  GRPO + 中间轮辅助项（截断重要性权重、组内配平基线、无 gate），1.4B
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -125,6 +126,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
 | 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
 | 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
+| 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -300,6 +302,17 @@ log-prob，`q_t` 为退出深度的先验。
   `gate/kl_w_q_mean`、`gate/entropy_mean`；原有的 `rltt/loop_<t>_entropy`、`actor/*` 照旧。
 - **批次里新增的张量**：`old_log_probs_loops` `[B,L,T]`，`prior: exit` 时还有 `old_exit_pdf` `[B,L,T]`。
   `old_log_probs` 就是前者的最后一轮。
+- **GRPO + 中间轮辅助项**（`configs/plc_grpo_loopaux_1p4b_8gpu.yaml`，`objective: additive`）：
+  `-agg_j[PPO^(T)(Â)] - λ·seq-mean·token-mean[Σ_{t<T} α_t·ρ̄[j,t]·PPO^(t)(Â − b[g,t])]`。
+  最后一轮那一项就是 GRPO，不乘 `(1−λ)`，λ=0 时与 GRPO 的 loss 相同。
+  `weight_mode: is_trunc` 时 `ρ̄[j,t] = min(1, P_old^(t)(y_j)/P_old^(T)(y_j))`，`α` 是先验在 t<T 上重新归一化
+  （`early_prior` 不乘 ρ̄）；`loop_baseline: group` 时 `b[g,t] = Σ_{i∈g} Â_i·m_it / Σ_{i∈g} m_it`，
+  `m_it` 是第 i 条回答在第 t 轮的权重质量（seq-mean-token-mean 下为 `α_t·ρ̄` 的 token 均值），
+  因此每组、每个中间轮的加权优势净质量为 0（`test_loop_gradient_has_zero_mass_in_every_group_at_the_on_policy_point`）。
+  基线每步在更新前算一次，用 `uid` 跨卡 `all_gather_object` 汇总整组。gate 不进入 loss。
+  动机和诊断见 `rltt_baseline/diagnostics/gate_push.py`。新增指标：`plc/loop_baseline_*_per_loop`、
+  `plc/loop_adv_mass_residual_per_loop`（应约为 0）、`plc/loop_weight_mass_per_loop`、
+  `plc/groups_split_across_ranks`、`plc/loop_adv_abs_mean_per_loop`。
 
 消融用命令行覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`、
 `plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`、
