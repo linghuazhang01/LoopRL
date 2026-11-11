@@ -45,8 +45,10 @@ A config file has these top-level keys:
     ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
     ``gate_coef``, ``gate_entropy_coef``, ``use_is_correction``, ``is_clip``,
     ``log_weight_stats``, and for GRPO + loop auxiliary term ``objective`` (mix | additive),
-    ``loop_baseline`` (none | group), ``loop_agg_mode`` (same | a verl loss_agg_mode) with
-    ``weight_mode`` is_trunc | early_prior (both need ``objective: additive``). When enabled
+    ``loop_baseline`` (none | group), ``loop_agg_mode`` (same | a verl loss_agg_mode),
+    ``trunc_cap`` (1; upper cap of the cross-loop ratio, is_trunc only) and ``kl_coef`` (0;
+    forward-KL trust region of the earlier loops towards the final loop) with ``weight_mode``
+    is_trunc | early_prior (both need ``objective: additive``). When enabled
     the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
     uses ``PLCActorRolloutRefWorker``.
 

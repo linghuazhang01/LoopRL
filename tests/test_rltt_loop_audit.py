@@ -251,6 +251,12 @@ def test_token_metrics_names_and_overlap():
     assert columns["topk_mass/loop_1"][0] == pytest.approx(0.875)
     assert columns["top1_prob/loop_2"][0] == 0.75
     assert "kl/1_1" not in columns
+    # cross-loop ratio of the sampled token, loop 1 against the last loop: rho = e^(-1 + 2) = e
+    assert columns["xloop_log_rho/loop_1"][0] == pytest.approx(1.0)
+    assert columns["xloop_rho_min1/loop_1"][0] == pytest.approx(1.0)
+    assert columns["xloop_rho_gt_1/loop_1"][0] == 1.0
+    assert columns["xloop_rho_lt_0.1/loop_1"][0] == 0.0
+    assert "xloop_log_rho/loop_2" not in columns
 
 
 # ---------- worker and driver ----------
@@ -336,6 +342,8 @@ def test_loop_weights_record_the_exit_pdf(tmp_path, remove_padding):
 @pytest.mark.parametrize("plc_settings", [
     plc.PLCSettings(enabled=True, prior="exit", use_gate_loss=True),
     plc.PLCSettings(enabled=True, prior="uniform", gamma=0.5, eps_floor=0.1),
+    plc.PLCSettings(enabled=True, weight_mode="is_trunc", objective="additive", lam=0.1,
+                    trunc_cap=2.0, kl_coef=0.2),
 ])
 def test_loop_weights_record_the_plc_weights_of_the_update(tmp_path, plc_settings):
     actor = PLCStyleActor(plc_settings)
@@ -352,11 +360,17 @@ def test_loop_weights_record_the_plc_weights_of_the_update(tmp_path, plc_setting
         logq = plc.loop_prior_logq(plc_settings.prior, LOOPS, plc_settings.progressive_alpha,
                                    exit_pdf, like=ell)
         weights = plc.compute_loop_weights(ell, logq, plc_settings.gamma,
-                                           plc_settings.weight_mode, plc_settings.eps_floor)
+                                           plc_settings.weight_mode, plc_settings.eps_floor,
+                                           plc_settings.trunc_cap)
         mask = micro_batch["attention_mask"][:, -5:].bool()
         expected.append(weights[mask].numpy())
     np.testing.assert_allclose(recorded, np.concatenate(expected), rtol=1e-6)
-    np.testing.assert_allclose(recorded.sum(-1), 1.0, rtol=1e-6)
+    if plc_settings.weight_mode in plc.EARLY_LOOP_WEIGHT_MODES:
+        rho = np.exp(sampled_log_prob[:, :-1] - sampled_log_prob[:, -1:])
+        np.testing.assert_allclose(recorded[:, :-1], np.minimum(rho, 2.0) / 3, rtol=1e-4)
+        assert (recorded[:, -1] == 0).all()
+    else:
+        np.testing.assert_allclose(recorded.sum(-1), 1.0, rtol=1e-6)
     if plc_settings.prior == "exit":  # gamma = 1: the posterior of the audited exit PDF
         posterior = pdf * np.exp(sampled_log_prob)
         np.testing.assert_allclose(recorded, posterior / posterior.sum(-1, keepdims=True),

@@ -502,7 +502,7 @@ LOOPAUX_CONFIG = paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")
 # the loop-aux config: the no-gate config with these plc / args keys changed (and wandb naming)
 LOOPAUX_CHANGES = {
     "plc": {"weight_mode": "is_trunc", "prior": "uniform", "lam": 0.1, "objective": "additive",
-            "loop_baseline": "group", "loop_agg_mode": "seq-mean-token-mean"},
+            "loop_baseline": "none", "loop_agg_mode": "same", "trunc_cap": 1.0, "kl_coef": 0.2},
     "args": {"loop_weighting": "uniform"},
 }
 
@@ -650,6 +650,95 @@ def test_loop_aux_settings_are_validated(values, match):
     assert ok.lam == 2.0 and "objective=additive" in ok.describe()
 
 
+@pytest.mark.parametrize("values, match", [
+    ({"weight_mode": "is_trunc", "objective": "additive", "trunc_cap": 0.5}, "trunc_cap"),
+    ({"weight_mode": "early_prior", "objective": "additive", "trunc_cap": 2.0}, "trunc_cap"),
+    ({"weight_mode": "is_trunc", "objective": "additive", "kl_coef": -0.1}, "kl_coef"),
+    ({"weight_mode": "posterior", "kl_coef": 0.2}, "kl_coef"),
+])
+def test_trust_region_settings_are_validated(values, match):
+    with pytest.raises(ValueError, match=match):
+        plc.PLCSettings.from_mapping({"enabled": True, **values})
+    ok = plc.PLCSettings.from_mapping({"enabled": True, "weight_mode": "is_trunc",
+                                       "objective": "additive", "trunc_cap": 2, "kl_coef": 0.2})
+    assert ok.trunc_cap == 2.0 and "kl_coef=0.2" in ok.describe()
+
+
+def test_trunc_cap_bounds_the_ratio_from_above_only():
+    ell_old, _, _, _ = _random_batch(B=4, L=6, seed=20)
+    ell_old[0, 0, 0] = ell_old[0, 0, -1] + 2.0          # ratio e^2 above the cap
+    ell_old[0, 1, 0] = ell_old[0, 1, -1] - 5.0          # ratio e^-5, kept as is
+    logq = _uniform_logq(ell_old)
+    w = plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc", trunc_cap=2.0)
+    ratio = torch.exp(ell_old[..., :-1] - ell_old[..., -1:])
+    assert torch.allclose(w[..., :-1], ratio.clamp(max=2.0) / 3, atol=1e-6)
+    assert w[0, 0, 0] == pytest.approx(2.0 / 3) and w[0, 1, 0] == pytest.approx(
+        float(torch.exp(torch.tensor(-5.0))) / 3, rel=1e-5)
+    assert torch.equal(plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc"),
+                       plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc", trunc_cap=1.0))
+    with pytest.raises(ValueError, match="trunc_cap"):
+        plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc", trunc_cap=0.5)
+
+
+@pytest.mark.parametrize("trunc_cap", [1.0, 2.0])
+def test_trust_region_gradient_is_rho_a_plus_kl_coef_per_token(trunc_cap):
+    # at the on-policy point (one update per step) the loop-t gradient per token is
+    # -(lam / N) alpha_t (rho A + kl_coef); the final loop gets GRPO's -A / N only
+    ell_old, _, adv, mask = _random_batch(B=5, L=6, seed=21)
+    logq = _uniform_logq(ell_old)
+    w = plc.compute_loop_weights(ell_old, logq, 1.0, "is_trunc", trunc_cap=trunc_cap)
+    alpha = plc.compute_loop_weights(ell_old, logq, 1.0, "early_prior")
+    ell_new = ell_old.clone().requires_grad_(True)
+    lam, beta = 0.1, 0.2
+    loss, metrics = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=lam, clip_ratio=0.2,
+                                        objective="additive", kl_coef=beta, kl_weights=alpha)
+    grad = torch.autograd.grad(loss, ell_new)[0]
+    n = mask.sum()
+    rho = torch.exp(ell_old[..., :-1] - ell_old[..., -1:]).clamp(max=trunc_cap)
+    expected = -lam * (alpha[..., :-1] * (rho * adv[..., None] + beta)) * mask[..., None] / n
+    assert torch.allclose(grad[..., :-1], expected, atol=1e-7)
+    assert torch.allclose(grad[..., -1], -adv * mask / n, atol=1e-7)
+    # the KL part of the loss is lam * kl_coef * token-mean of sum_t alpha_t k1_t
+    loss0, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=lam, clip_ratio=0.2,
+                                   objective="additive")
+    k1 = (alpha * (ell_old[..., -1:] - ell_old)).sum(-1)
+    assert torch.allclose(loss - loss0, lam * beta * plc.agg_loss(k1, mask, "token-mean"),
+                          atol=1e-6)
+    assert len(metrics["plc/kl_k3_per_loop"]) == T and metrics["plc/kl_term_mean"] == \
+        pytest.approx(float(plc.agg_loss(k1, mask, "token-mean")), abs=1e-6)
+    assert all(v >= 0 for v in metrics["plc/kl_k3_per_loop"])
+
+
+def test_trust_region_needs_additive_and_kl_weights():
+    ell_old, ell_new, adv, mask = _random_batch(seed=22)
+    w = plc.compute_loop_weights(ell_old, _uniform_logq(ell_old), 1.0, "is_trunc")
+    with pytest.raises(ValueError, match="kl_weights"):
+        plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                            objective="additive", kl_coef=0.2)
+    with pytest.raises(ValueError, match="additive"):
+        plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                            kl_coef=0.2, kl_weights=w)
+    # kl_coef = 0 leaves the loss unchanged
+    a, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                               objective="additive")
+    b, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                               objective="additive", kl_coef=0.0, kl_weights=w)
+    assert torch.equal(a, b)
+
+
+def test_cross_loop_stats():
+    ell_old = torch.log(torch.tensor([[[0.04, 0.6, 0.9, 0.5], [0.4, 0.4, 0.4, 0.4]]]))
+    adv = torch.tensor([[2.0, 2.0]])
+    mask = torch.ones(1, 2)
+    s = plc.cross_loop_stats(ell_old, adv, mask, trunc_cap=1.5)
+    # ratios against the last loop: token 1 = [0.08, 1.2, 1.8], token 2 = [1, 1, 1]
+    assert s["plc/xloop_rho_bar_mean_per_loop"] == pytest.approx([0.54, 1.1, 1.25], rel=1e-5)
+    assert s["plc/xloop_capped_frac_per_loop"] == pytest.approx([0.0, 0.0, 0.5])
+    assert s["plc/xloop_rho_lt_0.1_frac_per_loop"] == pytest.approx([0.5, 0.0, 0.0])
+    assert s["plc/xloop_pg_weight_abs_mean_per_loop"] == pytest.approx([1.08, 2.2, 2.5],
+                                                                       rel=1e-5)
+
+
 def test_loopaux_config_is_the_nogate_config_with_the_loop_aux_keys(env):
     nogate = OmegaConf.to_container(rcfg.load_config(str(NOGATE_CONFIG)))
     cfg = OmegaConf.to_container(rcfg.load_config(str(LOOPAUX_CONFIG)))
@@ -663,12 +752,16 @@ def test_loopaux_config_is_the_nogate_config_with_the_loop_aux_keys(env):
     assert cfg == nogate
     s = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG)))
     assert s.enabled and not s.needs_exit_pdf and not s.use_gate_loss
-    assert s.objective == "additive" and s.loop_baseline == "group" and s.lam == 0.1
+    assert s.objective == "additive" and s.loop_baseline == "none" and s.lam == 0.1
+    assert s.trunc_cap == 1.0 and s.kl_coef == 0.2
     gamma0 = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG), ["plc.lam=0"]))
     assert gamma0.lam == 0.0
-    ablation = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG),
-                                                  ["plc.weight_mode=early_prior"]))
-    assert ablation.weight_mode == "early_prior"
+    # every ablation in the config header is a valid override
+    for overrides in (["plc.weight_mode=early_prior"], ["plc.kl_coef=0"], ["plc.trunc_cap=2"],
+                      ["plc.kl_coef=0", "plc.loop_baseline=group",
+                       "plc.loop_agg_mode=seq-mean-token-mean"]):
+        ablation = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG), overrides))
+        assert ablation.enabled
 
 
 def test_loopaux_dry_run(env, capsys, monkeypatch):
@@ -680,6 +773,7 @@ def test_loopaux_dry_run(env, capsys, monkeypatch):
     assert launch.main(["--config", str(LOOPAUX_CONFIG), "--dry-run"]) == 0
     resolved = json.loads(capsys.readouterr().out)
     actor = resolved["verl_overrides"]["actor_rollout_ref"]["actor"]
-    assert actor["plc"]["objective"] == "additive" and actor["plc"]["loop_baseline"] == "group"
-    assert actor["plc"]["loop_agg_mode"] == "seq-mean-token-mean" and actor["plc"]["lam"] == 0.1
+    assert actor["plc"]["objective"] == "additive" and actor["plc"]["loop_baseline"] == "none"
+    assert actor["plc"]["loop_agg_mode"] == "same" and actor["plc"]["lam"] == 0.1
+    assert actor["plc"]["trunc_cap"] == 1.0 and actor["plc"]["kl_coef"] == 0.2
     assert actor["ppo_mini_batch_size"] == 64 and actor["use_kl_loss"] is False

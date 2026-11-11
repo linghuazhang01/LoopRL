@@ -14,12 +14,17 @@ With ``loop_weights`` the audit also records the loop weights of each token (n, 
 
 - ``exit_pdf``: the exit gate's distribution over loops, ``q_t = lambda_t prod_{s<t}(1 - lambda_s)``
   with the last loop taking the rest (all methods; RLTT's ``loop_weighting: exit_pdf`` weight);
-- ``plc_weight``: the PLC loop weights ``w = softmax_t(log q_t + gamma * ell_old)`` (with
-  ``eps_floor``) that ``PLCActor.update_policy`` applies to this step, computed from the actor's
+- ``plc_weight``: the PLC loop weights that ``PLCActor.update_policy`` applies to this step
+  (``plc.compute_loop_weights``: ``softmax_t(log q_t + gamma * ell_old)`` for the posterior
+  modes, ``alpha_t * min(trunc_cap, rho_t)`` for t < T and 0 for the final loop with
+  ``is_trunc``), computed from the actor's
   own per-loop log-probs and exit PDF of the same pass. PLC runs only; for GRPO and RLTT runs the
   posterior can be formed afterwards from ``exit_pdf`` and ``sampled_log_prob``.
 
-The probability of the sampled token at each loop is ``exp(sampled_log_prob)``.
+The probability of the sampled token at each loop is ``exp(sampled_log_prob)``. The summary
+also carries, for each loop t < T, the cross-loop ratio ``rho = P^(t)(y) / P^(T)(y)`` of the
+sampled token (``xloop_*``: log rho, min(1, rho), share above 1 and below 0.1), and ``kl/T_t``
+is the exact ``KL(P^(T) || P^(t))``, the trust region of the PLC loop term (``plc.kl_coef``).
 
 Distributions come from the training forward (full per-loop KV), also with decode_last rollouts.
 
@@ -258,7 +263,7 @@ class LoopAudit:
         logq = plc.loop_prior_logq(settings.prior, ell.shape[-1], settings.progressive_alpha,
                                    exit_pdf, like=ell)
         weights = plc.compute_loop_weights(ell, logq, settings.gamma, settings.weight_mode,
-                                           settings.eps_floor)
+                                           settings.eps_floor, settings.trunc_cap)
         record["plc_weight"] = weights[rows, tokens].cpu().numpy()
 
     def _write(self, step: int) -> None:
@@ -300,9 +305,18 @@ def token_metrics(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
             for t in range(loops):
                 columns[f"{name}/loop_{t + 1}"] = weights[:, t]
             columns[f"{name}/expected_loop"] = weights @ steps
+    log_prob = arrays["sampled_log_prob"]
+    for t in range(loops - 1):
+        # cross-loop ratio rho = P^(t)(y) / P^(T)(y) of the token the last loop sampled: how far
+        # the rollouts are off-policy for loop t (every method, so runs compare directly)
+        log_rho = log_prob[:, t] - log_prob[:, -1]
+        columns[f"xloop_log_rho/loop_{t + 1}"] = log_rho
+        columns[f"xloop_rho_min1/loop_{t + 1}"] = np.exp(np.minimum(log_rho, 0.0))
+        columns[f"xloop_rho_gt_1/loop_{t + 1}"] = (log_rho > 0).astype(np.float32)
+        columns[f"xloop_rho_lt_0.1/loop_{t + 1}"] = (log_rho < np.log(0.1)).astype(np.float32)
     for t in range(loops):
         columns[f"entropy/loop_{t + 1}"] = entropy[:, t]
-        columns[f"sampled_log_prob/loop_{t + 1}"] = arrays["sampled_log_prob"][:, t]
+        columns[f"sampled_log_prob/loop_{t + 1}"] = log_prob[:, t]
         columns[f"top1_prob/loop_{t + 1}"] = probs[:, t, 0]
         columns[f"topk_mass/loop_{t + 1}"] = probs[:, t].sum(-1)
         for s in range(loops):

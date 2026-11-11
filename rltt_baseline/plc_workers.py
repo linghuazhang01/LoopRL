@@ -13,7 +13,9 @@ and replaces the vendor's REINFORCE loss:
   ``old_log_probs`` tensor itself, so ``lam = 0`` is exactly verl's GRPO loss on this forward.
 - ``update_policy`` recomputes the per-loop log-probs with gradient, forms the loop weights
   from the old tensors (fixed for the whole update, as RLTT's weights are) and backpropagates
-  ``plc_policy_loss`` + the vendor's entropy bonus and final-loop KL + ``gate_loss``.
+  ``plc_policy_loss`` (with the earlier loops' forward-KL trust region when ``kl_coef > 0``)
+  + the vendor's entropy bonus and final-loop KL + ``gate_loss``. Early-loop modes also log the
+  cross-loop ratio statistics (``plc.cross_loop_stats``).
 - With ``loop_baseline = group`` it first forms, for the whole step, every response's advantage
   ``A_i`` and loop weight mass ``m_it``, gathers them from all ranks (one ``all_gather_object``
   of a few floats per response, so a group split across ranks is still handled) and subtracts the
@@ -167,18 +169,21 @@ class PLCActor(MetricsRLTTActor):
             "clip_ratio_c": float(cfg.get("clip_ratio_c", 3.0)),
         }
 
-    def _loop_weights(self, batch, ell_old: torch.Tensor) -> Tuple[torch.Tensor, Optional[
-            torch.Tensor]]:
-        """Loop weights ``[B, L, T]`` and IS factors ``[B, L]`` (or None) from old tensors."""
+    def _loop_weights(self, batch, ell_old: torch.Tensor) -> Tuple[
+            torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Loop weights ``[B, L, T]``, IS factors ``[B, L]`` (or None) and the trust-region
+        weights ``[B, L, T]`` (the prior on t < T; None when ``kl_coef = 0``), from old tensors."""
         settings = self.settings
         exit_pdf_old = batch[OLD_EXIT_PDF_KEY].float() if settings.prior == "exit" else None
         logq = plc.loop_prior_logq(settings.prior, ell_old.shape[-1], settings.progressive_alpha,
                                    exit_pdf_old, like=ell_old)
         weights = plc.compute_loop_weights(ell_old, logq, settings.gamma, settings.weight_mode,
-                                           settings.eps_floor)
+                                           settings.eps_floor, settings.trunc_cap)
         is_weights = (plc.importance_weights(ell_old, logq, settings.is_clip)
                       if settings.use_is_correction else None)
-        return weights, is_weights
+        kl_weights = (plc.compute_loop_weights(ell_old, logq, settings.gamma, "early_prior")
+                      if settings.kl_coef > 0 else None)
+        return weights, is_weights, kl_weights
 
     def _group_loop_baseline(self, data: DataProto, batch, loop_agg_mode: str
                              ) -> Tuple[torch.Tensor, Dict[str, object]]:
@@ -190,7 +195,7 @@ class PLCActor(MetricsRLTTActor):
         response_length = batch["responses"].size(1)
         mask = batch["attention_mask"][:, -response_length:].float()
         ell_old = batch[OLD_LOOPS_KEY].float()
-        weights, is_weights = self._loop_weights(batch, ell_old)
+        weights, is_weights, _ = self._loop_weights(batch, ell_old)
         if is_weights is not None:
             weights = weights * is_weights[..., None]
         mass = plc.sequence_weight_mass(weights, mask, loop_agg_mode).cpu()
@@ -274,7 +279,7 @@ class PLCActor(MetricsRLTTActor):
                     response_mask = micro["attention_mask"][:, -response_length:]
                     advantages = micro["advantages"]
                     ell_old = micro[OLD_LOOPS_KEY].float()
-                    weights, is_weights = self._loop_weights(micro, ell_old)
+                    weights, is_weights, kl_weights = self._loop_weights(micro, ell_old)
                     loop_advantages = None
                     if settings.loop_baseline == "group":
                         b = micro[LOOP_BASELINE_KEY].float()                       # [b, T]
@@ -288,7 +293,8 @@ class PLCActor(MetricsRLTTActor):
                         ell_new, ell_old, advantages, response_mask, weights, settings.lam,
                         loss_agg_mode=loss_agg_mode, is_weights=is_weights,
                         objective=settings.objective, loop_advantages=loop_advantages,
-                        loop_agg_mode=loop_agg_mode, **clip)
+                        loop_agg_mode=loop_agg_mode, kl_coef=settings.kl_coef,
+                        kl_weights=kl_weights, **clip)
                     policy_loss = pg_loss
 
                     entropy_loss = plc.agg_loss(entropy, response_mask, loss_agg_mode)
@@ -327,6 +333,9 @@ class PLCActor(MetricsRLTTActor):
                     })
                     if settings.log_weight_stats:
                         step_metrics.update(plc.weight_stats(weights, ell_old, response_mask))
+                    if settings.weight_mode in plc.EARLY_LOOP_WEIGHT_MODES:
+                        step_metrics.update(plc.cross_loop_stats(
+                            ell_old, advantages, response_mask, settings.trunc_cap))
                     append_to_dict(metrics, step_metrics)
 
                 grad_norm = self._optimizer_step()
