@@ -1,0 +1,177 @@
+# GRPO + off-policy loop auxiliary term WITHOUT the forward-KL trust region, on Ouro-1.4B-Thinking
+# (PLC code path). Saved as its own file at the user's request (2026-11-12): it is
+# plc_grpo_loopaux_1p4b_8gpu.yaml with plc.kl_coef 0.2 -> 0 and its own wandb run name / tags;
+# every other key is the same (tests/test_plc.py checks this), so it is also the no-gate config
+# with the loop-aux plc keys changed and differs from grpo_baseline_1p4b_8gpu.yaml only in the
+# method (tests/test_rltt_baseline.py). Change it together with plc_grpo_loopaux_1p4b_8gpu.yaml.
+# No 2.6B copy.
+#
+# Why: in the loop-aux run gw8h48fq (kl_coef 0.2) loop 1's entropy fell to 0.51x GRPO's
+# (g79f2224, same batches) by step 41, about twice as fast as RLTT (r50a17c3: 0.80x), and its
+# ratio tracked KL(P^(4) || P^(1)) almost exactly (0.511 vs 0.512). The k1 term puts a constant
+# positive coefficient kl_coef on every token sampled from the final loop, i.e. SFT of loop t
+# on P^(T)'s samples; its fixed point is P^(t) = P^(T), whose entropy is ~0.45. With one update per
+# step loop t's own ratio is 1, so no extra trust region is needed for the step size. This run
+# removes that pull and keeps the surrogate alone, to tell whether the KL term or the surrogate
+# drives the sharpening.
+#
+# Objective (rltt_baseline.plc, objective additive, kl_coef 0):
+#   loss = -token-mean[ PPO^(T)(A) ]                                        (GRPO, unchanged)
+#          + lam * sum_{t<T} alpha_t * ( -token-mean[ rho[j,t] PPO^(t)(A) ] )     (surrogate)
+#   rho[j,t] = min(trunc_cap, P_old^(t)(y_j) / P_old^(T)(y_j)),  stop-gradient
+#   alpha_t  = 1/3 (uniform prior on t < T)
+# Per-token gradient on loop t: -(lam / N) alpha_t rho A d log P^(t)(y_j). The gate gets no
+# gradient; the KL loss to a reference model stays disabled; token entropy coefficient is 0 as in
+# every config (the RLTT/PLC per-loop entropies carry no gradient). Same LOOPRL_MODEL_DIR as the
+# other 1.4B configs. Monitor: per-loop entropy against GRPO on the same step, loop_audit/kl/4_t
+# (exact KL(P^(4) || P^(t)), still logged by the audit) and plc/xloop_*; plc/kl_k*_per_loop are
+# not logged when kl_coef is 0.
+#
+# Data, lengths and optimisation are those of plc_grpo_loopaux_1p4b_8gpu.yaml (see its header):
+# the 14,684-row merged filtered training set (AGENTS.md rule 1), 64 prompts x 8 rollouts per
+# step, accumulation 1, 100 steps = 100 updates, lr 1e-6 constant + 10% warmup, betas
+# (0.9, 0.99), weight decay 0.1, grad clip 0.1, KL loss off, seed 42.
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+# Ablations by override (give each its own wandb.run_name):
+#   plc.loop_baseline=group plc.loop_agg_mode=seq-mean-token-mean
+#                                                 the 2026-11-08 version (zero net advantage mass)
+#   plc.lam=0                                     GRPO on the PLC code path
+
+trainer: rltt
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model (1.4B)
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false
+  ref_offload: true
+
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 2048
+  max_completion_length: 16384
+
+  # vendor loop weighting is replaced by the plc section below; this value only keeps the
+  # vendor's run name and logging consistent with the uniform prior used here
+  loop_weighting: uniform
+  progressive_alpha: 1.0
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
+  num_generations: 8
+  num_prompts_per_batch: 64
+  temperature: 1.0
+
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
+  num_train_epochs: 5
+  max_steps: 100
+  seed: 42
+
+  ppo_max_token_len: 32768      # >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 1
+  logging_steps: 1
+
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 16384
+
+plc:
+  enabled: true
+  weight_mode: is_trunc         # alpha_t * min(c, P^(t)/P^(T)) for t < T, 0 for the final loop
+  prior: uniform                # alpha = the prior on t < T, renormalised: 1/3 each
+  progressive_alpha: 1.0
+  gamma: 1.0                    # unused by is_trunc
+  lam: 0.1                      # loop term coefficient; 0 = GRPO
+  objective: additive           # GRPO term unchanged (not scaled by 1 - lam) + lam * loop term
+  loop_baseline: none           # advantages as GRPO's
+  loop_agg_mode: same           # loop term aggregated like the GRPO term (token-mean)
+  trunc_cap: 1.0                # c: upper cap of the cross-loop ratio (no lower cap)
+  kl_coef: 0.0                  # no trust region (plc_grpo_loopaux_1p4b_8gpu.yaml: 0.2)
+  eps_floor: 0.0
+  use_gate_loss: false          # needs prior: exit
+  gate_coef: 1.0
+  gate_entropy_coef: 0.05       # unused without the gate loss
+  use_is_correction: false      # is_trunc already is the importance weight
+  is_clip: 5.0
+  log_weight_stats: true
+
+wandb:
+  enabled: true
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
+  project: looprl-ouro            # one wandb project for every method and size
+  entity: null
+  run_name: plc-grpo-loopaux-nokl-1p4b
+  tags: [plc, grpo-loopaux, is-trunc, no-kl-trust-region, no-gate-loss, ouro-1.4b-thinking, deepmath-level6]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides:
+  data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
+  actor_rollout_ref:
+    rollout:
+      max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
+                                     # below max_model_len 18,432, which verl refuses with
+                                     # chunked prefill on (both vendor scripts turn it on)
+      # sampling and engine settings written out (verl 0.6.1 defaults, same for every method)
+      top_p: 1.0                     # no nucleus truncation
+      top_k: -1                      # no top-k truncation
+      do_sample: true                # sample at args.temperature, not greedy
+      ignore_eos: false              # stop at EOS
+      max_num_seqs: 1024             # vLLM concurrent sequences cap
+      dtype: bfloat16                # vLLM weights / activations
+    actor:
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
+      optim:
+        betas: [0.9, 0.99]
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]
+  trainer:
+    logger: [wandb, console]
+
+rollout:
+  kv_layout: full
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
+
+model:
+  num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. On in every config of the comparison groups (shared key):
+  # read-only, no extra forward (hooks the compute_log_prob pass), so the loss is unchanged; it
+  # costs an lm_head call per loop on the response tokens and about 220 bytes per token on disk
+  # before compression.
+  loop_distribution:
+    enabled: true
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory
+    loop_weights: true  # also per-token exit_pdf (n, T) and, in PLC runs, the PLC loop weights
+                        # plc_weight (n, T); 16 bytes per token each

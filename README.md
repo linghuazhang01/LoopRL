@@ -52,6 +52,7 @@ configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml  PLC 关闭 gate 损失的消�
 configs/plc_logp_softmax_1p4b_8gpu.yaml  PLC 代码路径 + `softmax_t(ℓ_old)` 权重（IDEA Two，均匀先验，无 gate 损失），1.4B
 configs/plc_rltt_progressive_1p4b_8gpu.yaml  PLC 代码路径 + RLTT-progressive 权重 `t^α`（α=1，无 gate 损失），1.4B
 configs/plc_grpo_loopaux_1p4b_8gpu.yaml  GRPO + 中间轮 off-policy 辅助项（截断重要性权重 + 正向 KL 信赖域、无 gate），1.4B
+configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml  同上但去掉正向 KL 项（`plc.kl_coef=0`），1.4B
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -127,6 +128,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
 | 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
 | 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
+| 1.4B GRPO + 中间轮辅助项、无 KL 项（PLC 代码路径） | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。

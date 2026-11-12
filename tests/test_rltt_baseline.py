@@ -373,6 +373,7 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
                                   "plc_logp_softmax_1p4b_8gpu.yaml",
                                   "plc_rltt_progressive_1p4b_8gpu.yaml",
                                   "plc_grpo_loopaux_1p4b_8gpu.yaml",
+                                  "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml",
                                   "plc_posterior_exit_gate_2p6b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
@@ -392,7 +393,8 @@ MATCHED_GROUPS = {
              "plc_nogate": "plc_posterior_exit_nogate_1p4b_8gpu.yaml",  # gate-loss ablation
              "plc_logp_softmax": "plc_logp_softmax_1p4b_8gpu.yaml",  # softmax(logp) weights
              "plc_rltt_progressive": "plc_rltt_progressive_1p4b_8gpu.yaml",  # t^alpha weights
-             "plc_grpo_loopaux": "plc_grpo_loopaux_1p4b_8gpu.yaml"},  # GRPO + loop aux term
+             "plc_grpo_loopaux": "plc_grpo_loopaux_1p4b_8gpu.yaml",  # GRPO + loop aux term
+             "plc_grpo_loopaux_nokl": "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"},  # ... no KL term
     "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml",
              "plc": "plc_posterior_exit_gate_2p6b_8gpu.yaml"},
 }

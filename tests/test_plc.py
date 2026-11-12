@@ -764,6 +764,26 @@ def test_loopaux_config_is_the_nogate_config_with_the_loop_aux_keys(env):
         assert ablation.enabled
 
 
+LOOPAUX_NOKL_CONFIG = paths.config_file("plc_grpo_loopaux_nokl_1p4b_8gpu.yaml")
+
+
+def test_loopaux_nokl_config_is_the_loopaux_config_without_the_kl_term(env):
+    # saved at the user's request (2026-11-12): plc.kl_coef 0.2 -> 0, everything else the same
+    loopaux = OmegaConf.to_container(rcfg.load_config(str(LOOPAUX_CONFIG)))
+    cfg = OmegaConf.to_container(rcfg.load_config(str(LOOPAUX_NOKL_CONFIG)))
+    assert loopaux["plc"].pop("kl_coef") == 0.2
+    assert cfg["plc"].pop("kl_coef") == 0.0
+    for c in (cfg, loopaux):
+        for key in ("run_name", "tags"):
+            c["wandb"].pop(key)
+    assert cfg == loopaux
+    s = rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_NOKL_CONFIG)))
+    assert s.enabled and s.kl_coef == 0.0 and s.weight_mode == "is_trunc" and s.lam == 0.1
+    for overrides in (["plc.lam=0"],
+                      ["plc.loop_baseline=group", "plc.loop_agg_mode=seq-mean-token-mean"]):
+        assert rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_NOKL_CONFIG), overrides)).enabled
+
+
 def test_loopaux_dry_run(env, capsys, monkeypatch):
     from rltt_baseline import launch
 

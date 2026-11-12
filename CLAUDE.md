@@ -34,6 +34,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
 | 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
 | 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
+| 1.4B GRPO + 中间轮辅助项、无 KL 项（PLC 代码路径） | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -81,6 +82,9 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
    `plc.kl_coef=0`（只有代理目标）、`plc.trunc_cap=2`、`plc.weight_mode=early_prior`（不乘比率）、
    `plc.lam=0`（GRPO）；`plc.kl_coef=0 plc.loop_baseline=group plc.loop_agg_mode=seq-mean-token-mean`
    是 2026-11-08 版本。
+   同样是用户要求单独存的（2026-11-12）：`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`，等于 loopaux 配置改
+   `plc.kl_coef=0`（去掉正向 KL 项，只留代理目标），用来区分中间轮熵坍塌来自 KL 项还是代理目标。
+   `tests/test_plc.py` 检查它与 loopaux 配置只差这一项和 wandb 命名，改 loopaux 配置时要同步改它。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
 `test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 64 题 × 8 条
