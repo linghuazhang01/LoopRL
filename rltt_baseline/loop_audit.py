@@ -26,6 +26,11 @@ is the exact ``KL(P^(T) || P^(t))``, the trust region of the PLC loop term (``pl
 
 Distributions come from the training forward (full per-loop KV), also with decode_last rollouts.
 
+Steps are numbered by the trainer's ``global_steps`` when the batch carries it, else by counting
+``compute_log_prob`` calls from ``first_step`` (1, or the loaded checkpoint's step + 1 when the run
+resumes; set by ``rltt_baseline.config.add_audit_overrides``). A step whose ``summary.json``
+already exists is never overwritten.
+
 No forward pass is added. A temporary hook on ``OuroModel`` reads the per-loop hidden states of
 the ``compute_log_prob`` pass that training runs anyway and applies ``lm_head`` there. That
 head belongs to the root FSDP unit, which stays unsharded during the root forward, so these
@@ -153,6 +158,8 @@ class LoopAudit:
         self.rank = rank
         self.directory = Path(config["dir"])
         self.every_n_steps = int(config["every_n_steps"])
+        # first training step of this run: 1, or checkpoint step + 1 when resuming
+        self.first_step = int(config.get("first_step", 1))
         self.top_k = int(config["top_k"])
         self.save_tokens = bool(config["save_tokens"])
         self.chunk_tokens = int(config["chunk_tokens"])
@@ -194,7 +201,7 @@ class LoopAudit:
 
     def compute_log_prob(self, data, *args, **kwargs):
         self._calls += 1
-        step = int(data.meta_info.get("global_steps", self._calls))
+        step = int(data.meta_info.get("global_steps", self.first_step + self._calls - 1))
         if (step - 1) % self.every_n_steps:
             return self._compute_log_prob(data, *args, **kwargs)
         self._temperature = float(data.meta_info["temperature"])
@@ -261,6 +268,13 @@ class LoopAudit:
 
     def _write(self, step: int) -> None:
         step_dir = self.directory / step_dir_name(step)
+        if (step_dir / "summary.json").exists():
+            # a finished step of an earlier run in this output_dir: keep it and leave a note (the
+            # run was restarted without resuming, or its first_step is wrong)
+            (step_dir / f"skipped_rank{self.rank:02d}.txt").write_text(
+                f"step {step} already finalized; this run's records were not written\n")
+            self._records = []
+            return
         step_dir.mkdir(parents=True, exist_ok=True)
         try:
             if self._error is not None:

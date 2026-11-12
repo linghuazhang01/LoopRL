@@ -406,8 +406,9 @@ def add_rollout_overrides(cfg: DictConfig, overrides: dict) -> dict:
 def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
     """``overrides`` plus ``actor_rollout_ref.loop_audit`` when the per-loop audit is on.
 
-    The workers count audited steps from 1, and LoRA adds a second ``compute_log_prob`` per step
-    (the reference pass), so both resuming and LoRA are refused rather than mislabelling steps.
+    The workers count ``compute_log_prob`` calls, one per step without LoRA (LoRA adds the
+    reference pass, so it is refused rather than mislabelling steps). A resumed run starts the
+    count at the step after the checkpoint it loads (``first_step``, see ``resume_first_step``).
     """
     settings = OmegaConf.to_container(cfg.audit.get("loop_distribution") or {}, resolve=True)
     settings = {**LOOP_AUDIT_DEFAULTS, **settings}
@@ -415,10 +416,37 @@ def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespa
         return overrides
     if not args.no_lora:
         raise ValueError("audit.loop_distribution needs no_lora=true")
-    if (overrides.get("trainer") or {}).get("resume_mode", "disable") != "disable":
-        raise ValueError("audit.loop_distribution counts steps from 1 and cannot resume a run")
+    settings["first_step"] = resume_first_step(overrides.get("trainer") or {}, args)
     settings["dir"] = os.path.join(os.path.abspath(str(args.output_dir)), "audit")
     return _deep_merge(overrides, {"actor_rollout_ref": {"loop_audit": settings}})
+
+
+def resume_first_step(trainer: dict, args: argparse.Namespace) -> int:
+    """The first training step this run executes: 1, or the loaded checkpoint's step + 1.
+
+    Mirrors verl 0.6.1 ``RayPPOTrainer._load_checkpoint``: ``resume_mode = auto`` loads the step
+    named in ``<default_local_dir>/latest_checkpointed_iteration.txt`` (none: starts from
+    scratch); ``resume_path`` loads ``resume_from_path``, a ``global_step_<n>`` directory. The
+    vendor scripts set ``default_local_dir`` to ``args.output_dir``.
+    """
+    mode = trainer.get("resume_mode", "disable")
+    if mode == "disable":
+        return 1
+    if mode == "resume_path":
+        path = trainer.get("resume_from_path")
+        match = re.fullmatch(r"global_step_(\d+)", os.path.basename(str(path or "").rstrip("/")))
+        if not match:
+            raise ValueError("trainer.resume_mode=resume_path needs trainer.resume_from_path "
+                             f"pointing at a global_step_<n> directory, got {path!r}")
+        return int(match.group(1)) + 1
+    if mode == "auto":
+        ckpt_dir = os.path.abspath(str(trainer.get("default_local_dir") or args.output_dir))
+        tracker = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
+        if not os.path.exists(tracker):
+            return 1
+        with open(tracker) as f:
+            return int(f.read().strip()) + 1
+    raise ValueError(f"unknown trainer.resume_mode {mode!r}; allowed disable, auto, resume_path")
 
 
 def plc_settings(cfg: DictConfig) -> PLCSettings:

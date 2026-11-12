@@ -462,7 +462,9 @@ token["topk_probs"][17, 0]         # 对应的概率
 - **自检。** `last_loop_log_prob_gap` 比较审计的最后一轮与 verl 的 `old_log_probs`，应接近 0；
   `unmatched_responses` 是对不上 driver batch 的回答数，应为 0。
 - **失败不影响训练。** 审计出错时写 `error_rank<r>.txt`，并记录在 `summary.json`，训练继续。
-- 审计按调用次数从第 1 步计数，因此 `resume_mode` 不是 `disable` 或启用 LoRA 时会拒绝启动。
+- 审计按 `compute_log_prob` 调用次数计步，启用 LoRA 时拒绝启动。续训（`verl_overrides.trainer.resume_mode=auto`
+  或 `resume_path`）时 launcher 读出要加载的 checkpoint 步数 n，审计从第 n+1 步接着编号，写进同一个
+  `audit/` 目录（解析后的 `loop_audit.first_step` 记录这个值）；已有 `summary.json` 的步不会被覆盖。
 
 ### 逐轮梯度探测
 

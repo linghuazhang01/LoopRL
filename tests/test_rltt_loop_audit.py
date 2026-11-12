@@ -423,6 +423,28 @@ def test_trainer_step_wins_over_the_call_count(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["step_000007"]
 
 
+def test_a_resumed_run_counts_from_first_step(tmp_path):
+    actor = FakeActor()
+    la.attach_loop_audit(actor, settings(tmp_path, every_n_steps=2, first_step=29), rank=0)
+    for _ in range(3):
+        run_step(actor, tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["step_000029", "step_000031"]
+
+
+def test_finished_steps_are_not_overwritten(tmp_path):
+    first = FakeActor()
+    la.attach_loop_audit(first, settings(tmp_path), rank=0)
+    run_step(first, tmp_path)
+    step_dir = tmp_path / la.step_dir_name(1)
+    before = {p.name: p.read_bytes() for p in step_dir.iterdir()}
+    again = FakeActor()  # restarted without resuming: counts from 1 again
+    la.attach_loop_audit(again, settings(tmp_path), rank=0)
+    run_step(again, tmp_path)
+    after = {p.name: p.read_bytes() for p in step_dir.iterdir() if p.name in before}
+    assert after == before
+    assert (step_dir / "skipped_rank00.txt").exists()
+
+
 def test_save_tokens_false_keeps_only_the_summaries(tmp_path):
     actor = FakeActor()
     la.attach_loop_audit(actor, settings(tmp_path, save_tokens=False), rank=0)
@@ -528,7 +550,7 @@ def test_audit_is_on_in_every_config(env, name):
     assert cfg.audit.loop_distribution.enabled is True
     audit = rcfg.add_audit_overrides(cfg, {}, _args())["actor_rollout_ref"]["loop_audit"]
     assert audit == {"every_n_steps": 1, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
-                     "loop_weights": True, "dir": "/out/run/audit"}
+                     "loop_weights": True, "first_step": 1, "dir": "/out/run/audit"}
 
 
 def test_config_switch_adds_the_worker_settings(env):
@@ -539,7 +561,7 @@ def test_config_switch_adds_the_worker_settings(env):
     assert overrides["trainer"] == {"logger": ["console"]}
     assert overrides["actor_rollout_ref"]["loop_audit"] == {
         "every_n_steps": 10, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
-        "loop_weights": True, "dir": "/out/run/audit"}
+        "loop_weights": True, "first_step": 1, "dir": "/out/run/audit"}
 
 
 def test_missing_settings_use_the_defaults(env):
@@ -562,10 +584,32 @@ def test_bad_audit_settings_are_refused(env, override, error):
         rcfg.load_config(str(paths.config_file("grpo_baseline_8gpu.yaml")), [override])
 
 
-def test_audit_refuses_lora_and_resume(env):
+def test_audit_refuses_lora(env):
     cfg = rcfg.load_config(str(paths.config_file("grpo_baseline_8gpu.yaml")),
                            ["audit.loop_distribution.enabled=true"])
     with pytest.raises(ValueError, match="no_lora"):
         rcfg.add_audit_overrides(cfg, {}, _args(no_lora=False))
-    with pytest.raises(ValueError, match="resume"):
-        rcfg.add_audit_overrides(cfg, {"trainer": {"resume_mode": "auto"}}, _args())
+
+
+def test_resumed_audit_starts_after_the_loaded_checkpoint(env, tmp_path):
+    cfg = rcfg.load_config(str(paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")))
+    args = types.SimpleNamespace(no_lora=True, output_dir=str(tmp_path))
+
+    def first_step(trainer):
+        return rcfg.add_audit_overrides(cfg, {"trainer": trainer}, args)[
+            "actor_rollout_ref"]["loop_audit"]["first_step"]
+
+    assert first_step({}) == 1
+    assert first_step({"resume_mode": "auto"}) == 1          # no checkpoint yet: from scratch
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("28")
+    assert first_step({"resume_mode": "auto"}) == 29
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "latest_checkpointed_iteration.txt").write_text("5")
+    assert first_step({"resume_mode": "auto", "default_local_dir": str(other)}) == 6
+    assert first_step({"resume_mode": "resume_path",
+                       "resume_from_path": str(tmp_path / "global_step_28") + "/"}) == 29
+    with pytest.raises(ValueError, match="global_step"):
+        first_step({"resume_mode": "resume_path", "resume_from_path": str(tmp_path)})
+    with pytest.raises(ValueError, match="resume_mode"):
+        first_step({"resume_mode": "latest"})

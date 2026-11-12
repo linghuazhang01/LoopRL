@@ -811,7 +811,8 @@ def test_loop_audit_configs_dry_run(env, capsys, monkeypatch, name):
     resolved = json.loads(capsys.readouterr().out)
     audit = resolved["verl_overrides"]["actor_rollout_ref"]["loop_audit"]
     assert audit == {"every_n_steps": 1, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
-                     "loop_weights": True, "dir": ENV["LOOPRL_OUTPUT_DIR"] + "/audit"}
+                     "loop_weights": True, "first_step": 1,
+                     "dir": ENV["LOOPRL_OUTPUT_DIR"] + "/audit"}
 
 
 def test_check_model_layers_refuses_the_other_model_size(tmp_path):
