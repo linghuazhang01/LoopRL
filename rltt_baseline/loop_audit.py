@@ -14,12 +14,10 @@ With ``loop_weights`` the audit also records the loop weights of each token (n, 
 
 - ``exit_pdf``: the exit gate's distribution over loops, ``q_t = lambda_t prod_{s<t}(1 - lambda_s)``
   with the last loop taking the rest (all methods; RLTT's ``loop_weighting: exit_pdf`` weight);
-- ``plc_weight``: the PLC loop weights that ``PLCActor.update_policy`` applies to this step
-  (``plc.compute_loop_weights``: ``softmax_t(log q_t + gamma * ell_old)`` for the posterior
-  modes, ``alpha_t * min(trunc_cap, rho_t)`` for t < T and 0 for the final loop with
-  ``is_trunc``), computed from the actor's
-  own per-loop log-probs and exit PDF of the same pass. PLC runs only; for GRPO and RLTT runs the
-  posterior can be formed afterwards from ``exit_pdf`` and ``sampled_log_prob``.
+- ``plc_weight``: the earlier-loop weights that ``PLCActor.update_policy`` applies to this step
+  (``plc.compute_loop_weights``: ``alpha_t * min(trunc_cap, rho_t)`` for t < T and 0 for the
+  final loop with ``is_trunc``, ``alpha_t`` with ``early_prior``), computed from the actor's own
+  per-loop log-probs of the same pass. PLC runs only.
 
 The probability of the sampled token at each loop is ``exp(sampled_log_prob)``. The summary
 also carries, for each loop t < T, the cross-loop ratio ``rho = P^(t)(y) / P^(T)(y)`` of the
@@ -188,7 +186,7 @@ class LoopAudit:
             if (returns_plc_tensors and self.loop_weights and self.plc_settings is not None
                     and self._error is None and len(self._records) == records + 1):
                 try:
-                    self._add_plc_weights(self._records[-1], micro_batch, result[1], result[2])
+                    self._add_plc_weights(self._records[-1], micro_batch, result[1])
                 except Exception as exc:  # the audit must not stop training
                     self._error = repr(exc)
             return result
@@ -251,19 +249,14 @@ class LoopAudit:
         return record
 
     @torch.no_grad()
-    def _add_plc_weights(self, record: dict, micro_batch: dict, ell: torch.Tensor,
-                         exit_pdf: Optional[torch.Tensor]) -> None:
+    def _add_plc_weights(self, record: dict, micro_batch: dict, ell: torch.Tensor) -> None:
         """``record["plc_weight"]``: the weights ``PLCActor.update_policy`` forms from ``ell``
-        ``[B, L, T]`` and ``exit_pdf`` (the old-policy tensors of this pass)."""
+        ``[B, L, T]`` (the old-policy per-loop log-probs of this pass)."""
         settings = self.plc_settings
         response_length = micro_batch["responses"].size(-1)
         rows, tokens = micro_batch["attention_mask"][:, -response_length:].bool().nonzero(
             as_tuple=True)
-        ell = ell.float()
-        logq = plc.loop_prior_logq(settings.prior, ell.shape[-1], settings.progressive_alpha,
-                                   exit_pdf, like=ell)
-        weights = plc.compute_loop_weights(ell, logq, settings.gamma, settings.weight_mode,
-                                           settings.eps_floor, settings.trunc_cap)
+        weights = plc.compute_loop_weights(ell.float(), settings.weight_mode, settings.trunc_cap)
         record["plc_weight"] = weights[rows, tokens].cpu().numpy()
 
     def _write(self, step: int) -> None:

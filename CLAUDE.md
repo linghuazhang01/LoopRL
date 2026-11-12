@@ -6,7 +6,9 @@
 @AGENTS.md
 
 在 looped language model（Ouro）上做 RL：GRPO 对照、RLTT 对照（arXiv 2602.10520）和我们的方法
-PLC（Posterior Loop Credit）。原作代码在 `third_party/RLTT`（submodule，固定 commit，**不修改**）；
+PLC：最后一轮做 GRPO，前几轮用截断重要性比率的 off-policy 代理目标加正向 KL 信赖域学习
+（`rltt_baseline/plc.py`；2026-11-13 起只保留这一种逻辑，旧的 posterior / gate loss / softmax(logp) /
+RLTT-progressive 权重及其配置已删除）。原作代码在 `third_party/RLTT`（submodule，固定 commit，**不修改**）；
 本仓库的适配代码在 `rltt_baseline/`，配置在 `configs/`，细节见 README.md。
 
 launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 与行数、seed 42、wandb online 且项目
@@ -28,13 +30,9 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
-| 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
-| 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
-| 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
-| 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
-| 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
-| 1.4B GRPO + 中间轮辅助项、无 KL 项（PLC 代码路径） | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
+| 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | —（暂无） |
+| 1.4B 消融：PLC 去掉 KL 项 | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -64,30 +62,19 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 2. **新增一种方法或一份配置**，先从同组已有文件复制，只改方法相关的键，再把文件名加进 `MATCHED_GROUPS`
    以及 `test_mini_batch_is_one_accumulated_update`、`test_other_configs_have_plc_off` 的参数列表。
 3. 临时实验用命令行 dot-list 覆盖（`args.max_steps=10 wandb.run_name=try`），不要为此另存一份配置。
-4. 消融走同一份配置加覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`。
-   PLC 配置加 `plc.gamma=0 plc.use_gate_loss=false` 是"与 PLC 完全同一条代码路径"的 RLTT 对照；
-   `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。两者回答的问题不同，论文里都要有。
-   例外：`plc_posterior_exit_nogate_1p4b_8gpu.yaml` 是用户 2026-11-05 要求单独存的 gate loss 消融，
-   等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。它登记在 `MATCHED_GROUPS` 里；
-   `tests/test_plc.py` 还检查它与 PLC 配置只差这一项和 wandb 命名，所以改 PLC 配置时要同步改它。
-   同样是用户要求单独存的（2026-11-07）：`plc_logp_softmax_1p4b_8gpu.yaml`（`plc.weight_mode=logp_softmax
-   plc.prior=uniform`）和 `plc_rltt_progressive_1p4b_8gpu.yaml`（`plc.weight_mode=rltt plc.prior=progressive`），
-   都等于 nogate 配置改这两个 `plc` 键和 `args.loop_weighting`（只影响原作脚本的 run 名）。`tests/test_plc.py`
-   检查这一点，改 nogate 配置时要同步改它们。
-   同样是用户要求单独存的（2026-11-08，2026-11-11 按用户要求改为信赖域形式）：
-   `plc_grpo_loopaux_1p4b_8gpu.yaml`（GRPO + 中间轮 off-policy 辅助项：`plc.weight_mode=is_trunc
-   plc.prior=uniform plc.lam=0.1 plc.objective=additive plc.loop_baseline=none plc.loop_agg_mode=same
-   plc.trunc_cap=1.0 plc.kl_coef=0.2`，`args.loop_weighting=uniform`），等于 nogate 配置改这些键，
-   `tests/test_plc.py` 同样检查。它的消融走覆盖：`plc.kl_coef=0.05 / 1.0`（信赖域大小）、
-   `plc.kl_coef=0`（只有代理目标）、`plc.trunc_cap=2`、`plc.weight_mode=early_prior`（不乘比率）、
-   `plc.lam=0`（GRPO）；`plc.kl_coef=0 plc.loop_baseline=group plc.loop_agg_mode=seq-mean-token-mean`
-   是 2026-11-08 版本。
-   同样是用户要求单独存的（2026-11-12）：`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`，等于 loopaux 配置改
+4. 消融走同一份配置加覆盖。PLC 配置 `plc_grpo_loopaux_1p4b_8gpu.yaml` 的 `plc` 段只有
+   `weight_mode`（is_trunc / early_prior）、`lam`、`trunc_cap`、`kl_coef`、`log_weight_stats` 五个键
+   （2026-11-08 首存，2026-11-11 改为信赖域形式，2026-11-13 起是唯一的 PLC 逻辑）。消融：
+   `plc.kl_coef=0.05 / 1.0`（信赖域大小）、`plc.kl_coef=0`（只有代理目标）、`plc.trunc_cap=2`、
+   `plc.weight_mode=early_prior`（不乘比率）、`plc.lam=0`（PLC 代码路径上的 GRPO）。
+   `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。
+   例外：`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` 是用户 2026-11-12 要求单独存的，等于 PLC 配置改
    `plc.kl_coef=0`（去掉正向 KL 项，只留代理目标），用来区分中间轮熵坍塌来自 KL 项还是代理目标。
-   `tests/test_plc.py` 检查它与 loopaux 配置只差这一项和 wandb 命名，改 loopaux 配置时要同步改它。
+   它登记在 `MATCHED_GROUPS` 里；`tests/test_plc.py` 检查它与 PLC 配置只差这一项和 wandb 命名，
+   改 PLC 配置时要同步改它。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
-`test_each_method_differs_between_sizes_only_in_the_model` 检查每种方法的两份配置）：都是每步 64 题 × 8 条
+`test_each_method_differs_between_sizes_only_in_the_model` 检查 GRPO、RLTT 的两份配置；PLC 暂无 2.6B 配置）：都是每步 64 题 × 8 条
 （512 条 rollout）、梯度累积 1、mini-batch 64 题、100 步 = 100 次优化器更新，warmup 10 步
 （用户 2026-11-05 指定；论文 Table 6 是每步 32 题、累积 2、140 步）。
 `test_matched_groups_are_one_update_per_step` 锁定这些值，改动要整组一起改。
@@ -101,6 +88,20 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 - 同一处还显式写出其余与训练有关的 rollout 参数：`top_p` 1.0、`top_k` -1、`do_sample` true、
   `ignore_eos` false、`max_num_seqs` 1024、`dtype` bfloat16。取值等于 verl 0.6.1 默认值，写出来是为了
   不依赖默认值；它们是共享键，测试锁定，改任何一个都要整组一起改。
+
+## 官方前向的 early exit：关闭（`early_exit_threshold: null`）
+
+- vLLM 采样始终用第 4 轮（最后一轮）。GRPO 的 log-prob（以及 RLTT 的 `old_log_probs`，它走 verl 父类的
+  `compute_log_prob`）来自官方 `OuroForCausalLM.forward`，verl 调用时不传退出参数，于是回落到 config 的
+  `early_exit_threshold`（Ouro 官方值 1.0）：逐 token 取累积退出概率第一次 >= 1.0 的那一轮。bf16 下
+  累积和会提前舍入成 1.0，部分 token 的 log-prob 会来自更早的轮，和采样分布不一致。
+- 因此每份配置都写 `verl_overrides.actor_rollout_ref.model.override_config.early_exit_threshold: null`。
+  verl 0.6.1 在 `from_pretrained` 之前把它写进 HF config，官方前向就走"取最后一轮"分支。它只影响官方
+  前向；RLTT / PLC 的逐轮前向和 vLLM 都不读它。这是共享键。launcher 的 `check_last_loop_logits`
+  在 dry-run 阶段就拒绝没有这一项（或命令行把它改掉、或设了 `early_exit_step`）的运行；
+  `tests/test_exit_threshold.py` 检查每份配置和这道检查。
+- 2026-11-12 加入这一项之前的 GRPO 结果没有这一项，属于旧行为；RLTT / PLC 的 loss 不受影响（RLTT 的
+  `actor/kl_loss` 和 `actor/entropy` 指标受影响）。
 
 ## KL：全部关闭
 
@@ -131,8 +132,8 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 - `trainer: rltt`（RLTT 与 PLC）的 actor 用自定义前向：padded 输入、模型内分块算逐轮 log-prob；
   `trainer: grpo` 走 verl 标准 actor（remove-padding 路径）。数学等价，数值路径不同。KL 关闭时
   三者都没有参考模型（见上面"KL：全部关闭"）。
-- exit gate 是否被训练由**模型目录**决定：`prepare_model` 默认写 `rltt_detach_exit_pdf: false`
-  （PLC 的 gate loss 需要）。原作 RLTT 用 `exit_pdf` 权重时梯度会流进 gate，GRPO 则完全不碰 gate。
+- exit gate 是否被训练由**模型目录**决定：`prepare_model` 默认写 `rltt_detach_exit_pdf: false`，
+  原作 RLTT 用 `exit_pdf` 权重时梯度因此会流进 gate；GRPO 和 PLC 的 loss 都不经过 gate。
   三种方法共用 `LOOPRL_MODEL_DIR`，换模型目录相当于换了实验设置，要在实验记录里写明。
 - 原作脚本会原地改模型目录：`rltt_train.py` 在 `rltt_logprob_chunk_size` 不一致时重写
   `config.json`，`grpo_train.py` 会改 `modeling_ouro.py`（launcher 拒绝官方目录以避免后者）。

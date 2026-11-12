@@ -24,9 +24,8 @@ What this adds around the vendor script (whose files are not modified; located b
 9. ``audit.loop_distribution.enabled`` writes per-loop token distributions to
    ``<output_dir>/audit/`` (``rltt_baseline.loop_audit``); for GRPO it also selects
    ``AuditGRPOActorRolloutRefWorker``;
-10. ``plc.enabled`` (RLTT trainer) replaces the vendor loss by Posterior Loop Credit
-    (``rltt_baseline.plc``) through ``PLCActorRolloutRefWorker``; with ``plc.use_gate_loss`` the
-    RLTT model directory must have been built without ``--detach-exit-pdf``;
+10. ``plc.enabled`` (RLTT trainer) replaces the vendor loss by PLC (``rltt_baseline.plc``: GRPO
+    on the final loop plus the earlier-loop auxiliary term) through ``PLCActorRolloutRefWorker``;
 11. when neither ``actor.use_kl_loss`` nor ``algorithm.use_kl_in_reward`` is on in the final verl
     config, ``Role.RefPolicy`` is removed from the trainer's ``role_worker_mapping``, so the GRPO
     script (the only one that registers it) neither loads the frozen reference model nor runs its
@@ -38,6 +37,9 @@ What this adds around the vendor script (whose files are not modified; located b
     file must be the 14,684-row set (SHA256 and row count checked), ``args.seed`` and
     ``data.seed`` must be 42, and wandb must be enabled, online, project ``looprl-ouro``. The
     dry-run reports ``train_file_check`` and ``policy_violations`` without stopping.
+14. the HF actor forward must give the last loop's logits (the loop vLLM samples from): the
+    final verl overrides must set ``actor_rollout_ref.model.override_config.early_exit_threshold``
+    to null, else the dry-run already refuses (``check_last_loop_logits``).
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -64,6 +66,7 @@ from rltt_baseline.config import (
     apply_verl_overrides,
     build_args,
     check_kl_not_in_reward,
+    check_last_loop_logits,
     check_rollout_token_budget,
     drop_unused_reference,
     env_file_path,
@@ -192,17 +195,6 @@ def install_plc_worker() -> None:
     verl_rltt.RLTTActorRolloutRefWorker = PLCActorRolloutRefWorker
 
 
-def check_plc_model(args, settings) -> None:
-    """The gate loss needs gradients through the exit PDF (``rltt_detach_exit_pdf: false``)."""
-    if not (settings.enabled and settings.use_gate_loss):
-        return
-    config = json.loads((Path(args.rltt_model_path) / "config.json").read_text())
-    if config.get("rltt_detach_exit_pdf", False):
-        raise SystemExit(f"{args.rltt_model_path}: rltt_detach_exit_pdf is true, so the gate "
-                         "would get no gradient; rebuild it with prepare_model without "
-                         "--detach-exit-pdf or set plc.use_gate_loss=false")
-
-
 def install_grpo_audit_worker() -> None:
     import verl_grpo
 
@@ -256,6 +248,7 @@ def main(argv=None) -> int:
     plc = plc_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
     check_rollout_token_budget(overrides, args)
+    check_last_loop_logits(overrides)
     loop_audit = (overrides.get("actor_rollout_ref") or {}).get("loop_audit")
     train_check = train_file_check(args.train_file)
     violations = policy_violations(cfg, args, overrides, train_check)
@@ -292,7 +285,6 @@ def main(argv=None) -> int:
     if n_gpus <= 1 or args.debug:
         raise SystemExit("rltt_baseline needs the vendor verl path: >= 2 GPUs and debug=false")
     check_model_layers(args, cfg.model.get("num_hidden_layers"))
-    check_plc_model(args, plc)
     if cfg.trainer == "grpo":
         check_grpo_model_dir(args.model_path)
     if str(args.train_file).endswith(".parquet"):

@@ -368,13 +368,8 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
 @pytest.mark.parametrize("name", ["rltt_baseline.yaml", "grpo_baseline_8gpu.yaml",
                                   "grpo_baseline_1p4b_8gpu.yaml",
                                   "rltt_baseline_1p4b_8gpu.yaml",
-                                  "plc_posterior_exit_gate_1p4b_8gpu.yaml",
-                                  "plc_posterior_exit_nogate_1p4b_8gpu.yaml",
-                                  "plc_logp_softmax_1p4b_8gpu.yaml",
-                                  "plc_rltt_progressive_1p4b_8gpu.yaml",
                                   "plc_grpo_loopaux_1p4b_8gpu.yaml",
-                                  "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml",
-                                  "plc_posterior_exit_gate_2p6b_8gpu.yaml"])
+                                  "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
     cfg = rcfg.load_config(str(paths.config_file(name)))
@@ -389,14 +384,9 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 # every other setting must be identical so the runs can be compared.
 MATCHED_GROUPS = {
     "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
-             "plc": "plc_posterior_exit_gate_1p4b_8gpu.yaml",
-             "plc_nogate": "plc_posterior_exit_nogate_1p4b_8gpu.yaml",  # gate-loss ablation
-             "plc_logp_softmax": "plc_logp_softmax_1p4b_8gpu.yaml",  # softmax(logp) weights
-             "plc_rltt_progressive": "plc_rltt_progressive_1p4b_8gpu.yaml",  # t^alpha weights
-             "plc_grpo_loopaux": "plc_grpo_loopaux_1p4b_8gpu.yaml",  # GRPO + loop aux term
-             "plc_grpo_loopaux_nokl": "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"},  # ... no KL term
-    "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml",
-             "plc": "plc_posterior_exit_gate_2p6b_8gpu.yaml"},
+             "plc": "plc_grpo_loopaux_1p4b_8gpu.yaml",  # GRPO + loop aux term
+             "plc_nokl": "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"},  # ... without the KL term
+    "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},  # no PLC config
 }
 # verl settings the GRPO configs must override because grpo_train.py lacks them; rltt_train.py
 # sets the same values from its own options (checked in _method_free_view)
@@ -478,7 +468,7 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert {key: rollout[key] for key in explicit} == explicit, name
 
 
-@pytest.mark.parametrize("method", ["grpo", "rltt", "plc"])
+@pytest.mark.parametrize("method", ["grpo", "rltt"])
 def test_each_method_differs_between_sizes_only_in_the_model(env, method):
     small = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(
         MATCHED_GROUPS["1.4B"][method]))))

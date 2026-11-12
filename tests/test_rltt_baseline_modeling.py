@@ -172,8 +172,8 @@ def test_loop_audit_reads_the_loops_of_the_real_model(models, tmp_path):
         assert torch.equal(torch.from_numpy(shard["topk_ids"][:, -1].astype(np.int64)), final_top)
 
 
-def test_plc_losses_on_the_real_per_loop_outputs(models):
-    """PLC policy loss reaches the backbone only; the gate is trained by the gate loss alone."""
+def test_plc_loss_on_the_real_per_loop_outputs(models):
+    """The PLC loss (GRPO + earlier-loop term) reaches the backbone only, never the gate."""
     from rltt_baseline import plc
 
     _, rltt = models
@@ -185,31 +185,26 @@ def test_plc_losses_on_the_real_per_loop_outputs(models):
 
     def forward():
         out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
-                   return_per_loop_log_probs=True, return_exit_pdf=True, log_prob_labels=labels)
-        ell = torch.stack([lp[:, window] for lp in out.per_loop_log_probs], dim=-1).float()
-        return ell, out.exit_pdf[:, window, :].float()
+                   return_per_loop_log_probs=True, return_exit_pdf=False, log_prob_labels=labels)
+        return torch.stack([lp[:, window] for lp in out.per_loop_log_probs], dim=-1).float()
 
     with torch.no_grad():
-        ell_old, pdf_old = forward()
-    logq = plc.loop_prior_logq("exit", ell_old.shape[-1], exit_pdf=pdf_old)
-    weights = plc.compute_loop_weights(ell_old, logq, gamma=1.0)
-    assert torch.allclose(weights.sum(-1), torch.ones(2, response_length), atol=1e-5)
-    joint = pdf_old * ell_old.exp()
-    assert torch.allclose(weights, joint / joint.sum(-1, keepdim=True), atol=1e-5)
+        ell_old = forward()
+    weights = plc.compute_loop_weights(ell_old, "is_trunc", trunc_cap=1.0)
+    kl_weights = plc.compute_loop_weights(ell_old, "early_prior")
+    rho = torch.exp(ell_old[..., :-1] - ell_old[..., -1:]).clamp(max=1.0)
+    assert torch.allclose(weights[..., :-1], rho / 3, atol=1e-6)
+    assert (weights[..., -1] == 0).all() and torch.allclose(kl_weights[..., :-1],
+                                                            torch.full_like(rho, 1 / 3))
 
     rltt.zero_grad()
-    ell_new, pdf_new = forward()
-    assert torch.allclose(ell_new[..., -1], ell_old[..., -1], atol=1e-5)   # same policy
-    pg_loss, _ = plc.plc_policy_loss(ell_new, ell_old, adv, response_mask, weights, lam=1.0,
-                                     clip_ratio=0.2)
+    ell_new = forward()
+    assert torch.allclose(ell_new, ell_old, atol=1e-5)   # same policy
+    pg_loss, metrics = plc.plc_policy_loss(ell_new, ell_old, adv, response_mask, weights,
+                                           lam=0.1, clip_ratio=0.2, kl_coef=0.2,
+                                           kl_weights=kl_weights)
     pg_loss.backward()
     assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
-    assert rltt.model.early_exit_gate.weight.grad is None  # weights are detached
-
-    rltt.zero_grad()
-    _, pdf_new = forward()
-    g_loss, metrics = plc.gate_loss(pdf_new, weights, adv, response_mask, gate_coef=1.0,
-                                    gate_entropy_coef=0.05)
-    g_loss.backward()
-    assert rltt.model.early_exit_gate.weight.grad.abs().sum() > 0
-    assert metrics["gate/kl_w_q_mean"] >= 0 and 1.0 <= metrics["gate/expected_exit_step"] <= 4
+    gate_grad = rltt.model.early_exit_gate.weight.grad
+    assert gate_grad is None or gate_grad.abs().sum() == 0   # the gate is not in the loss
+    assert len(metrics["plc/kl_k3_per_loop"]) == 4

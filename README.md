@@ -29,7 +29,7 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/decode_last.py`、`vllm_decode_last.py` | 可选的 rollout KV 布局 `decode_last`（`rollout.kv_layout`，默认关闭）：prompt 保留每一轮的 KV，生成的 token 只保留最后一轮的 KV。只改变 vLLM rollout，训练 forward 不变 |
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
-| `rltt_baseline/plc.py`、`plc_workers.py` | PLC（Posterior Loop Credit，`plc.enabled`，默认关闭）：把 RLTT 的逐轮权重换成按 token 的后验权重 `softmax_t(log q_t + γ·log P_old^(t)(y_j))`，逐轮 PPO ratio，可选 gate 损失；γ=0 退回 RLTT，λ=0 退回 GRPO |
+| `rltt_baseline/plc.py`、`plc_workers.py` | PLC（`plc.enabled`，默认关闭）：最后一轮做 GRPO，前几轮用截断重要性比率的 off-policy PPO 代理目标加指向最后一轮的正向 KL 信赖域；λ=0 退回 GRPO |
 | `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 逐轮分布审计（`audit.loop_distribution`，所有配置都打开）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
 | `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
@@ -46,12 +46,7 @@ configs/grpo_baseline_8gpu.yaml  GRPO 8 卡训练配置（Ouro-2.6B-Thinking）
 configs/grpo_baseline_1p4b_8gpu.yaml  GRPO 8 卡训练配置（Ouro-1.4B-Thinking，生成 16K，每步更新一次）
 configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置（Ouro-2.6B-Thinking，与 grpo_baseline_8gpu 对齐）
 configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinking，与 GRPO 1.4B / PLC 配置对齐）
-configs/plc_posterior_exit_gate_1p4b_8gpu.yaml  PLC（γ=1，λ=1，exit 先验，gate 损失）on Ouro-1.4B-Thinking，8 卡
-configs/plc_posterior_exit_gate_2p6b_8gpu.yaml  同上，Ouro-2.6B-Thinking（与 1.4B 版只差模型）
-configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml  PLC 关闭 gate 损失的消融（Ouro-1.4B-Thinking，与 PLC 1.4B 版只差 `plc.use_gate_loss`）
-configs/plc_logp_softmax_1p4b_8gpu.yaml  PLC 代码路径 + `softmax_t(ℓ_old)` 权重（IDEA Two，均匀先验，无 gate 损失），1.4B
-configs/plc_rltt_progressive_1p4b_8gpu.yaml  PLC 代码路径 + RLTT-progressive 权重 `t^α`（α=1，无 gate 损失），1.4B
-configs/plc_grpo_loopaux_1p4b_8gpu.yaml  GRPO + 中间轮 off-policy 辅助项（截断重要性权重 + 正向 KL 信赖域、无 gate），1.4B
+configs/plc_grpo_loopaux_1p4b_8gpu.yaml  PLC：GRPO + 中间轮 off-policy 辅助项（截断重要性权重 + 正向 KL 信赖域、无 gate），1.4B
 configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml  同上但去掉正向 KL 项（`plc.kl_coef=0`），1.4B
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
@@ -122,13 +117,9 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 
 | 组 | GRPO | RLTT | PLC |
 |---|---|---|---|
-| 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_posterior_exit_gate_1p4b_8gpu.yaml` |
-| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | `plc_posterior_exit_gate_2p6b_8gpu.yaml` |
-| 1.4B 消融：PLC 关闭 gate loss | — | — | `plc_posterior_exit_nogate_1p4b_8gpu.yaml` |
-| 1.4B 权重：softmax(logp)（IDEA Two） | — | — | `plc_logp_softmax_1p4b_8gpu.yaml` |
-| 1.4B 权重：RLTT-progressive（PLC 代码路径） | — | — | `plc_rltt_progressive_1p4b_8gpu.yaml` |
-| 1.4B GRPO + 中间轮辅助项（PLC 代码路径） | — | — | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
-| 1.4B GRPO + 中间轮辅助项、无 KL 项（PLC 代码路径） | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
+| 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
+| 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | —（暂无） |
+| 1.4B 消融：PLC 去掉 KL 项 | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -279,60 +270,43 @@ export LOOPRL_TRAIN_FILE=$PWD/data/deepmath_level6_filter12k_passes1to3_no_yesno
 这份 2,865 条数据已纳入上述合并训练集。单独使用时，100 步 × 64 题需要 6,400 题，
 它只够约 44 步不重复。规则和构成见该目录的 README。
 
-### PLC：Posterior Loop Credit（`configs/plc_posterior_exit_gate_1p4b_8gpu.yaml`）
+### PLC（`configs/plc_grpo_loopaux_1p4b_8gpu.yaml`）
 
 `plc.enabled: true` 时 launcher 用 `PLCActorRolloutRefWorker` 代替原作的 RLTT worker（仍是 `trainer: rltt`，
-仍需 `use_rltt_model: true` 的逐轮模型目录）。记号：`ℓ[j,t] = log P^(t)(y_j)` 为采样 token 在第 t 轮的
-log-prob，`q_t` 为退出深度的先验。
+仍需 `use_rltt_model: true` 的逐轮模型目录）。2026-11-13 起这是唯一的 PLC 逻辑（旧的 posterior 权重、
+gate 损失、softmax(logp) / RLTT-progressive 权重、组基线和 IS 修正连同配置一起删除）。
+记号：`ℓ[j,t] = log P^(t)(y_j)` 为采样 token 在第 t 轮的 log-prob。
 
-- **权重**：`w[j,t] = softmax_t(log q_t + γ·ℓ_old[j,t])`，用旧策略（`compute_log_prob` 那次 forward）的
-  逐轮 log-prob 计算，detach，整个更新内固定。γ=1 是退出混合策略 `Σ_t q_t P^(t)` 的精确后验；γ=0 时
-  `w = q`，就是 RLTT（先验 uniform / progressive / exit 分别对应 RLTT 的三种权重）。
-  `weight_mode` 另有两种不用先验的写法（都要求 `prior: uniform`，忽略 γ）：`uniform` 是 `w = 1/T`
-  （RLTT-uniform）；`logp_softmax` 是 `w = softmax_t(ℓ_old[j,t]) = P^(t)(y_j) / Σ_s P^(s)(y_j)`（IDEA Two），
-  即最大化 `Â·log (1/T)Σ_t P^(t)(y_j)` 的梯度系数，数值上等于 `posterior` + 均匀先验 + γ=1。
-- **损失**：`-agg_j[(1-λ)·PPO^(T) + λ·Σ_t w[j,t]·PPO^(t)]`，每轮一个 PPO ratio `exp(ℓ_new - ℓ_old)`，
-  clip 用 verl 的 `clip_ratio` / 双重 clip；λ=0 与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
-  熵项和 KL（`low_var_kl`）只加在最后一轮，与原作相同；对照组配置里 KL 关闭，熵系数为 0。
-- **gate 损失**（`use_gate_loss`，需要 `prior: exit`）：`gate_coef·agg[Â·CE(sg[w], q_new)] − gate_entropy_coef·agg[H(q_new)]`，
-  即混合策略梯度中 gate 的那一项加 Ouro Stage I 的熵正则（Ouro 预训练 β=0.1，末阶段 0.05）。
-  它要求模型目录没有用 `--detach-exit-pdf` 构建，launcher 训练前检查 `config.json`。
-- **可选**：`eps_floor`（权重下限）、`use_is_correction`（在 loop 项上乘
-  `min(Σ_t q_t·exp(ℓ_old[t] − ℓ_old[T]), is_clip)`，把自归一化权重换成普通的逐轮重要性权重）。
-- **指标**：`plc/w_mean_per_loop`、`plc/eff_loops_mean`、`plc/argmax_is_final_frac`、`plc/delta_*`、
-  `plc/clipfrac_per_loop`、`plc/ratio_mean_per_loop`，gate 的 `gate/q_mean_per_loop`、`gate/expected_exit_step`、
-  `gate/kl_w_q_mean`、`gate/entropy_mean`；原有的 `rltt/loop_<t>_entropy`、`actor/*` 照旧。
-- **批次里新增的张量**：`old_log_probs_loops` `[B,L,T]`，`prior: exit` 时还有 `old_exit_pdf` `[B,L,T]`。
-  `old_log_probs` 就是前者的最后一轮。
-- **GRPO + 中间轮 off-policy 辅助项**（`configs/plc_grpo_loopaux_1p4b_8gpu.yaml`，`objective: additive`）：
-  以最后一轮为行为策略，中间轮用截断比率加权的 PPO 代理目标，加上指向最后一轮的正向 KL 信赖域：
-  `-agg_j[PPO^(T)(Â)] + λ·Σ_{t<T} α_t·( -agg'_j[ρ̄[j,t]·PPO^(t)(Ã)] + kl_coef·agg'_j[k1[j,t]] )`，
+vLLM 从最后一轮 T 采样，所以最后一轮是前几轮的行为策略。最后一轮照常做 GRPO；前几轮用截断比率加权的
+PPO 代理目标学习，再加指向最后一轮的正向 KL 信赖域：
+
+- **损失**：`-agg_j[PPO^(T)(Â)] + λ·Σ_{t<T} α_t·( -agg_j[ρ̄[j,t]·PPO^(t)(Â)] + kl_coef·agg_j[k1[j,t]] )`，
   `ρ̄[j,t] = min(trunc_cap, P_old^(t)(y_j)/P_old^(T)(y_j))`（只截上限，不回传梯度），
   `k1[j,t] = log P_old^(T)(y_j) − log P^(t)(y_j)`（最后一轮自己样本上 `KL(P^(T)‖P^(t))` 的无偏估计，
-  梯度就是第 t 轮在 rollout token 上的交叉熵）。每步一次更新时，第 t 轮每个 token 的梯度系数是
-  `−(λ/N)·α_t·(ρ̄·Â + kl_coef)`（`test_trust_region_gradient_is_rho_a_plus_kl_coef_per_token`）。
-  配置里 `trunc_cap: 1.0`、`kl_coef: 0.2`、`loop_baseline: none`、`loop_agg_mode: same`（与 GRPO 一样 token-mean）。
-  完整词表上的精确 KL 没有实现（要改 `prepare_model` 拷进模型目录的 modeling 文件），
-  监控用审计里已有的 `loop_audit/kl/4_t`（精确的 `KL(P^(4)‖P^(t))`）。新增指标：`plc/kl_k1_per_loop`、
-  `plc/kl_k3_per_loop`（≥0，低方差，只用于监控）、`plc/kl_term_mean`、`plc/xloop_rho_bar_mean_per_loop`、
-  `plc/xloop_capped_frac_per_loop`、`plc/xloop_rho_lt_0.1_frac_per_loop`、`plc/xloop_pg_weight_abs_mean_per_loop`
-  （与 `kl_coef` 比大小）；审计 summary 新增 `xloop_*`（所有方法都有，跨方法可比）。
-  最后一轮那一项就是 GRPO，不乘 `(1−λ)`，λ=0 时与 GRPO 的 loss 相同。
-  `α` 是先验在 t<T 上重新归一化（`early_prior` 不乘 ρ̄）。可选的 `loop_baseline: group`（2026-11-08 版本）时
-  `Ã = Â − b[g,t]`，`b[g,t] = Σ_{i∈g} Â_i·m_it / Σ_{i∈g} m_it`，
-  `m_it` 是第 i 条回答在第 t 轮的权重质量（seq-mean-token-mean 下为 `α_t·ρ̄` 的 token 均值），
-  因此每组、每个中间轮的加权优势净质量为 0（`test_loop_gradient_has_zero_mass_in_every_group_at_the_on_policy_point`）。
-  基线每步在更新前算一次，用 `uid` 跨卡 `all_gather_object` 汇总整组。gate 不进入 loss。
-  动机和诊断见 `rltt_baseline/diagnostics/gate_push.py`。新增指标：`plc/loop_baseline_*_per_loop`、
-  `plc/loop_adv_mass_residual_per_loop`（应约为 0）、`plc/loop_weight_mass_per_loop`、
-  `plc/groups_split_across_ranks`、`plc/loop_adv_abs_mean_per_loop`。
+  梯度就是第 t 轮在 rollout token 上的交叉熵），`α_t = 1/(T−1)`，`agg` 是 actor 的 `loss_agg_mode`
+  （token-mean）。每轮一个 PPO ratio `exp(ℓ_new − ℓ_old)`，clip 用 verl 的 `clip_ratio` / 双重 clip。
+  最后一轮那一项就是 GRPO，λ=0 时与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
+  每步一次更新时，第 t 轮每个 token 的梯度系数是 `−(λ/N)·α_t·(ρ̄·Â + kl_coef)`
+  （`test_trust_region_gradient_is_rho_a_plus_kl_coef_per_token`）。熵项和 KL（`low_var_kl`）只加在最后一轮，
+  与原作相同；对照组配置里 KL 关闭，熵系数为 0。gate 不进入 loss。
+- **`plc` 段**：`weight_mode`（`is_trunc`，或 `early_prior` 即 ρ̄=1）、`lam`（0.1）、`trunc_cap`（1.0）、
+  `kl_coef`（0.2）、`log_weight_stats`。
+- **指标**（逐轮的量每轮一个键，`/loop_<t>` 即第 t 轮；verl 的 `reduce_metrics` 对每个键的列表取均值，
+  所以不能把一个逐轮列表放在同一个键里，见 `plc.flatten_loop_metrics`）：
+  `plc/clipfrac/loop_<t>`、`plc/ratio_mean/loop_<t>`、`plc/loop_term_mean`、`plc/final_term_mean`、
+  `plc/kl_k1/loop_<t>`（loss 用的单样本估计）、`plc/kl_k3/loop_<t>`（≥0，低方差，只用于监控）、
+  `plc/kl_term_mean`、`plc/w_mean/loop_<t>`，前几轮（t = 1..3）的 `plc/xloop_rho_bar_mean/loop_<t>`、
+  `plc/xloop_capped_frac/loop_<t>`、`plc/xloop_rho_lt_0.1_frac/loop_<t>`、`plc/xloop_pg_weight_abs_mean/loop_<t>`
+  （与 `kl_coef` 比大小），相邻轮之间的 `plc/delta_mean/loop_<t>_to_<t+1>`、`plc/delta_neg_frac/loop_<t>_to_<t+1>`；
+  原有的 `rltt/loop_<t>_entropy`、`actor/*` 照旧。2026-11-13 之前的 run 里这些逐轮指标名是 `plc/*_per_loop`，
+  wandb 上只有把各轮平均后的一个数；要看各轮，用审计 npz 的 `sampled_log_prob` 离线重算
+  （k1⁽ᵗ⁾ = ℓ⁽⁴⁾ − ℓ⁽ᵗ⁾）。完整词表上的精确 KL 没有实现，监控用审计里已有的
+  `loop_audit/kl/4_t`（精确的 `KL(P^(4)‖P^(t))`）。
+- **批次里新增的张量**：`old_log_probs_loops` `[B,L,T]`；`old_log_probs` 就是它的最后一轮。
 
-消融用命令行覆盖：`plc.gamma=0`（RLTT-exit）、`plc.lam=0`（GRPO）、`plc.use_gate_loss=false`、
-`plc.prior=uniform plc.use_gate_loss=false`（PLC-uniform）、`plc.use_is_correction=true`、
-`plc.weight_mode=uniform plc.prior=uniform plc.use_gate_loss=false`（逐轮 1/T）、
-`plc.weight_mode=logp_softmax plc.prior=uniform plc.use_gate_loss=false`（softmax(logp)）。
-关闭 gate 损失的消融另存为 `configs/plc_posterior_exit_nogate_1p4b_8gpu.yaml`（用户 2026-11-05 要求），
-等于 1.4B PLC 配置加 `plc.use_gate_loss=false`。
+消融用命令行覆盖：`plc.kl_coef=0.05 / 1.0`（信赖域大小）、`plc.kl_coef=0`（只有代理目标）、
+`plc.trunc_cap=2`、`plc.weight_mode=early_prior`（不乘比率）、`plc.lam=0`（PLC 代码路径上的 GRPO）。
+去掉 KL 项的消融另存为 `configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`（用户 2026-11-12 要求）。
 状态：只有 CPU 单元测试和 tiny 随机模型测试（`tests/test_plc.py`、`test_rltt_baseline_modeling.py`），
 没有在真实权重或 GPU 上运行过。
 
@@ -427,9 +401,9 @@ audit:
 
 - `exit_pdf`：exit gate 给出的各轮退出概率 `q_t = λ_t ∏_{s<t}(1 − λ_s)`，最后一轮取剩余部分。
   三种方法都记；它也是 RLTT（`loop_weighting: exit_pdf`）loss 用的逐轮权重。
-- `plc_weight`：PLC 的逐轮权重 `w = softmax_t(log q_t + γ·ℓ_old)`（含 `eps_floor`），用 PLC actor 在同一次
-  `compute_log_prob` 里算出的逐轮 log-prob 和 exit PDF 求得，等于这一步 `update_policy` 实际使用的权重。
-  只在 PLC 运行（`plc.enabled`）里有；GRPO / RLTT 运行可以事后用 `exit_pdf` 和 `sampled_log_prob` 自己算后验。
+- `plc_weight`：PLC 前几轮的权重 `α_t·min(trunc_cap, ρ_t)`（最后一轮为 0），用 PLC actor 在同一次
+  `compute_log_prob` 里算出的逐轮 log-prob 求得，等于这一步 `update_policy` 实际使用的权重。
+  只在 PLC 运行（`plc.enabled`）里有。
 
 每一轮上采样 token 的概率就是已有的 `exp(sampled_log_prob)`，不另存。这个开关只控制上面两组新增数组，
 关掉后审计与之前完全相同。

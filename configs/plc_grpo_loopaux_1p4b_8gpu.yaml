@@ -1,13 +1,11 @@
-# GRPO + off-policy loop auxiliary term on Ouro-1.4B-Thinking (PLC code path): the final loop is
-# trained by GRPO unchanged; the earlier loops learn off-policy from the same rollouts, with the
-# final loop as their behaviour policy; no gate loss. One node with 8 GPUs, one optimizer update
-# per step. Method config in the 1.4B comparison group (see CLAUDE.md), saved as its own file at
-# the user's request (2026-11-08; loss changed to the trust-region form 2026-11-11): it is
-# plc_posterior_exit_nogate_1p4b_8gpu.yaml with the plc keys weight_mode, prior, lam, objective,
-# loop_baseline, loop_agg_mode, trunc_cap and kl_coef changed (args.loop_weighting uniform to
-# match, which only names the vendor run) and its own wandb run name / tags; every other key is
-# the same, so the run differs from grpo_baseline_1p4b_8gpu.yaml only in the method
-# (tests/test_rltt_baseline.py and tests/test_plc.py check this). No 2.6B copy.
+# PLC on Ouro-1.4B-Thinking: GRPO + off-policy loop auxiliary term. The final loop is trained by
+# GRPO unchanged; the earlier loops learn off-policy from the same rollouts, with the final loop
+# as their behaviour policy; no gate loss. One node with 8 GPUs, one optimizer update per step.
+# The PLC config of the 1.4B comparison group (see CLAUDE.md; first saved 2026-11-08, loss changed
+# to the trust-region form 2026-11-11, the only PLC logic since 2026-11-13): it differs from
+# grpo_baseline_1p4b_8gpu.yaml and rltt_baseline_1p4b_8gpu.yaml only in the method
+# (tests/test_rltt_baseline.py checks this; args.loop_weighting uniform only names the vendor
+# run). No 2.6B copy.
 #
 # Why: the RLTT run r50a17c3 sharpened loop 1 (entropy 1.65 -> 0.36) and, through the shared
 # weights, the final loop (0.50 -> 0.37), with no accuracy gain over GRPO (g79f2224). RLTT trains
@@ -18,7 +16,7 @@
 #   - a trust region, because the surrogate is only valid near the behaviour policy: forward KL
 #     KL(P^(T) || P^(t)), estimated on the final loop's own samples (no ratio needed)
 #
-# Objective (rltt_baseline.plc, objective additive):
+# Objective (rltt_baseline.plc):
 #   loss = -token-mean[ PPO^(T)(A) ]                                        (GRPO, unchanged)
 #          + lam * sum_{t<T} alpha_t * ( -token-mean[ rho[j,t] PPO^(t)(A) ]       (surrogate)
 #                                        + kl_coef * token-mean[ k1[j,t] ] )      (trust region)
@@ -32,7 +30,7 @@
 # like the final loop. The gate gets no gradient; it can still move because the hidden states it
 # reads change (as in GRPO). The KL loss to a reference model stays disabled (kl_coef is the
 # loop term's own trust region, not verl's KL loss). Same LOOPRL_MODEL_DIR as the other 1.4B
-# configs. Monitor: plc/xloop_* (ratio), plc/kl_k3_per_loop (trust region), loop_audit/kl/4_t
+# configs. Monitor: plc/xloop_*/loop_t (ratio), plc/kl_k3/loop_t (trust region), loop_audit/kl/4_t
 # (exact KL(P^(4) || P^(t))), per-loop entropy.
 #
 # Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
@@ -49,8 +47,6 @@
 #   plc.trunc_cap=2                               looser cap on the ratio
 #   plc.weight_mode=early_prior                   no ratio (rho = 1)
 #   plc.lam=0                                     GRPO on the PLC code path
-#   plc.kl_coef=0 plc.loop_baseline=group plc.loop_agg_mode=seq-mean-token-mean
-#                                                 the 2026-11-08 version of this config
 
 trainer: rltt
 
@@ -112,22 +108,11 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
 
 plc:
   enabled: true
-  weight_mode: is_trunc         # alpha_t * min(c, P^(t)/P^(T)) for t < T, 0 for the final loop
-  prior: uniform                # alpha = the prior on t < T, renormalised: 1/3 each
-  progressive_alpha: 1.0
-  gamma: 1.0                    # unused by is_trunc
-  lam: 0.1                      # loop term coefficient; 0 = GRPO
-  objective: additive           # GRPO term unchanged (not scaled by 1 - lam) + lam * loop term
-  loop_baseline: none           # advantages as GRPO's
-  loop_agg_mode: same           # loop term aggregated like the GRPO term (token-mean)
+  weight_mode: is_trunc         # alpha_t * min(c, P^(t)/P^(T)) for t < T, 0 for the final loop;
+                                # alpha_t = 1/3 (uniform over the earlier loops)
+  lam: 0.1                      # earlier-loop term coefficient (GRPO term unscaled); 0 = GRPO
   trunc_cap: 1.0                # c: upper cap of the cross-loop ratio (no lower cap)
   kl_coef: 0.2                  # trust region: kl_coef * KL(P^(T) || P^(t)) per earlier loop
-  eps_floor: 0.0
-  use_gate_loss: false          # needs prior: exit
-  gate_coef: 1.0
-  gate_entropy_coef: 0.05       # unused without the gate loss
-  use_is_correction: false      # is_trunc already is the importance weight
-  is_clip: 5.0
   log_weight_stats: true
 
 wandb:
@@ -145,6 +130,14 @@ verl_overrides:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
     train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
+    model:
+      override_config:
+        # HF actor forward = the last loop, the loop vLLM samples from. With the Ouro config's
+        # early_exit_threshold 1.0, the official forward takes per token the first loop whose
+        # cumulative exit probability reaches 1.0, an earlier loop when bf16 rounds it to 1.
+        # Read only by the official forward (GRPO log-probs, RLTT's old_log_probs); the
+        # per-loop RLTT / PLC forward and vLLM never use it.
+        early_exit_threshold: null
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
                                      # below max_model_len 18,432, which verl refuses with

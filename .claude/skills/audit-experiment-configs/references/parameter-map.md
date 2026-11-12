@@ -22,7 +22,7 @@
 | `rollout` | `kv_layout: full`（标准 vLLM）或 `decode_last`（实验性 KV 布局） | 共享 |
 | `model` | `num_hidden_layers`：launcher 开训前核对模型目录 `config.json`，防止 1.4B 配置跑到 2.6B 权重（24 = 1.4B，48 = 2.6B） | 共享 |
 | `audit` | `loop_distribution`：逐轮分布审计，写 `<output_dir>/audit/`；所有配置都打开，只读不改训练，每次运行几十 GB。其中 `loop_weights` 另记逐 token 的 `exit_pdf` 和 PLC 运行的 `plc_weight` | 共享 |
-| `plc` | Posterior Loop Credit 的全部开关（见下） | 方法 |
+| `plc` | PLC（GRPO + 中间轮 off-policy 辅助项）的全部开关（见下） | 方法 |
 
 ## `args`：模型与数据
 
@@ -104,10 +104,11 @@
 
 ## `plc` 段（方法键，只在 PLC 配置里开）
 
-`enabled`、`weight_mode`（posterior / rltt / uniform / logp_softmax；后两种要求 `prior: uniform`）、`prior`（uniform / progressive / exit）、`progressive_alpha`、
-`gamma`（0 = RLTT 同先验）、`lam`（0 = GRPO，只算最后一轮）、`eps_floor`、`use_gate_loss`（需 `prior: exit`
-且模型目录 `rltt_detach_exit_pdf: false`）、`gate_coef`、`gate_entropy_coef`、`use_is_correction`、`is_clip`、
-`log_weight_stats`。其他配置里这段必须不存在或 `enabled: false`。消融用命令行覆盖这些键，不另存文件。
+`enabled`、`weight_mode`（`is_trunc`：前几轮权重 `α_t·min(trunc_cap, P_old^(t)/P_old^(T))`；`early_prior`：不乘比率）、
+`lam`（前几轮辅助项系数，0 = GRPO，只算最后一轮）、`trunc_cap`（比率上限，只对 is_trunc）、`kl_coef`
+（前几轮指向最后一轮的正向 KL 信赖域）、`log_weight_stats`。2026-11-13 起只有这几个键，旧的 posterior / gate
+loss / prior / gamma 等键会被 launcher 当作未知键拒绝。其他配置里这段必须不存在或 `enabled: false`。
+消融用命令行覆盖这些键，不另存文件（`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` 是用户要求的例外）。
 
 ## 两份原作脚本的默认值差异（`args` 没写就会在组内不一致）
 
@@ -134,7 +135,7 @@
   若 GRPO 的 run 里是 `built`，它每步多跑一次参考模型前向，耗时不能和另外两种方法比。
 
 - 模型目录 `config.json` 的 `rltt_detach_exit_pdf`：决定 exit gate 是否被训练。prepare_model 默认 false
-  （PLC gate loss 需要）；RLTT 用 `exit_pdf` 权重时梯度因此也会流进 gate；GRPO 完全不碰 gate。
+  RLTT 用 `exit_pdf` 权重时梯度因此会流进 gate；GRPO 和 PLC 的 loss 都不经过 gate。
 - `rltt_train.py` 会把 `rltt_logprob_chunk_size` 写回模型目录；`grpo_train.py` 会原地改 `modeling_ouro.py`。
   所以同组各 run 必须共用同一个、由 prepare_model 生成的 `LOOPRL_MODEL_DIR`。
 - `LOOPRL_TRAIN_FILE`、`LOOPRL_MATH500_JSONL`、`LOOPRL_OUTPUT_DIR`：配置里只是 `${oc.env:...}`，
