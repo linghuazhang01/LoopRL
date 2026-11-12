@@ -38,17 +38,12 @@ A config file has these top-level keys:
     (default false; also record each token's exit-gate distribution ``exit_pdf`` and, in PLC runs,
     the PLC loop weights ``plc_weight``).
 ``plc``
-    Posterior Loop Credit (``rltt_baseline.plc``), ``trainer: rltt`` only. Keys and defaults are
-    the fields of ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (posterior | rltt |
-    uniform | logp_softmax; the last two need ``prior: uniform``), ``prior`` (uniform |
-    progressive | exit), ``progressive_alpha``, ``gamma`` (1; 0 = RLTT), ``lam`` (1; 0 = GRPO),
-    ``eps_floor``, ``use_gate_loss`` (needs ``prior: exit``),
-    ``gate_coef``, ``gate_entropy_coef``, ``use_is_correction``, ``is_clip``,
-    ``log_weight_stats``, and for GRPO + loop auxiliary term ``objective`` (mix | additive),
-    ``loop_baseline`` (none | group), ``loop_agg_mode`` (same | a verl loss_agg_mode),
-    ``trunc_cap`` (1; upper cap of the cross-loop ratio, is_trunc only) and ``kl_coef`` (0;
-    forward-KL trust region of the earlier loops towards the final loop) with ``weight_mode``
-    is_trunc | early_prior (both need ``objective: additive``). When enabled
+    PLC (``rltt_baseline.plc``): GRPO on the final loop plus an off-policy auxiliary term on the
+    earlier loops, ``trainer: rltt`` only. Keys and defaults are the fields of
+    ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (is_trunc | early_prior),
+    ``lam`` (0.1; 0 = GRPO), ``trunc_cap`` (1; upper cap of the cross-loop ratio, is_trunc only),
+    ``kl_coef`` (0.2; forward-KL trust region of the earlier loops towards the final loop) and
+    ``log_weight_stats``. When enabled
     the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
     uses ``PLCActorRolloutRefWorker``.
 
@@ -411,9 +406,9 @@ def add_rollout_overrides(cfg: DictConfig, overrides: dict) -> dict:
 def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
     """``overrides`` plus ``actor_rollout_ref.loop_audit`` when the per-loop audit is on.
 
-    The driver supplies the trainer's global step after loading a checkpoint. Resumed workers
-    require it instead of falling back to a call count. LoRA still adds a second log-prob pass
-    per step (the reference pass), so it is refused rather than overwriting the actor's audit.
+    The driver supplies the trainer global step after loading a checkpoint. Resumed workers
+    require it; first_step also records the checkpoint-derived start for inspection and for
+    fresh-run call-count fallback. LoRA is refused to avoid a second log-prob pass per step.
     """
     settings = OmegaConf.to_container(cfg.audit.get("loop_distribution") or {}, resolve=True)
     settings = {**LOOP_AUDIT_DEFAULTS, **settings}
@@ -423,8 +418,37 @@ def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespa
         raise ValueError("audit.loop_distribution needs no_lora=true")
     if (overrides.get("trainer") or {}).get("resume_mode", "disable") != "disable":
         settings["require_global_step"] = True
+    settings["first_step"] = resume_first_step(overrides.get("trainer") or {}, args)
     settings["dir"] = os.path.join(os.path.abspath(str(args.output_dir)), "audit")
     return _deep_merge(overrides, {"actor_rollout_ref": {"loop_audit": settings}})
+
+
+def resume_first_step(trainer: dict, args: argparse.Namespace) -> int:
+    """The first training step this run executes: 1, or the loaded checkpoint's step + 1.
+
+    Mirrors verl 0.6.1 ``RayPPOTrainer._load_checkpoint``: ``resume_mode = auto`` loads the step
+    named in ``<default_local_dir>/latest_checkpointed_iteration.txt`` (none: starts from
+    scratch); ``resume_path`` loads ``resume_from_path``, a ``global_step_<n>`` directory. The
+    vendor scripts set ``default_local_dir`` to ``args.output_dir``.
+    """
+    mode = trainer.get("resume_mode", "disable")
+    if mode == "disable":
+        return 1
+    if mode == "resume_path":
+        path = trainer.get("resume_from_path")
+        match = re.fullmatch(r"global_step_(\d+)", os.path.basename(str(path or "").rstrip("/")))
+        if not match:
+            raise ValueError("trainer.resume_mode=resume_path needs trainer.resume_from_path "
+                             f"pointing at a global_step_<n> directory, got {path!r}")
+        return int(match.group(1)) + 1
+    if mode == "auto":
+        ckpt_dir = os.path.abspath(str(trainer.get("default_local_dir") or args.output_dir))
+        tracker = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
+        if not os.path.exists(tracker):
+            return 1
+        with open(tracker) as f:
+            return int(f.read().strip()) + 1
+    raise ValueError(f"unknown trainer.resume_mode {mode!r}; allowed disable, auto, resume_path")
 
 
 def plc_settings(cfg: DictConfig) -> PLCSettings:
@@ -471,6 +495,35 @@ def check_rollout_token_budget(overrides: dict, args: argparse.Namespace) -> Non
                          f"max_model_len={max_model_len} (prompt + completion); verl refuses this "
                          "with chunked prefill. Set verl_overrides.actor_rollout_ref.rollout."
                          "max_num_batched_tokens >= max_model_len")
+
+
+def check_last_loop_logits(overrides: dict) -> None:
+    """Refuse a run whose HF actor forward would not give the last loop's logits.
+
+    vLLM samples from the last loop. verl's actor (GRPO's log-probs, RLTT's ``old_log_probs``)
+    calls the official ``OuroForCausalLM.forward`` without exit arguments, so it falls back to
+    ``config.early_exit_threshold`` (1.0 in the Ouro configs) and ``config.early_exit_step``;
+    the threshold branch takes, per token, the first loop whose cumulative exit probability
+    reaches 1.0, an earlier loop when the bf16 forward rounds the sum. Both must be overridden
+    to null through ``actor_rollout_ref.model.override_config`` (set on the HF config before
+    ``from_pretrained`` in verl 0.6.1).
+    """
+    model = (overrides.get("actor_rollout_ref") or {}).get("model") or {}
+    override = model.get("override_config") or {}
+    if "model_config" in override:
+        # verl 0.6.1's FSDP actor passes override_config to the HF config as is (only the
+        # rollout-side HFModelConfig unwraps model_config), so the nested form never reaches it
+        raise ValueError("set actor_rollout_ref.model.override_config.early_exit_threshold at the "
+                         "top level, not under override_config.model_config (the FSDP actor of "
+                         "verl 0.6.1 does not unwrap it)")
+    if "early_exit_threshold" not in override or override["early_exit_threshold"] is not None:
+        raise ValueError("the HF actor forward must use the last loop, the one vLLM samples "
+                         "from: set verl_overrides.actor_rollout_ref.model.override_config."
+                         "early_exit_threshold=null (the Ouro config's 1.0 makes the official "
+                         "forward exit early under bf16)")
+    if override.get("early_exit_step") is not None:
+        raise ValueError("actor_rollout_ref.model.override_config.early_exit_step must be unset "
+                         "or null: the official forward would use that loop instead of the last")
 
 
 def check_kl_not_in_reward(trainer: str, overrides: dict) -> None:

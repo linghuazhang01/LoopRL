@@ -1,33 +1,39 @@
-# PLC without the gate loss on Ouro-1.4B-Thinking: gamma = 1, lam = 1, exit-gate prior, gate loss off.
-# One node with 8 GPUs, one optimizer update per step. Ablation in the 1.4B comparison group (see
-# CLAUDE.md): plc_posterior_exit_gate_1p4b_8gpu.yaml with plc.use_gate_loss false and its own wandb
-# run name / tags; every other key, the rest of the plc section included, is the same
-# (tests/test_plc.py checks this). No 2.6B copy.
+# GRPO + off-policy loop auxiliary term WITHOUT the forward-KL trust region, on Ouro-1.4B-Thinking
+# (PLC code path). Saved as its own file at the user's request (2026-11-12): it is
+# plc_grpo_loopaux_1p4b_8gpu.yaml with plc.kl_coef 0.2 -> 0 and its own wandb run name / tags;
+# every other key is the same (tests/test_plc.py checks this), so it differs from
+# grpo_baseline_1p4b_8gpu.yaml only in the method (tests/test_rltt_baseline.py). Change it
+# together with plc_grpo_loopaux_1p4b_8gpu.yaml.
+# No 2.6B copy.
 #
-# Why: in the gate-loss run (wandb looprl-ouro 2577b0b1, 32 prompts x 8, 2026-11-04) the gate went
-# to uniform (entropy 1.17 -> 1.37, ln 4 = 1.39; expected exit step 2.96 -> 2.45) over the first
-# ~40 steps, then reward fell from 0.62 to about 0.45 and final-loop entropy rose from 0.49 to 0.70,
-# while the RLTT run on the same data stayed flat. This config tests whether the gate loss causes it.
+# Why: in the loop-aux run gw8h48fq (kl_coef 0.2) loop 1's entropy fell to 0.51x GRPO's
+# (g79f2224, same batches) by step 41, about twice as fast as RLTT (r50a17c3: 0.80x), and its
+# ratio tracked KL(P^(4) || P^(1)) almost exactly (0.511 vs 0.512). The k1 term puts a constant
+# positive coefficient kl_coef on every token sampled from the final loop, i.e. SFT of loop t
+# on P^(T)'s samples; its fixed point is P^(t) = P^(T), whose entropy is ~0.45. With one update per
+# step loop t's own ratio is 1, so no extra trust region is needed for the step size. This run
+# removes that pull and keeps the surrogate alone, to tell whether the KL term or the surrogate
+# drives the sharpening.
 #
-# Objective (rltt_baseline.plc): the RLTT per-loop objective with token x loop weights
-#   w[j, t] = softmax_t(log q_t + gamma * log P_old^(t)(y_j)),   q = the model's exit distribution
-# (gamma = 1: exact posterior of the exit mixture; gamma = 0 would be RLTT-exit), lam = 1 (no extra
-# final-loop GRPO term), and no gate loss. q enters the weights detached, so the loss sends no
-# gradient to the gate head; q can still move because the shared hidden states it reads change.
-# gate_coef and gate_entropy_coef keep the PLC values and are unused. KL loss is disabled.
-# Same LOOPRL_MODEL_DIR as the other 1.4B configs (built without --detach-exit-pdf); the launcher's
-# detach check applies only with the gate loss on.
+# Objective (rltt_baseline.plc, kl_coef 0):
+#   loss = -token-mean[ PPO^(T)(A) ]                                        (GRPO, unchanged)
+#          + lam * sum_{t<T} alpha_t * ( -token-mean[ rho[j,t] PPO^(t)(A) ] )     (surrogate)
+#   rho[j,t] = min(trunc_cap, P_old^(t)(y_j) / P_old^(T)(y_j)),  stop-gradient
+#   alpha_t  = 1/3 (uniform prior on t < T)
+# Per-token gradient on loop t: -(lam / N) alpha_t rho A d log P^(t)(y_j). The gate gets no
+# gradient; the KL loss to a reference model stays disabled; token entropy coefficient is 0 as in
+# every config (the RLTT/PLC per-loop entropies carry no gradient). Same LOOPRL_MODEL_DIR as the
+# other 1.4B configs. Monitor: per-loop entropy against GRPO on the same step, loop_audit/kl/4_t
+# (exact KL(P^(4) || P^(t)), still logged by the audit) and plc/xloop_*/loop_t; plc/kl_k*/loop_t
+# are not logged when kl_coef is 0.
 #
-# Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
-# like the other configs here; training uses only the 14,684-row merged filtered subset
-# (AGENTS.md rule 1), and the launcher refuses any other training file.
-# Optimisation follows RLTT Table 6 apart from batch and length of run: 64 prompts x 8 rollouts
-# per step, accumulation 1, 100 steps = 100 updates (paper: 32 prompts, accumulation 2, 140
-# steps); lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
-# weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
+# Data, lengths and optimisation are those of plc_grpo_loopaux_1p4b_8gpu.yaml (see its header):
+# the 14,684-row merged filtered training set (AGENTS.md rule 1), 64 prompts x 8 rollouts per
+# step, accumulation 1, 100 steps = 100 updates, lr 1e-6 constant + 10% warmup, betas
+# (0.9, 0.99), weight decay 0.1, grad clip 0.1, KL loss off, seed 42.
 # Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
-# Further ablations by override, e.g. plc.gamma=0 (the RLTT-exit control on the PLC code path),
-#   plc.prior=uniform (PLC-uniform), plc.use_is_correction=true.
+# Ablations by override (give each its own wandb.run_name):
+#   plc.lam=0                                     GRPO on the PLC code path
 
 trainer: rltt
 
@@ -47,9 +53,9 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
   max_prompt_length: 2048
   max_completion_length: 16384
 
-  # vendor loop weighting is replaced by the plc section below; exit_pdf keeps the vendor's
-  # run name and logging consistent with the prior used here
-  loop_weighting: exit_pdf
+  # vendor loop weighting is replaced by the plc section below; this value only keeps the
+  # vendor's run name and logging consistent with the uniform prior used here
+  loop_weighting: uniform
   progressive_alpha: 1.0
   beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
   num_generations: 8
@@ -89,17 +95,11 @@ args:  # keys = dest names of the vendor rltt_train.py argparse options
 
 plc:
   enabled: true
-  weight_mode: posterior        # posterior | rltt | uniform | logp_softmax
-  prior: exit                   # uniform | progressive | exit (the gate)
-  progressive_alpha: 1.0
-  gamma: 1.0                    # 0 = RLTT with the same prior
-  lam: 1.0                      # 0 = GRPO (final loop only)
-  eps_floor: 0.0
-  use_gate_loss: false          # the only plc difference from plc_posterior_exit_gate_1p4b_8gpu.yaml
-  gate_coef: 1.0
-  gate_entropy_coef: 0.05       # Ouro Stage I entropy regulariser, last-stage value
-  use_is_correction: false
-  is_clip: 5.0
+  weight_mode: is_trunc         # alpha_t * min(c, P^(t)/P^(T)) for t < T, 0 for the final loop;
+                                # alpha_t = 1/3 (uniform over the earlier loops)
+  lam: 0.1                      # earlier-loop term coefficient (GRPO term unscaled); 0 = GRPO
+  trunc_cap: 1.0                # c: upper cap of the cross-loop ratio (no lower cap)
+  kl_coef: 0.0                  # no trust region (plc_grpo_loopaux_1p4b_8gpu.yaml: 0.2)
   log_weight_stats: true
 
 wandb:
@@ -107,8 +107,8 @@ wandb:
   mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
   project: looprl-ouro            # one wandb project for every method and size
   entity: null
-  run_name: plc-posterior-exit-nogate-1p4b
-  tags: [plc, posterior, exit-prior, no-gate-loss, ouro-1.4b-thinking, deepmath-level6]
+  run_name: plc-grpo-loopaux-nokl-1p4b
+  tags: [plc, grpo-loopaux, is-trunc, no-kl-trust-region, no-gate-loss, ouro-1.4b-thinking, deepmath-level6]
   notes: null
   dir: ${args.output_dir}
 
@@ -117,6 +117,14 @@ verl_overrides:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
     train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
+    model:
+      override_config:
+        # HF actor forward = the last loop, the loop vLLM samples from. With the Ouro config's
+        # early_exit_threshold 1.0, the official forward takes per token the first loop whose
+        # cumulative exit probability reaches 1.0, an earlier loop when bf16 rounds it to 1.
+        # Read only by the official forward (GRPO log-probs, RLTT's old_log_probs); the
+        # per-loop RLTT / PLC forward and vLLM never use it.
+        early_exit_threshold: null
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
                                      # below max_model_len 18,432, which verl refuses with

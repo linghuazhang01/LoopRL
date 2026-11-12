@@ -101,25 +101,23 @@ class RLTTStyleActor(FakeActor):
 class PLCStyleActor(FakeActor):
     """``PLCActor.compute_log_prob``: a padded per-loop forward through _forward_micro_batch_plc.
 
-    Keeps the per-loop log-probs and exit PDF it returned, as ``PLCActor`` hands them on to
-    ``update_policy``.
+    Keeps the per-loop log-probs it returned, as ``PLCActor`` hands them on to ``update_policy``.
     """
 
     def __init__(self, settings=None):
         super().__init__(remove_padding=False)
-        self.settings = settings or plc.PLCSettings(enabled=True, prior="exit")
+        self.settings = settings or plc.PLCSettings(enabled=True)
         self.old = []
 
     def _forward_micro_batch_plc(self, micro_batch, temperature):
         # calls the model directly, as PLCActor does (not through _forward_micro_batch)
         input_ids = micro_batch["input_ids"]
         window = slice(-micro_batch["responses"].size(-1) - 1, -1)
-        _, hiddens, gates = self.actor_module.model(input_ids)
+        _, hiddens, _ = self.actor_module.model(input_ids)
         labels = input_ids.roll(-1, 1).unsqueeze(-1)
         ell = torch.stack([F.log_softmax(self.actor_module.lm_head(h) / temperature, -1)
                            .gather(-1, labels).squeeze(-1)[:, window] for h in hiddens], -1)
-        exit_pdf = exit_pdf_from_gates(gates)[:, window] if self.settings.needs_exit_pdf else None
-        return None, ell, exit_pdf
+        return None, ell
 
     def compute_log_prob(self, data, calculate_entropy=False):
         rows = torch.arange(len(data.batch["input_ids"])).flip(0)
@@ -128,10 +126,9 @@ class PLCStyleActor(FakeActor):
         with torch.no_grad():
             for part in rows.split(2):
                 micro_batch = {name: value[part] for name, value in data.batch.items()}
-                _, ell, exit_pdf = self._forward_micro_batch_plc(micro_batch,
-                                                                 data.meta_info["temperature"])
+                _, ell = self._forward_micro_batch_plc(micro_batch, data.meta_info["temperature"])
                 log_probs[part] = ell[..., -1]
-                self.old.append((micro_batch, ell, exit_pdf))
+                self.old.append((micro_batch, ell))
         return log_probs, None
 
 
@@ -340,10 +337,9 @@ def test_loop_weights_record_the_exit_pdf(tmp_path, remove_padding):
 
 
 @pytest.mark.parametrize("plc_settings", [
-    plc.PLCSettings(enabled=True, prior="exit", use_gate_loss=True),
-    plc.PLCSettings(enabled=True, prior="uniform", gamma=0.5, eps_floor=0.1),
-    plc.PLCSettings(enabled=True, weight_mode="is_trunc", objective="additive", lam=0.1,
-                    trunc_cap=2.0, kl_coef=0.2),
+    plc.PLCSettings(enabled=True),
+    plc.PLCSettings(enabled=True, trunc_cap=2.0),
+    plc.PLCSettings(enabled=True, weight_mode="early_prior"),
 ])
 def test_loop_weights_record_the_plc_weights_of_the_update(tmp_path, plc_settings):
     actor = PLCStyleActor(plc_settings)
@@ -351,30 +347,24 @@ def test_loop_weights_record_the_plc_weights_of_the_update(tmp_path, plc_setting
     run_step(actor, tmp_path)
     step_dir = tmp_path / "step_000001"
     with np.load(step_dir / "tokens_rank00.npz") as shard:
-        recorded, pdf = shard["plc_weight"], shard["exit_pdf"]
+        recorded = shard["plc_weight"]
         sampled_log_prob = shard["sampled_log_prob"]
 
     # the weights PLCActor.update_policy forms from the old tensors, in the audit's token order
     expected = []
-    for micro_batch, ell, exit_pdf in actor.old:
-        logq = plc.loop_prior_logq(plc_settings.prior, LOOPS, plc_settings.progressive_alpha,
-                                   exit_pdf, like=ell)
-        weights = plc.compute_loop_weights(ell, logq, plc_settings.gamma,
-                                           plc_settings.weight_mode, plc_settings.eps_floor,
-                                           plc_settings.trunc_cap)
+    for micro_batch, ell in actor.old:
+        weights = plc.compute_loop_weights(ell, plc_settings.weight_mode, plc_settings.trunc_cap)
         mask = micro_batch["attention_mask"][:, -5:].bool()
         expected.append(weights[mask].numpy())
     np.testing.assert_allclose(recorded, np.concatenate(expected), rtol=1e-6)
-    if plc_settings.weight_mode in plc.EARLY_LOOP_WEIGHT_MODES:
-        rho = np.exp(sampled_log_prob[:, :-1] - sampled_log_prob[:, -1:])
-        np.testing.assert_allclose(recorded[:, :-1], np.minimum(rho, 2.0) / 3, rtol=1e-4)
-        assert (recorded[:, -1] == 0).all()
-    else:
-        np.testing.assert_allclose(recorded.sum(-1), 1.0, rtol=1e-6)
-    if plc_settings.prior == "exit":  # gamma = 1: the posterior of the audited exit PDF
-        posterior = pdf * np.exp(sampled_log_prob)
-        np.testing.assert_allclose(recorded, posterior / posterior.sum(-1, keepdims=True),
-                                   atol=1e-5)
+    # against the audit's own log-probs: alpha_t * min(cap, rho_t) on t < T (rho = 1 with
+    # early_prior), 0 on the final loop
+    rho = np.exp(sampled_log_prob[:, :-1] - sampled_log_prob[:, -1:])
+    if plc_settings.weight_mode == "early_prior":
+        rho = np.ones_like(rho)
+    np.testing.assert_allclose(recorded[:, :-1], np.minimum(rho, plc_settings.trunc_cap) / 3,
+                               rtol=1e-4)
+    assert (recorded[:, -1] == 0).all()
     summary = json.loads((step_dir / "summary.json").read_text())
     assert summary["errors"] == []
     assert "plc_weight/loop_4" in summary["metrics"]
@@ -500,6 +490,28 @@ def test_driver_supplies_live_step_after_checkpoint_restore(monkeypatch, tmp_pat
         la.step_dir_name(saved_step + 1), la.step_dir_name(saved_step + 2)]
 
 
+def test_a_resumed_run_counts_from_first_step(tmp_path):
+    actor = FakeActor()
+    la.attach_loop_audit(actor, settings(tmp_path, every_n_steps=2, first_step=29), rank=0)
+    for _ in range(3):
+        run_step(actor, tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["step_000029", "step_000031"]
+
+
+def test_finished_steps_are_not_overwritten(tmp_path):
+    first = FakeActor()
+    la.attach_loop_audit(first, settings(tmp_path), rank=0)
+    run_step(first, tmp_path)
+    step_dir = tmp_path / la.step_dir_name(1)
+    before = {p.name: p.read_bytes() for p in step_dir.iterdir()}
+    again = FakeActor()  # restarted without resuming: counts from 1 again
+    la.attach_loop_audit(again, settings(tmp_path), rank=0)
+    run_step(again, tmp_path)
+    after = {p.name: p.read_bytes() for p in step_dir.iterdir() if p.name in before}
+    assert after == before
+    assert (step_dir / "skipped_rank00.txt").exists()
+
+
 def test_save_tokens_false_keeps_only_the_summaries(tmp_path):
     actor = FakeActor()
     la.attach_loop_audit(actor, settings(tmp_path, save_tokens=False), rank=0)
@@ -605,7 +617,7 @@ def test_audit_is_on_in_every_config(env, name):
     assert cfg.audit.loop_distribution.enabled is True
     audit = rcfg.add_audit_overrides(cfg, {}, _args())["actor_rollout_ref"]["loop_audit"]
     assert audit == {"every_n_steps": 1, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
-                     "loop_weights": True, "dir": "/out/run/audit"}
+                     "loop_weights": True, "first_step": 1, "dir": "/out/run/audit"}
 
 
 def test_config_switch_adds_the_worker_settings(env):
@@ -616,7 +628,7 @@ def test_config_switch_adds_the_worker_settings(env):
     assert overrides["trainer"] == {"logger": ["console"]}
     assert overrides["actor_rollout_ref"]["loop_audit"] == {
         "every_n_steps": 10, "top_k": 5, "save_tokens": True, "chunk_tokens": 512,
-        "loop_weights": True, "dir": "/out/run/audit"}
+        "loop_weights": True, "first_step": 1, "dir": "/out/run/audit"}
 
 
 def test_missing_settings_use_the_defaults(env):
@@ -649,7 +661,34 @@ def test_audit_refuses_lora(env):
 @pytest.mark.parametrize("mode", ["auto", "resume_path"])
 def test_resume_requires_the_trainer_step_in_worker_metadata(env, mode):
     cfg = rcfg.load_config(str(paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")))
-    overrides = {"trainer": {"resume_mode": mode}}
+    trainer = {"resume_mode": mode}
+    if mode == "resume_path":
+        trainer["resume_from_path"] = "/out/run/global_step_28"
+    overrides = {"trainer": trainer}
     audit = rcfg.add_audit_overrides(cfg, overrides, _args())["actor_rollout_ref"]["loop_audit"]
     assert audit["require_global_step"] is True
     assert audit["dir"] == "/out/run/audit"
+
+
+def test_resumed_audit_starts_after_the_loaded_checkpoint(env, tmp_path):
+    cfg = rcfg.load_config(str(paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")))
+    args = types.SimpleNamespace(no_lora=True, output_dir=str(tmp_path))
+
+    def first_step(trainer):
+        return rcfg.add_audit_overrides(cfg, {"trainer": trainer}, args)[
+            "actor_rollout_ref"]["loop_audit"]["first_step"]
+
+    assert first_step({}) == 1
+    assert first_step({"resume_mode": "auto"}) == 1          # no checkpoint yet: from scratch
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("28")
+    assert first_step({"resume_mode": "auto"}) == 29
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "latest_checkpointed_iteration.txt").write_text("5")
+    assert first_step({"resume_mode": "auto", "default_local_dir": str(other)}) == 6
+    assert first_step({"resume_mode": "resume_path",
+                       "resume_from_path": str(tmp_path / "global_step_28") + "/"}) == 29
+    with pytest.raises(ValueError, match="global_step"):
+        first_step({"resume_mode": "resume_path", "resume_from_path": str(tmp_path)})
+    with pytest.raises(ValueError, match="resume_mode"):
+        first_step({"resume_mode": "latest"})

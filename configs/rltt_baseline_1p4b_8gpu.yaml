@@ -1,8 +1,8 @@
 # RLTT baseline on Ouro-1.4B-Thinking, one node with 8 GPUs, one optimizer update per step.
 # This is the RLTT member of the 1.4B comparison group (see CLAUDE.md):
-#   grpo_baseline_1p4b_8gpu.yaml / rltt_baseline_1p4b_8gpu.yaml /
-#   plc_posterior_exit_gate_1p4b_8gpu.yaml
-# The three files share every setting that is not the method itself (data, lengths, 64 prompts x 8
+#   grpo_baseline_1p4b_8gpu.yaml / rltt_baseline_1p4b_8gpu.yaml / plc_grpo_loopaux_1p4b_8gpu.yaml
+#   (+ its ablation plc_grpo_loopaux_nokl_1p4b_8gpu.yaml)
+# The files share every setting that is not the method itself (data, lengths, 64 prompts x 8
 # rollouts, 100 steps, optimizer, KL, rollout, checkpoints, model check). The test
 # tests/test_rltt_baseline.py::test_matched_configs_share_all_non_method_settings enforces this:
 # change a shared value in all files of the group at once.
@@ -13,11 +13,8 @@
 # Objective: the vendor RLTT loss (third_party/RLTT rltt_experiments/verl_rltt): REINFORCE on
 #   sum_t w_t log P^(t)(y_j),  w = the model's exit distribution (loop_weighting exit_pdf),
 # KL loss disabled (use_kl_loss false, coefficient 0), as in every config of the group.
-# The model directory built by prepare_model has rltt_detach_exit_pdf false (the PLC gate loss
-# needs it), so here the exit gate also receives gradient through the weights; GRPO never
-# touches the gate. For RLTT on exactly the PLC code path (per-loop PPO ratio, fixed detached
-# weights) run the PLC config with
-#   plc.gamma=0 plc.use_gate_loss=false
+# The model directory built by prepare_model has rltt_detach_exit_pdf false, so here the exit
+# gate also receives gradient through the weights; GRPO and PLC never touch the gate.
 #
 # Model directory: `bash scripts/prepare_model.sh <models dir> --model 1.4B`;
 #   LOOPRL_MODEL_DIR = <models dir>/Ouro-1.4B-Thinking-RLTT,
@@ -108,6 +105,14 @@ verl_overrides:
     seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
     train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
   actor_rollout_ref:
+    model:
+      override_config:
+        # HF actor forward = the last loop, the loop vLLM samples from. With the Ouro config's
+        # early_exit_threshold 1.0, the official forward takes per token the first loop whose
+        # cumulative exit probability reaches 1.0, an earlier loop when bf16 rounds it to 1.
+        # Read only by the official forward (GRPO log-probs, RLTT's old_log_probs); the
+        # per-loop RLTT / PLC forward and vLLM never use it.
+        early_exit_threshold: null
     rollout:
       max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
                                      # below max_model_len 18,432, which verl refuses with

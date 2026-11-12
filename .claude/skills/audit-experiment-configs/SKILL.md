@@ -17,8 +17,8 @@ description: 靠阅读来审计 LoopRL 的实验配置（configs/ 下 GRPO / RLT
 目标是确定被审配置属于哪个对照组、要和谁比。按这个顺序找：
 
 1. **文件名**。约定是 `<方法>_<变体>_<规模>_<卡数>.yaml`：`grpo_baseline_1p4b_8gpu`、
-   `rltt_baseline_1p4b_8gpu`、`plc_posterior_exit_gate_1p4b_8gpu` 是 1.4B 组；`grpo_baseline_8gpu.yaml`、
-   `rltt_baseline.yaml`（没写规模的是 2.6B）和 `plc_posterior_exit_gate_2p6b_8gpu` 是 2.6B 组。
+   `rltt_baseline_1p4b_8gpu`、`plc_grpo_loopaux_1p4b_8gpu`（及其消融 `plc_grpo_loopaux_nokl_1p4b_8gpu`）
+   是 1.4B 组；`grpo_baseline_8gpu.yaml`、`rltt_baseline.yaml`（没写规模的是 2.6B）是 2.6B 组，暂无 PLC 配置。
    以前的 `*_loop_audit.yaml` 诊断变体已删除：逐轮审计现在在所有配置里都打开。
 2. **文件头注释**。每份配置开头都写了"属于哪个组、和同组文件差在哪、和另一规模差在哪"。
 3. **对照组表**。`CLAUDE.md` 和 README"配置对照组"一节的表格，以及 `tests/test_rltt_baseline.py` 里的
@@ -37,7 +37,7 @@ description: 靠阅读来审计 LoopRL 的实验配置（configs/ 下 GRPO / RLT
 
 ```
 配置：<文件名>
-方法：<GRPO | RLTT(loop_weighting=…) | PLC(gamma, lam, prior, gate loss)>；trainer=<grpo|rltt> → 走哪条 actor 前向
+方法：<GRPO | RLTT(loop_weighting=…) | PLC(weight_mode, lam, trunc_cap, kl_coef)>；trainer=<grpo|rltt> → 走哪条 actor 前向
 模型：Ouro-<规模>，<层数>层 × 4 轮，全参数 / LoRA；模型目录来自哪个环境变量
 数据：<训练文件>，prompt 怎么来（parquet 自带 / RLTT prompt），prompt ≤ <n>，生成 ≤ <n>
 批次：每步 <题数> × <采样数> = <rollout 数>，累积 <k> 步，mini-batch <m> 题 → 每 <k> 步一次更新，共 <steps> 步 = <updates> 次更新
@@ -117,8 +117,8 @@ GRPO 的 `actor.grad_clip` 应等于 `args.max_grad_norm`；RLTT 的 `use_rltt_m
    不是审计本身。
 4. 文件头注释写清所属组、与同组文件的差异只有方法、与另一规模的差异是什么。
 
-临时实验不要新建配置，用命令行 dot-list 覆盖；消融也走覆盖（`plc.gamma=0`、`plc.lam=0`、
-`plc.use_gate_loss=false`）。
+临时实验不要新建配置，用命令行 dot-list 覆盖；消融也走覆盖（`plc.lam=0`、`plc.kl_coef=0`、
+`plc.trunc_cap=2`、`plc.weight_mode=early_prior`）。
 
 ## 报告模板
 

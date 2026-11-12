@@ -14,12 +14,10 @@ With ``loop_weights`` the audit also records the loop weights of each token (n, 
 
 - ``exit_pdf``: the exit gate's distribution over loops, ``q_t = lambda_t prod_{s<t}(1 - lambda_s)``
   with the last loop taking the rest (all methods; RLTT's ``loop_weighting: exit_pdf`` weight);
-- ``plc_weight``: the PLC loop weights that ``PLCActor.update_policy`` applies to this step
-  (``plc.compute_loop_weights``: ``softmax_t(log q_t + gamma * ell_old)`` for the posterior
-  modes, ``alpha_t * min(trunc_cap, rho_t)`` for t < T and 0 for the final loop with
-  ``is_trunc``), computed from the actor's
-  own per-loop log-probs and exit PDF of the same pass. PLC runs only; for GRPO and RLTT runs the
-  posterior can be formed afterwards from ``exit_pdf`` and ``sampled_log_prob``.
+- ``plc_weight``: the earlier-loop weights that ``PLCActor.update_policy`` applies to this step
+  (``plc.compute_loop_weights``: ``alpha_t * min(trunc_cap, rho_t)`` for t < T and 0 for the
+  final loop with ``is_trunc``, ``alpha_t`` with ``early_prior``), computed from the actor's own
+  per-loop log-probs of the same pass. PLC runs only.
 
 The probability of the sampled token at each loop is ``exp(sampled_log_prob)``. The summary
 also carries, for each loop t < T, the cross-loop ratio ``rho = P^(t)(y) / P^(T)(y)`` of the
@@ -27,6 +25,11 @@ sampled token (``xloop_*``: log rho, min(1, rho), share above 1 and below 0.1), 
 is the exact ``KL(P^(T) || P^(t))``, the trust region of the PLC loop term (``plc.kl_coef``).
 
 Distributions come from the training forward (full per-loop KV), also with decode_last rollouts.
+
+Steps are numbered by the trainer's ``global_steps`` when the batch carries it, else by counting
+``compute_log_prob`` calls from ``first_step`` (1, or the loaded checkpoint's step + 1 when the run
+resumes; set by ``rltt_baseline.config.add_audit_overrides``). A step whose ``summary.json``
+already exists is never overwritten.
 
 No forward pass is added. A temporary hook on ``OuroModel`` reads the per-loop hidden states of
 the ``compute_log_prob`` pass that training runs anyway and applies ``lm_head`` there. That
@@ -155,6 +158,8 @@ class LoopAudit:
         self.rank = rank
         self.directory = Path(config["dir"])
         self.every_n_steps = int(config["every_n_steps"])
+        # first training step of this run: 1, or checkpoint step + 1 when resuming
+        self.first_step = int(config.get("first_step", 1))
         self.top_k = int(config["top_k"])
         self.save_tokens = bool(config["save_tokens"])
         self.chunk_tokens = int(config["chunk_tokens"])
@@ -189,7 +194,7 @@ class LoopAudit:
             if (returns_plc_tensors and self.loop_weights and self.plc_settings is not None
                     and self._error is None and len(self._records) == records + 1):
                 try:
-                    self._add_plc_weights(self._records[-1], micro_batch, result[1], result[2])
+                    self._add_plc_weights(self._records[-1], micro_batch, result[1])
                 except Exception as exc:  # the audit must not stop training
                     self._error = repr(exc)
             return result
@@ -199,7 +204,7 @@ class LoopAudit:
         if self.require_global_step and "global_steps" not in data.meta_info:
             raise ValueError("resumed loop audit requires the trainer's global_steps metadata")
         self._calls += 1
-        step = int(data.meta_info.get("global_steps", self._calls))
+        step = int(data.meta_info.get("global_steps", self.first_step + self._calls - 1))
         if step < 1:
             raise ValueError("loop audit global_steps must be positive")
         if (step - 1) % self.every_n_steps:
@@ -256,23 +261,25 @@ class LoopAudit:
         return record
 
     @torch.no_grad()
-    def _add_plc_weights(self, record: dict, micro_batch: dict, ell: torch.Tensor,
-                         exit_pdf: Optional[torch.Tensor]) -> None:
+    def _add_plc_weights(self, record: dict, micro_batch: dict, ell: torch.Tensor) -> None:
         """``record["plc_weight"]``: the weights ``PLCActor.update_policy`` forms from ``ell``
-        ``[B, L, T]`` and ``exit_pdf`` (the old-policy tensors of this pass)."""
+        ``[B, L, T]`` (the old-policy per-loop log-probs of this pass)."""
         settings = self.plc_settings
         response_length = micro_batch["responses"].size(-1)
         rows, tokens = micro_batch["attention_mask"][:, -response_length:].bool().nonzero(
             as_tuple=True)
-        ell = ell.float()
-        logq = plc.loop_prior_logq(settings.prior, ell.shape[-1], settings.progressive_alpha,
-                                   exit_pdf, like=ell)
-        weights = plc.compute_loop_weights(ell, logq, settings.gamma, settings.weight_mode,
-                                           settings.eps_floor, settings.trunc_cap)
+        weights = plc.compute_loop_weights(ell.float(), settings.weight_mode, settings.trunc_cap)
         record["plc_weight"] = weights[rows, tokens].cpu().numpy()
 
     def _write(self, step: int) -> None:
         step_dir = self.directory / step_dir_name(step)
+        if (step_dir / "summary.json").exists():
+            # a finished step of an earlier run in this output_dir: keep it and leave a note (the
+            # run was restarted without resuming, or its first_step is wrong)
+            (step_dir / f"skipped_rank{self.rank:02d}.txt").write_text(
+                f"step {step} already finalized; this run's records were not written\n")
+            self._records = []
+            return
         step_dir.mkdir(parents=True, exist_ok=True)
         try:
             if self._error is not None:

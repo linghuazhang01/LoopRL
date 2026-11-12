@@ -70,9 +70,8 @@ def worker_config():
             "use_kl_loss": True,
             "kl_loss_coef": 0.001,
             "plc": {
-                "enabled": True, "weight_mode": "posterior", "prior": "exit",
-                "gamma": 1.0, "lam": 1.0, "use_gate_loss": True,
-                "gate_coef": 1.0, "gate_entropy_coef": 0.05,
+                "enabled": True, "weight_mode": "is_trunc", "lam": 0.1,
+                "trunc_cap": 1.0, "kl_coef": 0.2,
             },
         },
         "total_ut_steps": 4,
