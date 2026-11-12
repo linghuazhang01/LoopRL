@@ -140,7 +140,7 @@ def row_key(input_ids: np.ndarray, attention_mask: np.ndarray) -> str:
 
 
 class LoopAudit:
-    """Wraps a verl actor's ``compute_log_prob``; steps count from 1, as the trainer's do."""
+    """Wraps an actor's log-prob pass, using the trainer's step across restarts."""
 
     def __init__(self, actor, config, rank: int):
         modules = dict(actor.actor_module.named_modules())
@@ -159,6 +159,7 @@ class LoopAudit:
         self.save_tokens = bool(config["save_tokens"])
         self.chunk_tokens = int(config["chunk_tokens"])
         self.loop_weights = bool(config.get("loop_weights", False))
+        self.require_global_step = bool(config.get("require_global_step", False))
         settings = getattr(actor, "settings", None)
         self.plc_settings = settings if isinstance(settings, plc.PLCSettings) else None
         self._calls = 0
@@ -195,8 +196,12 @@ class LoopAudit:
         return wrapped
 
     def compute_log_prob(self, data, *args, **kwargs):
+        if self.require_global_step and "global_steps" not in data.meta_info:
+            raise ValueError("resumed loop audit requires the trainer's global_steps metadata")
         self._calls += 1
         step = int(data.meta_info.get("global_steps", self._calls))
+        if step < 1:
+            raise ValueError("loop audit global_steps must be positive")
         if (step - 1) % self.every_n_steps:
             return self._compute_log_prob(data, *args, **kwargs)
         self._temperature = float(data.meta_info["temperature"])
@@ -290,6 +295,35 @@ class LoopAudit:
 def attach_loop_audit(actor, config, rank: int) -> Optional[LoopAudit]:
     """Install the audit on ``actor``; ``config`` is ``actor_rollout_ref.loop_audit`` or None."""
     return LoopAudit(actor, config, rank) if config else None
+
+
+def install_trainer_step_tracking() -> None:
+    """Tag the old-policy batch after checkpoint loading, before Ray dispatch to workers.
+
+    Both native trainers call ``_load_checkpoint`` after worker initialization and before
+    entering their loops. Read ``self.global_steps`` on every call: rollout outputs may drop
+    metadata, and a worker's call count restarts at one when resuming.
+    """
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    original = RayPPOTrainer._load_checkpoint
+    if getattr(original, "_loop_audit_step_tracking", False):
+        return
+
+    def load_checkpoint(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        compute = self.actor_rollout_wg.compute_log_prob
+        if not getattr(compute, "_loop_audit_step_tracking", False):
+            def compute_log_prob(data, *call_args, **call_kwargs):
+                data.meta_info["global_steps"] = self.global_steps
+                return compute(data, *call_args, **call_kwargs)
+
+            compute_log_prob._loop_audit_step_tracking = True
+            self.actor_rollout_wg.compute_log_prob = compute_log_prob
+        return result
+
+    load_checkpoint._loop_audit_step_tracking = True
+    RayPPOTrainer._load_checkpoint = load_checkpoint
 
 
 def token_metrics(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:

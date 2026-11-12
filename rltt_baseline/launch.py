@@ -308,6 +308,10 @@ def main(argv=None) -> int:
     os.environ.update(env)
     vendor.parse_args = lambda: args
     install_trainer_overrides(overrides)
+    if loop_audit:
+        from rltt_baseline.loop_audit import install_trainer_step_tracking
+
+        install_trainer_step_tracking()
     install_parquet_train_data()
     if cfg.trainer == "rltt" and plc.enabled:
         install_plc_worker()

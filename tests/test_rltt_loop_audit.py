@@ -433,6 +433,73 @@ def test_trainer_step_wins_over_the_call_count(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["step_000007"]
 
 
+@pytest.mark.parametrize("actor_type", [FakeActor, RLTTStyleActor, PLCStyleActor])
+def test_resumed_audit_continues_at_29_with_aligned_responses(tmp_path, actor_type):
+    actor = actor_type()
+    la.attach_loop_audit(actor, settings(tmp_path, require_global_step=True,
+                                          every_n_steps=2), rank=0)
+    for step in (29, 30, 31):
+        _, metrics = run_step(actor, tmp_path, global_steps=step)
+        if step != 30:
+            assert metrics["loop_audit/unmatched_responses"] == 0
+            assert metrics["loop_audit/error_ranks"] == 0
+            assert metrics["loop_audit/last_loop_log_prob_gap"] < 1e-6
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["step_000029", "step_000031"]
+
+
+def test_resumed_audit_refuses_a_missing_trainer_step(tmp_path):
+    actor = FakeActor()
+    la.attach_loop_audit(actor, settings(tmp_path, require_global_step=True), rank=0)
+    with pytest.raises(ValueError, match="global_steps metadata"):
+        run_step(actor, tmp_path)
+    assert not list(tmp_path.iterdir())
+    assert not actor.actor_module.model._forward_hooks
+
+
+@pytest.mark.parametrize("saved_step", [0, 28])
+def test_driver_supplies_live_step_after_checkpoint_restore(monkeypatch, tmp_path, saved_step):
+    actor = PLCStyleActor()
+    la.attach_loop_audit(actor, settings(tmp_path, require_global_step=True), rank=0)
+
+    class RayPPOTrainer:
+        def __init__(self):
+            self.actor_rollout_wg = types.SimpleNamespace(compute_log_prob=actor.compute_log_prob)
+
+        def _load_checkpoint(self):
+            self.global_steps = saved_step
+            return "loaded"
+
+    fake = types.ModuleType("verl.trainer.ppo.ray_trainer")
+    fake.RayPPOTrainer = RayPPOTrainer
+    for name in ("verl", "verl.trainer", "verl.trainer.ppo"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "verl.trainer.ppo.ray_trainer", fake)
+    la.install_trainer_step_tracking()
+    patched = RayPPOTrainer._load_checkpoint
+    la.install_trainer_step_tracking()
+    assert RayPPOTrainer._load_checkpoint is patched
+
+    trainer = RayPPOTrainer()
+    assert trainer._load_checkpoint() == "loaded"
+    wrapped = trainer.actor_rollout_wg.compute_log_prob
+    assert trainer._load_checkpoint() == "loaded"
+    assert trainer.actor_rollout_wg.compute_log_prob is wrapped
+    for step in (saved_step + 1, saved_step + 2):
+        trainer.global_steps = step
+        data = make_data(global_steps=999)  # stale rollout metadata must not win
+        before = {name: value.clone() for name, value in data.batch.items()}
+        log_probs, _ = trainer.actor_rollout_wg.compute_log_prob(data=data,
+                                                               calculate_entropy=True)
+        assert data.meta_info == {"temperature": 0.7, "global_steps": step}
+        for name, value in before.items():
+            torch.testing.assert_close(data.batch[name], value)
+        metrics = la.finalize_pending(tmp_path, driver_batch(data, log_probs))
+        assert metrics["loop_audit/responses"] == 6
+        assert metrics["loop_audit/unmatched_responses"] == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        la.step_dir_name(saved_step + 1), la.step_dir_name(saved_step + 2)]
+
+
 def test_save_tokens_false_keeps_only_the_summaries(tmp_path):
     actor = FakeActor()
     la.attach_loop_audit(actor, settings(tmp_path, save_tokens=False), rank=0)
@@ -572,10 +639,17 @@ def test_bad_audit_settings_are_refused(env, override, error):
         rcfg.load_config(str(paths.config_file("grpo_baseline_8gpu.yaml")), [override])
 
 
-def test_audit_refuses_lora_and_resume(env):
+def test_audit_refuses_lora(env):
     cfg = rcfg.load_config(str(paths.config_file("grpo_baseline_8gpu.yaml")),
                            ["audit.loop_distribution.enabled=true"])
     with pytest.raises(ValueError, match="no_lora"):
         rcfg.add_audit_overrides(cfg, {}, _args(no_lora=False))
-    with pytest.raises(ValueError, match="resume"):
-        rcfg.add_audit_overrides(cfg, {"trainer": {"resume_mode": "auto"}}, _args())
+
+
+@pytest.mark.parametrize("mode", ["auto", "resume_path"])
+def test_resume_requires_the_trainer_step_in_worker_metadata(env, mode):
+    cfg = rcfg.load_config(str(paths.config_file("plc_grpo_loopaux_1p4b_8gpu.yaml")))
+    overrides = {"trainer": {"resume_mode": mode}}
+    audit = rcfg.add_audit_overrides(cfg, overrides, _args())["actor_rollout_ref"]["loop_audit"]
+    assert audit["require_global_step"] is True
+    assert audit["dir"] == "/out/run/audit"

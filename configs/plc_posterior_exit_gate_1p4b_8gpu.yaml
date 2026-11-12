@@ -132,6 +132,7 @@ verl_overrides:
         save_contents: [model, optimizer, extra, hf_model]
   trainer:
     logger: [wandb, console]
+    max_actor_ckpt_to_keep: 2  # save every step; retain the two latest actor checkpoints
 
 rollout:
   kv_layout: full

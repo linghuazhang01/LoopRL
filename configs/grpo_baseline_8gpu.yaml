@@ -117,6 +117,7 @@ verl_overrides:
         param_offload: true   # RLTT ref_offload
   trainer:
     logger: [wandb, console]
+    max_actor_ckpt_to_keep: 2  # save every step; retain the two latest actor checkpoints
 
 rollout:
   # full: stock vLLM (one KV cache per loop). decode_last: prompts keep every loop's KV,

@@ -411,8 +411,9 @@ def add_rollout_overrides(cfg: DictConfig, overrides: dict) -> dict:
 def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
     """``overrides`` plus ``actor_rollout_ref.loop_audit`` when the per-loop audit is on.
 
-    The workers count audited steps from 1, and LoRA adds a second ``compute_log_prob`` per step
-    (the reference pass), so both resuming and LoRA are refused rather than mislabelling steps.
+    The driver supplies the trainer's global step after loading a checkpoint. Resumed workers
+    require it instead of falling back to a call count. LoRA still adds a second log-prob pass
+    per step (the reference pass), so it is refused rather than overwriting the actor's audit.
     """
     settings = OmegaConf.to_container(cfg.audit.get("loop_distribution") or {}, resolve=True)
     settings = {**LOOP_AUDIT_DEFAULTS, **settings}
@@ -421,7 +422,7 @@ def add_audit_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespa
     if not args.no_lora:
         raise ValueError("audit.loop_distribution needs no_lora=true")
     if (overrides.get("trainer") or {}).get("resume_mode", "disable") != "disable":
-        raise ValueError("audit.loop_distribution counts steps from 1 and cannot resume a run")
+        settings["require_global_step"] = True
     settings["dir"] = os.path.join(os.path.abspath(str(args.output_dir)), "audit")
     return _deep_merge(overrides, {"actor_rollout_ref": {"loop_audit": settings}})
 

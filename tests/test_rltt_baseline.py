@@ -225,7 +225,8 @@ def test_cli_overrides_win(env):
     assert rcfg.wandb_env(cfg)["WANDB_MODE"] == "online"
     overrides = rcfg.verl_overrides(cfg)
     assert overrides["trainer"] == {"save_freq": 20, "experiment_name": "try1",
-                                    "logger": ["wandb", "console"]}
+                                    "logger": ["wandb", "console"],
+                                    "max_actor_ckpt_to_keep": 2}
     # 64 prompts per rollout batch (paper: 32); the shuffle seed follows args.seed
     assert overrides["data"] == {"train_batch_size": 64, "seed": 42}
     assert overrides["actor_rollout_ref"]["actor"]["optim"]["betas"] == [0.9, 0.99]
@@ -467,6 +468,8 @@ def test_matched_configs_lock_kl_off_vllm_and_seed(env, name):
     assert cfg.args.seed == 42 and cfg.verl_overrides.data.seed == 42, name
     assert cfg.wandb.project == "looprl-ouro" and cfg.wandb.entity is None, name
     assert cfg.wandb.enabled is True and cfg.wandb.mode == "online", name
+    assert cfg.args.save_steps == 1, name
+    assert cfg.verl_overrides.trainer.max_actor_ckpt_to_keep == 2, name
     rollout = cfg.verl_overrides.actor_rollout_ref.rollout
     assert rollout.max_num_batched_tokens == 32768, name
     max_model_len = cfg.args.max_prompt_length + cfg.args.max_completion_length
@@ -1039,6 +1042,7 @@ def test_decode_last_dry_run_carries_the_settings(env, capsys, monkeypatch):
 
 def test_generated_mask_uses_positions_not_query_length():
     import numpy as np
+
     from rltt_baseline.decode_last import generated_mask
 
     # A: decoding (prompt 5, position 7); B: prompt chunk (prompt 10, positions 3-6);
@@ -1054,9 +1058,10 @@ def test_generated_mask_uses_positions_not_query_length():
 
 def test_vllm_decode_last_registers_once():
     pytest.importorskip("vllm")
-    from rltt_baseline import decode_last, vllm_decode_last
     from vllm import ModelRegistry
     from vllm.v1.worker import gpu_model_runner
+
+    from rltt_baseline import decode_last, vllm_decode_last
 
     hook = gpu_model_runner.GPUModelRunner._prepare_inputs
     vllm_decode_last.register()

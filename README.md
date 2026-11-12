@@ -486,7 +486,9 @@ token["topk_probs"][17, 0]         # 对应的概率
 - **自检。** `last_loop_log_prob_gap` 比较审计的最后一轮与 verl 的 `old_log_probs`，应接近 0；
   `unmatched_responses` 是对不上 driver batch 的回答数，应为 0。
 - **失败不影响训练。** 审计出错时写 `error_rank<r>.txt`，并记录在 `summary.json`，训练继续。
-- 审计按调用次数从第 1 步计数，因此 `resume_mode` 不是 `disable` 或启用 LoRA 时会拒绝启动。
+- 审计步号由 driver 在加载 checkpoint 后按训练器的 `global_steps` 传给 worker；从第 28 步
+  恢复时，下一份审计写入 `audit/step_000029/`。续训必须使用真实步号，缺少该元数据会报错，
+  不会退回从 1 开始的调用次数。启用 LoRA 仍会拒绝启动（参考策略会多算一次 log-prob）。
 
 ### 逐轮梯度探测
 
