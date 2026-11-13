@@ -33,6 +33,9 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | —（暂无） |
 | 1.4B 消融：PLC 去掉 KL 项 | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
+| 1.4B：PLC 前几轮改为跨轮蒸馏 | — | — | `plc_grpo_loopkd_1p4b_8gpu.yaml` |
+| 1.4B：同上，reverse KL | — | — | `plc_grpo_loopkd_rev_1p4b_8gpu.yaml` |
+| 1.4B：PLC 精确比率 + 初始模型锚定项 | — | — | `plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml` |
 
 组内**允许**不同的只有：
 
@@ -67,11 +70,32 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
    （2026-11-08 首存，2026-11-11 改为信赖域形式，2026-11-13 起是唯一的 PLC 逻辑）。消融：
    `plc.kl_coef=0.05 / 1.0`（信赖域大小）、`plc.kl_coef=0`（只有代理目标）、`plc.trunc_cap=2`、
    `plc.weight_mode=early_prior`（不乘比率）、`plc.lam=0`（PLC 代码路径上的 GRPO）。
+   另有三个可选键（2026-11-13 加入，配置文件里不写，默认关闭，现有配置的 loss 逐位不变）：把前几轮拉回
+   **冻结初始模型**同一轮分布的锚定项。`plc.init_kl_coef`（强度，默认 0 = 关；> 0 时 PLC worker 额外加载
+   一份冻结的初始模型）、`plc.init_kl_form`（`k3`：r = P_init/P_new，|d| 小时等于 verl `low_var_kl`；`k3_reverse`：
+   r = P_new/P_init，默认；`k2`：½(log P_new − log P_init)²）、`plc.init_kl_log_ratio_cap`（默认 3，
+   |log 比值| 超过它后惩罚线性延伸，梯度有界）。典型用法 `plc.kl_coef=0 plc.init_kl_coef=0.05`
+   （用锚定项替换指向最后一轮的 KL）。锚定项乘 `lam`，实际强度是 `lam·init_kl_coef`，
+   `plc.lam=0` 时不能打开。
    `rltt_baseline_1p4b_8gpu.yaml` 是原作 REINFORCE 形式的 RLTT 对照。
    例外：`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` 是用户 2026-11-12 要求单独存的，等于 PLC 配置改
    `plc.kl_coef=0`（去掉正向 KL 项，只留代理目标），用来区分中间轮熵坍塌来自 KL 项还是代理目标。
    它登记在 `MATCHED_GROUPS` 里；`tests/test_plc.py` 检查它与 PLC 配置只差这一项和 wandb 命名，
    改 PLC 配置时要同步改它。
+   另有两个键（2026-11-13 加入，默认值让现有配置的 loss 逐位不变）选择前几轮的监督形式：
+   `plc.loop_loss`（`surrogate` 默认 = 上面的代理目标 + k1；`kd` = 在同一批第 4 轮 rollout 的每个
+   回答位置上，把第 1–3 轮向 **stop-gradient 的第 4 轮**做全词表蒸馏，权重固定 α_t = 1/3，不用 advantage）
+   和 `plc.kd_divergence`（`forward` = KL(sg P^(4) ‖ P^(t))，默认；`reverse` = KL(P^(t) ‖ sg P^(4))）。
+   `kd` 要求 `weight_mode: early_prior`、`kl_coef: 0`，可以叠加锚定项。蒸馏项来自模型 forward 的
+   `return_loop_kd`，所以 **`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**（开关默认关闭，其他方法不受影响）。
+   `plc_grpo_loopkd_1p4b_8gpu.yaml` 是用户 2026-11-13 要求存的 kd 配置（forward，`lam` 0.1），登记在
+   `MATCHED_GROUPS` 里；`tests/test_loop_kd.py` 检查它与 PLC 配置只差 `plc` 段和 wandb 命名。
+   reverse 另存为 `plc_grpo_loopkd_rev_1p4b_8gpu.yaml`（用户 2026-11-13 要求）：只把 `kd_divergence` 改成
+   `reverse`、换 wandb 命名，`tests/test_plc.py` 检查这一点；改 forward 配置时要同步改它。
+   `plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml` 是用户 2026-11-13 要求存的：PLC 配置改
+   `trunc_cap: .inf`（去掉比率上界，用精确比率）、`kl_coef: 0`（去掉指向第 4 轮的 k1），加锚定项
+   `init_kl_coef: 0.1`、`init_kl_form: k3`。登记在 `MATCHED_GROUPS` 里；`tests/test_plc.py` 检查它与
+   PLC 配置只差 `plc` 段和 wandb 命名。它会加载冻结初始模型，每步耗时不能和 GRPO / RLTT 直接比较。
 
 两个组之间只差模型（1.4B / 2.6B，`model.num_hidden_layers` 24 / 48；
 `test_each_method_differs_between_sizes_only_in_the_model` 检查 GRPO、RLTT 的两份配置；PLC 暂无 2.6B 配置）：都是每步 64 题 × 8 条
@@ -114,6 +138,11 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
   `role_worker_mapping` 里去掉 `Role.RefPolicy`，所以 KL 关闭时三种方法都不加载参考模型，
   每步耗时可以直接比较。结果记录在 `rltt_baseline_resolved.json` 的 `reference_policy` 字段。
 - 要重新打开 KL，必须先解决 RLTT / PLC 没有参考模型的问题，否则三种方法的 KL 含义不同。
+- 例外：PLC 的 `plc.init_kl_coef > 0` 是**方法组件**，不是这里的共享 KL。它只对前几轮生效，由 PLC 的
+  actor worker 自己加载一份冻结、CPU offload 的初始模型（`actor_rollout_ref.model.path`，即
+  `LOOPRL_MODEL_DIR`；断点续训时不重新加载，锚点不变），每步多做一次逐轮前向。dry-run 的
+  `reference_policy` 这时以 `plc anchor` 开头；这类 run 的每步耗时不能和 GRPO / RLTT 直接比较，
+  实验记录里要写明。
 
 ## 随机种子：全部锁定 42
 

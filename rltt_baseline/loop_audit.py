@@ -10,6 +10,21 @@ far (loops are compared on the same context):
 - ``topk_ids``, ``topk_probs`` (n, T, k): each loop's k most likely tokens, most likely first.
   Full distributions are not stored: one vocabulary of float32 is about 200 KB per token and loop.
 
+Cross-loop distillation diagnostics (PLC ``loop_loss: kd``; recorded in every run, so methods
+compare directly; the last loop is the teacher):
+
+- ``teacher_topk_probs`` (n, T, k): P^(t) of the last loop's top-k tokens (its ``topk_ids``), so
+  ``sum_k`` is the mass loop t puts on the teacher's candidates;
+- ``kd_entropy_push_forward`` / ``kd_entropy_push_reverse`` (n, T): the first-order change of
+  loop t's entropy along one distillation step towards the last loop, per unit step
+  (``rltt_per_loop.kd_entropy_push``; negative = the step lowers the entropy; 0 for the last
+  loop). The forward one is also the expected push of PLC's ``k1`` trust region.
+
+The summary adds, per loop t < T, ``entropy_gap`` = H(P^(t)) - H(P^(T)) and ``below_teacher`` (the
+share of tokens where loop t is sharper than the last loop), and repeats the entropy, KL,
+``entropy_gap`` and push statistics separately for correct and wrong responses
+(``metrics_by_correct``): drift driven by the advantage shows up as a difference between the two.
+
 With ``loop_weights`` the audit also records the loop weights of each token (n, T):
 
 - ``exit_pdf``: the exit gate's distribution over loops, ``q_t = lambda_t prod_{s<t}(1 - lambda_s)``
@@ -56,11 +71,15 @@ import numpy as np
 import torch
 
 from rltt_baseline import plc
-from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates
+from rltt_baseline.ouro_rltt.rltt_per_loop import exit_pdf_from_gates, kd_entropy_push
 
 PREFIX = "loop_audit/"
 TOKEN_ARRAYS = ("sampled_token", "sampled_log_prob", "entropy", "kl", "topk_ids", "topk_probs")
 WEIGHT_ARRAYS = ("exit_pdf", "plc_weight")  # with loop_weights; plc_weight in PLC runs only
+KD_ARRAYS = ("teacher_topk_probs", "kd_entropy_push_forward", "kd_entropy_push_reverse")
+# summary columns repeated for correct and wrong responses (``metrics_by_correct``)
+SPLIT_PREFIXES = ("entropy/", "entropy_gap/", "below_teacher/", "kl/", "kd_entropy_push_",
+                  "teacher_topk_mass/", "xloop_log_rho/")
 
 
 def step_dir_name(step: int) -> str:
@@ -112,7 +131,8 @@ def distribution_stats(
 
     Returns:
         CPU tensors ``kl`` (n, T, T), ``entropy`` and ``sampled_log_prob`` (n, T), ``topk_ids``
-        and ``topk_probs`` (n, T, k), float32 except the ids.
+        and ``topk_probs`` (n, T, k), float32 except the ids, and the ``KD_ARRAYS``
+        (``teacher_topk_probs`` (n, T, k), ``kd_entropy_push_*`` (n, T)).
     """
     loops = len(hidden_list)
     parts = defaultdict(list)
@@ -133,6 +153,13 @@ def distribution_stats(
         parts["sampled_log_prob"].append(log_p.gather(-1, picked).squeeze(-1).cpu())
         parts["topk_ids"].append(top_ids.cpu())
         parts["topk_probs"].append(top_log_p.exp().cpu())
+        teacher_ids = top_ids[:, -1:, :].expand(-1, loops, -1)
+        parts["teacher_topk_probs"].append(log_p.gather(-1, teacher_ids).exp().cpu())
+        for divergence in ("forward", "reverse"):
+            push = log_p.new_zeros(log_p.shape[0], loops)
+            for t in range(loops - 1):
+                push[:, t] = kd_entropy_push(log_p[:, t], log_p[:, -1], divergence)
+            parts[f"kd_entropy_push_{divergence}"].append(push.cpu())
     return {name: torch.cat(chunks) for name, chunks in parts.items()}
 
 
@@ -280,7 +307,7 @@ class LoopAudit:
             if self._error is not None:
                 raise RuntimeError(self._error)
             names = TOKEN_ARRAYS + ("response_tokens", "prompt_tokens", "row_keys")
-            names += tuple(name for name in WEIGHT_ARRAYS
+            names += tuple(name for name in WEIGHT_ARRAYS + KD_ARRAYS
                            if self._records and all(name in r for r in self._records))
             arrays = {name: np.concatenate([r[name] for r in self._records]) for name in names}
             arrays["offsets"] = np.concatenate([[0], np.cumsum(arrays["response_tokens"])])
@@ -321,6 +348,18 @@ def token_metrics(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         columns[f"xloop_rho_min1/loop_{t + 1}"] = np.exp(np.minimum(log_rho, 0.0))
         columns[f"xloop_rho_gt_1/loop_{t + 1}"] = (log_rho > 0).astype(np.float32)
         columns[f"xloop_rho_lt_0.1/loop_{t + 1}"] = (log_rho < np.log(0.1)).astype(np.float32)
+    for t in range(loops - 1):
+        gap = entropy[:, t] - entropy[:, -1]
+        columns[f"entropy_gap/loop_{t + 1}"] = gap
+        columns[f"below_teacher/loop_{t + 1}"] = (gap < 0).astype(np.float32)
+        if "teacher_topk_probs" in arrays:
+            teacher = arrays["teacher_topk_probs"]
+            columns[f"teacher_top1_prob/loop_{t + 1}"] = teacher[:, t, 0]
+            columns[f"teacher_topk_mass/loop_{t + 1}"] = teacher[:, t].sum(-1)
+        for divergence in ("forward", "reverse"):
+            name = f"kd_entropy_push_{divergence}"
+            if name in arrays:
+                columns[f"{name}/loop_{t + 1}"] = arrays[name][:, t]
     for t in range(loops):
         columns[f"entropy/loop_{t + 1}"] = entropy[:, t]
         columns[f"sampled_log_prob/loop_{t + 1}"] = log_prob[:, t]
@@ -374,6 +413,7 @@ def finalize_step(step_dir: Path, rows: Dict[str, List[dict]], save_tokens: bool
     """Write ``responses.jsonl`` and ``summary.json`` from the rank shards; return wandb metrics."""
     shards = sorted(step_dir.glob("tokens_rank*.npz"))
     pooled = defaultdict(list)
+    by_correct = {"correct": defaultdict(list), "wrong": defaultdict(list)}
     gaps = []
     responses = unmatched = tokens = 0
     temperature = None
@@ -398,6 +438,10 @@ def finalize_step(step_dir: Path, rows: Dict[str, List[dict]], save_tokens: bool
                 else:
                     old_log_probs = row.pop("old_log_probs")
                     line.update(row)
+                    group = by_correct["correct" if row["correct"] else "wrong"]
+                    for name, values in columns.items():
+                        if name.startswith(SPLIT_PREFIXES):
+                            group[name].append(values[start:stop])
                     gaps.append(np.abs(arrays["sampled_log_prob"][start:stop, -1]
                                        - old_log_probs[:stop - start]))
                 line["stats"] = statistics({n: v[start:stop] for n, v in columns.items()})
@@ -407,11 +451,15 @@ def finalize_step(step_dir: Path, rows: Dict[str, List[dict]], save_tokens: bool
     (step_dir / "responses.partial").rename(step_dir / "responses.jsonl")
 
     stats = statistics({name: np.concatenate(parts) for name, parts in pooled.items()})
+    split_stats = {group: statistics({name: np.concatenate(parts)
+                                      for name, parts in columns.items()})
+                   for group, columns in by_correct.items()}
     errors = sorted(path.name for path in step_dir.glob("error_rank*.txt"))
     gap = float(np.concatenate(gaps).mean()) if gaps else None
     summary = {"responses": responses, "tokens": tokens, "ranks": len(shards),
                "temperature": temperature, "unmatched_responses": unmatched,
-               "last_loop_log_prob_gap": gap, "errors": errors, "metrics": stats}
+               "last_loop_log_prob_gap": gap, "errors": errors, "metrics": stats,
+               "metrics_by_correct": split_stats}
     (step_dir / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     if not save_tokens:
         for shard in shards:
@@ -419,6 +467,9 @@ def finalize_step(step_dir: Path, rows: Dict[str, List[dict]], save_tokens: bool
 
     metrics = {f"{PREFIX}{name}/{stat}": value for name, values in stats.items()
                for stat, value in values.items()}
+    metrics.update({f"{PREFIX}{group}/{name}/mean": values["mean"]
+                    for group, group_stats in split_stats.items()
+                    for name, values in group_stats.items()})
     metrics.update({PREFIX + "responses": float(responses), PREFIX + "tokens": float(tokens),
                     PREFIX + "unmatched_responses": float(unmatched),
                     PREFIX + "error_ranks": float(len(errors))})
@@ -450,7 +501,7 @@ def read_response(step_dir, rank: int, index: int, tokenizer=None) -> Dict[str, 
     """
     with np.load(Path(step_dir) / f"tokens_rank{rank:02d}.npz") as data:
         start, stop = data["offsets"][index], data["offsets"][index + 1]
-        out = {name: data[name][start:stop] for name in TOKEN_ARRAYS + WEIGHT_ARRAYS
+        out = {name: data[name][start:stop] for name in TOKEN_ARRAYS + WEIGHT_ARRAYS + KD_ARRAYS
                if name in data.files}
     if tokenizer is not None:
         out["topk_tokens"] = [[tokenizer.convert_ids_to_tokens(ids.tolist()) for ids in loops]

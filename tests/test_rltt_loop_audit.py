@@ -613,3 +613,28 @@ def test_resumed_audit_starts_after_the_loaded_checkpoint(env, tmp_path):
         first_step({"resume_mode": "resume_path", "resume_from_path": str(tmp_path)})
     with pytest.raises(ValueError, match="resume_mode"):
         first_step({"resume_mode": "latest"})
+
+
+def test_audit_splits_the_kd_diagnostics_by_correctness(tmp_path):
+    actor = FakeActor()
+    la.attach_loop_audit(actor, settings(tmp_path), rank=0)
+    _, metrics = run_step(actor, tmp_path)
+    step_dir = tmp_path / la.step_dir_name(1)
+    summary = json.loads((step_dir / "summary.json").read_text())
+    with np.load(step_dir / "tokens_rank00.npz") as shard:
+        assert set(la.KD_ARRAYS) <= set(shard.files)
+        assert shard["teacher_topk_probs"].shape[1:] == (LOOPS, 3)
+    split = summary["metrics_by_correct"]
+    assert set(split) == {"correct", "wrong"}
+    for group in split.values():
+        assert {"entropy_gap/loop_1", "below_teacher/loop_3", "kl/4_1",
+                "kd_entropy_push_forward/loop_2", "teacher_topk_mass/loop_1"} <= set(group)
+        assert "top1_agree/1_4" not in group      # only the SPLIT_PREFIXES columns
+    lines = responses_of(step_dir)
+    wrong = np.concatenate([la.read_response(step_dir, 0, line["index"])["entropy"]
+                            for line in lines if not line["correct"]])
+    assert split["wrong"]["entropy/loop_2"]["mean"] == pytest.approx(float(wrong[:, 1].mean()))
+    assert metrics["loop_audit/correct/entropy_gap/loop_1/mean"] == \
+        split["correct"]["entropy_gap/loop_1"]["mean"]
+    token = la.read_response(step_dir, 0, 0)
+    assert set(la.KD_ARRAYS) <= set(token)

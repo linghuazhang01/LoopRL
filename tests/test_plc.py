@@ -161,6 +161,134 @@ def test_trust_region_needs_kl_weights_and_kl_coef_0_changes_nothing():
     assert torch.equal(a, b)
 
 
+# ---------- anchor to the initial model ----------
+
+def _anchor_closed_form(d, form):
+    """(value, slope) of the anchor penalty inside the cap."""
+    if form == "k3":
+        return torch.exp(-d) + d - 1, 1 - torch.exp(-d)
+    if form == "k3_reverse":
+        return torch.exp(d) - d - 1, torch.exp(d) - 1
+    return 0.5 * d * d, d
+
+
+@pytest.mark.parametrize("form", plc.INIT_KL_FORMS)
+def test_anchor_penalty_value_and_slope_inside_the_cap(form):
+    g = torch.Generator().manual_seed(31)
+    logp_init = -torch.rand(4, 6, T, generator=g) * 4
+    d = (torch.rand(4, 6, T, generator=g) * 2 - 1) * 2.9          # |d| < cap 3
+    logp_new = (logp_init + d).requires_grad_(True)
+    pen = plc.init_anchor_penalty(logp_new, logp_init, form, 3.0)
+    value, slope = _anchor_closed_form(d, form)
+    assert torch.allclose(pen, value, atol=1e-5)
+    assert (pen >= 0).all()
+    grad = torch.autograd.grad(pen.sum(), logp_new)[0]
+    assert torch.allclose(grad, slope, atol=1e-5)
+    # zero penalty and zero gradient at the initial model
+    at_init = logp_init.clone().requires_grad_(True)
+    pen0 = plc.init_anchor_penalty(at_init, logp_init, form, 3.0)
+    assert torch.all(pen0 == 0)
+    assert torch.all(torch.autograd.grad(pen0.sum(), at_init)[0] == 0)
+
+
+def test_anchor_k3_is_verl_low_var_kl_with_the_initial_model_as_reference():
+    g = torch.Generator().manual_seed(32)
+    logp_init = -torch.rand(3, 5, T, generator=g) * 4
+    logp_new = logp_init + (torch.rand(3, 5, T, generator=g) * 2 - 1) * 2.5
+    assert torch.allclose(plc.init_anchor_penalty(logp_new, logp_init, "k3", 3.0),
+                          plc.low_var_kl(logp_new, logp_init), atol=1e-6)
+
+
+def test_anchor_directions_differ_on_raised_and_lowered_tokens():
+    # a token raised from 0.1 to 0.8, and one lowered from 0.8 to 0.1
+    logp_init = torch.log(torch.tensor([0.1, 0.8]))
+    logp_new = torch.log(torch.tensor([0.8, 0.1])).requires_grad_(True)
+    slopes = {}
+    for form in plc.INIT_KL_FORMS:
+        pen = plc.init_anchor_penalty(logp_new, logp_init, form, 3.0)
+        slopes[form] = torch.autograd.grad(pen.sum(), logp_new)[0]
+    assert slopes["k3"][0] == pytest.approx(0.875) and slopes["k3"][1] == pytest.approx(-7.0)
+    assert slopes["k3_reverse"][0] == pytest.approx(7.0)
+    assert slopes["k3_reverse"][1] == pytest.approx(-0.875)
+    assert slopes["k2"][0] == pytest.approx(float(torch.log(torch.tensor(8.0))), rel=1e-5)
+    assert slopes["k2"][1] == pytest.approx(-float(torch.log(torch.tensor(8.0))), rel=1e-5)
+
+
+@pytest.mark.parametrize("form", plc.INIT_KL_FORMS)
+def test_anchor_penalty_turns_linear_beyond_the_cap(form):
+    cap = 3.0
+    logp_init = torch.zeros(6) - 5.0
+    d = torch.tensor([-50.0, -4.0, -cap, cap, 4.0, 50.0])
+    logp_new = (logp_init + d).requires_grad_(True)
+    pen = plc.init_anchor_penalty(logp_new, logp_init, form, cap)
+    grad = torch.autograd.grad(pen.sum(), logp_new)[0]
+    value_cap, slope_cap = _anchor_closed_form(torch.tensor([-cap, cap]), form)
+    # gradient bounded by the slope at the cap, never zero, never inf
+    assert torch.allclose(grad[:3], slope_cap[0].expand(3), atol=1e-5)
+    assert torch.allclose(grad[3:], slope_cap[1].expand(3), atol=1e-5)
+    assert torch.isfinite(pen).all() and (grad != 0).all()
+    pen = pen.detach()
+    # continuous at the cap, linear beyond it
+    assert pen[2] == pytest.approx(float(value_cap[0]), rel=1e-5)
+    assert pen[3] == pytest.approx(float(value_cap[1]), rel=1e-5)
+    assert pen[4] == pytest.approx(float(value_cap[1] + slope_cap[1] * (4.0 - cap)), rel=1e-5)
+    assert pen[1] == pytest.approx(float(value_cap[0] - slope_cap[0] * (4.0 - cap)), rel=1e-5)
+
+
+@pytest.mark.parametrize("form", plc.INIT_KL_FORMS)
+def test_anchor_gradient_reaches_only_the_earlier_loops(form):
+    # loss = PLC + lam * init_kl_coef * token-mean(sum_{t<T} alpha_t pen_t): the extra gradient
+    # on loop t < T is lam * coef * alpha_t * slope_t / N; the final loop keeps GRPO's
+    ell_old, ell_new, adv, mask = _random_batch(B=5, L=6, seed=33)
+    w = plc.compute_loop_weights(ell_old, "is_trunc")
+    alpha = plc.compute_loop_weights(ell_old, "early_prior")
+    ell_init = ell_old - 0.4 * torch.randn(5, 6, T, generator=torch.Generator().manual_seed(3))
+    lam, coef = 0.1, 0.5
+    ell_new = ell_new.requires_grad_(True)
+    base, _ = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=lam, clip_ratio=0.2)
+    loss, metrics = plc.plc_policy_loss(
+        ell_new, ell_old, adv, mask, w, lam=lam, clip_ratio=0.2, init_kl_coef=coef,
+        logp_init=ell_init, init_weights=alpha, init_kl_form=form)
+    g_base = torch.autograd.grad(base, ell_new)[0]
+    g = torch.autograd.grad(loss, ell_new)[0]
+    d = (ell_new - ell_init).detach()
+    _, slope = _anchor_closed_form(d.clamp(-3, 3), form)
+    n = mask.sum()
+    expected = lam * coef * alpha[..., :-1] * slope[..., :-1] * mask[..., None] / n
+    assert torch.allclose(g[..., :-1] - g_base[..., :-1], expected, atol=1e-6)
+    assert torch.equal(g[..., -1], g_base[..., -1])
+    pen = plc.init_anchor_penalty(ell_new.detach(), ell_init, form, 3.0)
+    term = plc.agg_loss((alpha * pen).sum(-1), mask, "token-mean")
+    assert torch.allclose(loss - base, lam * coef * term, atol=1e-6)
+    assert metrics["plc/init_term_mean"] == pytest.approx(float(term), abs=1e-6)
+    flat = plc.flatten_loop_metrics(metrics)
+    for name in ("init_pen", "init_log_ratio", "init_beyond_cap_frac"):
+        assert [f"plc/{name}/loop_{t}" in flat for t in range(1, T + 1)] == [True] * T
+
+
+def test_anchor_needs_its_tensors_and_coef_0_changes_nothing():
+    ell_old, ell_new, adv, mask = _random_batch(seed=34)
+    w = plc.compute_loop_weights(ell_old, "is_trunc")
+    alpha = plc.compute_loop_weights(ell_old, "early_prior")
+    for kwargs in ({}, {"logp_init": ell_old}, {"init_weights": alpha},
+                   {"logp_init": ell_old[..., :2], "init_weights": alpha}):
+        with pytest.raises(ValueError, match="init_kl_coef"):
+            plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                                init_kl_coef=0.1, **kwargs)
+    with pytest.raises(ValueError, match="init_kl_coef"):
+        plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                            init_kl_coef=-0.1, logp_init=ell_old, init_weights=alpha)
+    with pytest.raises(ValueError, match="init_kl_form"):
+        plc.init_anchor_penalty(ell_new, ell_old, "k1")
+    a, ma = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                                kl_coef=0.2, kl_weights=alpha)
+    b, mb = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, lam=0.1, clip_ratio=0.2,
+                                kl_coef=0.2, kl_weights=alpha, init_kl_coef=0.0,
+                                logp_init=ell_old, init_weights=alpha, init_kl_form="k2")
+    assert torch.equal(a, b) and ma == mb
+    assert not any(k.startswith("plc/init") for k in ma)
+
+
 def test_policy_loss_rejects_bad_shapes():
     ell_old, ell_new, adv, mask = _random_batch()
     w = plc.compute_loop_weights(ell_old, "is_trunc")
@@ -277,6 +405,14 @@ def test_settings_defaults_are_the_loopaux_values():
     s = plc.PLCSettings.from_mapping({"enabled": True, "lam": 2, "trunc_cap": 2, "kl_coef": 0})
     assert isinstance(s.lam, float) and s.lam == 2.0 and s.trunc_cap == 2.0
     assert "kl_coef=0.0" in s.describe()
+    assert s.init_kl_coef == 0.0 and s.init_kl_form == "k3_reverse"
+    assert s.init_kl_log_ratio_cap == 3.0 and not s.uses_init_model
+    assert "init_kl_form" not in s.describe()
+    s = plc.PLCSettings.from_mapping({"enabled": True, "init_kl_coef": 1, "init_kl_form": "k2"})
+    assert s.uses_init_model and isinstance(s.init_kl_coef, float)
+    assert "init_kl_coef=1.0 init_kl_form=k2 init_kl_log_ratio_cap=3.0" in s.describe()
+    # the frozen model is only loaded for an enabled PLC run
+    assert not plc.PLCSettings.from_mapping({"init_kl_coef": 1}).uses_init_model
 
 
 @pytest.mark.parametrize("values, error, match", [
@@ -290,6 +426,12 @@ def test_settings_defaults_are_the_loopaux_values():
     ({"trunc_cap": 0.5}, ValueError, "trunc_cap"),
     ({"weight_mode": "early_prior", "trunc_cap": 2.0}, ValueError, "trunc_cap"),
     ({"kl_coef": -0.1}, ValueError, "kl_coef"),
+    ({"init_kl_coef": -0.1}, ValueError, "init_kl_coef"),
+    ({"init_kl_coef": "0.1"}, TypeError, "number"),
+    ({"init_kl_form": "k1"}, ValueError, "init_kl_form"),
+    ({"init_kl_form": 3}, TypeError, "string"),
+    ({"init_kl_log_ratio_cap": 0}, ValueError, "init_kl_log_ratio_cap"),
+    ({"lam": 0.0, "init_kl_coef": 0.1}, ValueError, "lam > 0"),     # zero gradient, full cost
 ])
 def test_settings_are_validated(values, error, match):
     with pytest.raises(error, match=match):
@@ -321,12 +463,19 @@ def test_loopaux_config_resolves_to_the_loopaux_settings(env):
     overrides = rcfg.add_plc_overrides(cfg, rcfg.verl_overrides(cfg), _args())
     actor = overrides["actor_rollout_ref"]["actor"]
     assert actor["plc"] == {"enabled": True, "weight_mode": "is_trunc", "lam": 0.1,
-                            "trunc_cap": 1.0, "kl_coef": 0.2, "log_weight_stats": True}
+                            "trunc_cap": 1.0, "kl_coef": 0.2, "log_weight_stats": True,
+                            "init_kl_coef": 0.0, "init_kl_form": "k3_reverse",
+                            "init_kl_log_ratio_cap": 3.0, "loop_loss": "surrogate",
+                            "kd_divergence": "forward"}
     assert actor["ppo_mini_batch_size"] == 64 and overrides["data"]["train_batch_size"] == 64
     assert rcfg.wandb_env(cfg)["WANDB_TAGS"].startswith("plc,")
     # every ablation in the config header is a valid override
     for overrides in (["plc.kl_coef=0.05"], ["plc.kl_coef=1.0"], ["plc.kl_coef=0"],
-                      ["plc.trunc_cap=2"], ["plc.weight_mode=early_prior"], ["plc.lam=0"]):
+                      ["plc.trunc_cap=2"], ["plc.weight_mode=early_prior"], ["plc.lam=0"],
+                      ["plc.kl_coef=0", "plc.init_kl_coef=0.1"],
+                      ["plc.init_kl_coef=0.1", "plc.init_kl_form=k3"],
+                      ["plc.init_kl_coef=0.1", "plc.init_kl_form=k2",
+                       "plc.init_kl_log_ratio_cap=2"]):
         assert rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_CONFIG), overrides)).enabled
     with pytest.raises(KeyError, match="unknown plc keys"):
         rcfg.load_config(str(LOOPAUX_CONFIG), ["plc.loop_baseline=group"])
@@ -344,6 +493,17 @@ def test_plc_overrides_require_the_rltt_trainer_and_per_loop_model(env):
                             ["plc.enabled=true"])
     with pytest.raises(ValueError, match="trainer=rltt"):
         rcfg.add_plc_overrides(grpo, {}, _args())
+
+
+@pytest.mark.parametrize("values, status", [
+    (None, "none"),
+    ({"enabled": True, "init_kl_coef": 0.0}, "none"),
+    ({"enabled": False, "init_kl_coef": 0.1}, "none"),
+    ({"enabled": True, "init_kl_coef": 0.1}, "plc anchor"),
+])
+def test_reference_policy_status_reports_the_plc_anchor(values, status):
+    overrides = {"actor_rollout_ref": {"actor": {"plc": values} if values else {}}}
+    assert rcfg.reference_policy_status("rltt", overrides).startswith(status)
 
 
 def test_other_configs_have_plc_off(env):
@@ -367,6 +527,68 @@ def test_loopaux_nokl_config_is_the_loopaux_config_without_the_kl_term(env):
     assert rcfg.plc_settings(rcfg.load_config(str(LOOPAUX_NOKL_CONFIG), ["plc.lam=0"])).enabled
 
 
+NOCAP_REFKL_CONFIG = paths.config_file("plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml")
+
+
+def test_nocap_refkl_config_is_the_loopaux_config_with_the_exact_ratio_and_the_anchor(env):
+    # saved at the user's request (2026-11-13): trunc_cap 1 -> inf, kl_coef 0.2 -> 0, anchor on
+    loopaux = OmegaConf.to_container(rcfg.load_config(str(LOOPAUX_CONFIG)))
+    cfg = OmegaConf.to_container(rcfg.load_config(str(NOCAP_REFKL_CONFIG)))
+    assert cfg["plc"] == {"enabled": True, "weight_mode": "is_trunc", "lam": 0.1,
+                          "trunc_cap": float("inf"), "kl_coef": 0.0, "log_weight_stats": True,
+                          "init_kl_coef": 0.1, "init_kl_form": "k3",
+                          "init_kl_log_ratio_cap": 3.0}
+    for c in (cfg, loopaux):
+        c.pop("plc")
+        for key in ("run_name", "tags"):
+            c["wandb"].pop(key)
+    assert cfg == loopaux
+    s = rcfg.plc_settings(rcfg.load_config(str(NOCAP_REFKL_CONFIG)))
+    assert s.enabled and s.uses_init_model and s.trunc_cap == float("inf")
+    ell = -torch.rand(2, 3, T, generator=torch.Generator().manual_seed(5)) * 6
+    exact = torch.exp(ell[..., :-1] - ell[..., -1:]) / (T - 1)
+    assert torch.allclose(plc.compute_loop_weights(ell, s.weight_mode, s.trunc_cap)[..., :-1],
+                          exact)
+    for overrides in (["plc.init_kl_coef=0"], ["plc.init_kl_form=k3_reverse"],
+                      ["plc.kl_coef=0.2"], ["plc.trunc_cap=1"]):
+        assert rcfg.plc_settings(rcfg.load_config(str(NOCAP_REFKL_CONFIG), overrides)).enabled
+
+
+def test_nocap_refkl_dry_run_reports_the_anchor(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(NOCAP_REFKL_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    values = resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["plc"]
+    assert values["trunc_cap"] == float("inf") and values["kl_coef"] == 0.0
+    assert values["init_kl_coef"] == 0.1 and values["init_kl_form"] == "k3"
+    assert resolved["reference_policy"].startswith("plc anchor")
+    assert resolved["config"]["wandb"]["run_name"] == "plc-grpo-loopaux-nocap-refkl-1p4b"
+
+
+LOOPKD_CONFIG = paths.config_file("plc_grpo_loopkd_1p4b_8gpu.yaml")
+LOOPKD_REV_CONFIG = paths.config_file("plc_grpo_loopkd_rev_1p4b_8gpu.yaml")
+
+
+def test_loopkd_rev_config_is_the_loopkd_config_with_the_reverse_kl(env):
+    # saved at the user's request (2026-11-13): plc.kd_divergence forward -> reverse, nothing else
+    forward = OmegaConf.to_container(rcfg.load_config(str(LOOPKD_CONFIG)))
+    cfg = OmegaConf.to_container(rcfg.load_config(str(LOOPKD_REV_CONFIG)))
+    assert forward["plc"].pop("kd_divergence") == "forward"
+    assert cfg["plc"].pop("kd_divergence") == "reverse"
+    assert cfg["wandb"]["run_name"] == "plc-grpo-loopkd-rev-1p4b"
+    for c in (cfg, forward):
+        for key in ("run_name", "tags"):
+            c["wandb"].pop(key)
+    assert cfg == forward
+    s = rcfg.plc_settings(rcfg.load_config(str(LOOPKD_REV_CONFIG)))
+    assert s.enabled and s.loop_loss == "kd" and s.kd_divergence == "reverse" and s.lam == 0.1
+    assert s.weight_mode == "early_prior" and s.kl_coef == 0.0 and not s.uses_init_model
+
+
 def test_loopaux_dry_run(env, capsys, monkeypatch):
     from rltt_baseline import launch
 
@@ -377,8 +599,28 @@ def test_loopaux_dry_run(env, capsys, monkeypatch):
     resolved = json.loads(capsys.readouterr().out)
     actor = resolved["verl_overrides"]["actor_rollout_ref"]["actor"]
     assert actor["plc"] == {"enabled": True, "weight_mode": "is_trunc", "lam": 0.1,
-                            "trunc_cap": 2.0, "kl_coef": 0.2, "log_weight_stats": True}
+                            "trunc_cap": 2.0, "kl_coef": 0.2, "log_weight_stats": True,
+                            "init_kl_coef": 0.0, "init_kl_form": "k3_reverse",
+                            "init_kl_log_ratio_cap": 3.0, "loop_loss": "surrogate",
+                            "kd_divergence": "forward"}
     assert actor["ppo_mini_batch_size"] == 64 and actor["use_kl_loss"] is False
     assert resolved["vendor_args"]["use_rltt_model"] is True
     assert resolved["vendor_args"]["rltt_model_path"] == ENV["LOOPRL_MODEL_DIR"]
     assert resolved["vendor_args"]["n_gpus"] == 8
+    assert resolved["reference_policy"].startswith("none")
+
+
+def test_anchor_dry_run_reports_the_frozen_initial_model(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONPATH"):
+        monkeypatch.setenv(key, "")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert launch.main(["--config", str(LOOPAUX_CONFIG), "--dry-run", "plc.kl_coef=0",
+                        "plc.init_kl_coef=0.05", "plc.init_kl_form=k2"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    values = resolved["verl_overrides"]["actor_rollout_ref"]["actor"]["plc"]
+    assert values["kl_coef"] == 0.0 and values["init_kl_coef"] == 0.05
+    assert values["init_kl_form"] == "k2" and values["init_kl_log_ratio_cap"] == 3.0
+    assert resolved["reference_policy"].startswith("plc anchor")
+    assert resolved["cli_overrides"][-1] == "plc.init_kl_form=k2"

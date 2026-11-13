@@ -42,8 +42,13 @@ A config file has these top-level keys:
     earlier loops, ``trainer: rltt`` only. Keys and defaults are the fields of
     ``plc.PLCSettings``: ``enabled`` (false), ``weight_mode`` (is_trunc | early_prior),
     ``lam`` (0.1; 0 = GRPO), ``trunc_cap`` (1; upper cap of the cross-loop ratio, is_trunc only),
-    ``kl_coef`` (0.2; forward-KL trust region of the earlier loops towards the final loop) and
-    ``log_weight_stats``. When enabled
+    ``kl_coef`` (0.2; forward-KL trust region of the earlier loops towards the final loop),
+    ``log_weight_stats``, and the anchor of the earlier loops to the frozen initial model:
+    ``init_kl_coef`` (0 = off; > 0 loads the frozen model), ``init_kl_form`` (k3 | k3_reverse |
+    k2, default k3_reverse) and ``init_kl_log_ratio_cap`` (3; where the penalty turns linear),
+    and the earlier-loop loss form: ``loop_loss`` (surrogate | kd; kd = full-vocabulary
+    distillation towards the stop-gradient final loop) and ``kd_divergence`` (forward | reverse).
+    When enabled
     the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
     uses ``PLCActorRolloutRefWorker``.
 
@@ -563,9 +568,16 @@ def reference_policy_status(trainer: str, overrides: dict) -> str:
     """What the run does with the reference model, from the vendor defaults and ``overrides``.
 
     Mirrors the launcher at trainer construction: the RLTT script never registers a reference
-    worker; the GRPO script does, and the launcher removes it when neither KL uses it.
+    worker; the GRPO script does, and the launcher removes it when neither KL uses it. PLC with
+    ``plc.init_kl_coef > 0`` loads its own frozen copy of the initial model inside the actor
+    worker (``PLCActorRolloutRefWorker``), reported here because it costs a forward per step.
     """
     if trainer == "rltt":
+        plc_values = ((overrides.get("actor_rollout_ref") or {}).get("actor") or {}).get("plc")
+        if plc_values and PLCSettings.from_mapping(plc_values).uses_init_model:
+            return ("plc anchor: no vendor reference worker; the PLC actor worker loads a frozen, "
+                    "CPU-offloaded copy of the initial model (actor_rollout_ref.model.path) for "
+                    "plc.init_kl_coef and runs its per-loop forward once per step")
         return "none: the rltt vendor script registers no reference worker"
     actor = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
     kl_loss = actor.get("use_kl_loss", VENDOR_KL_LOSS[trainer])

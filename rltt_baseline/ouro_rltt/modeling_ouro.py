@@ -17,20 +17,26 @@ The RLTT repository (github.com/jonwill8/RLTT) loads ``Ouro-*-Thinking-RLTT`` th
 provides exactly that interface. Without those flags it defers to the official forward, so
 generation and the standard verl log-prob path (final loop) are unchanged.
 
+``return_loop_kd`` (PLC ``loop_loss: kd``, ``rltt_baseline.plc``) adds ``loop_kd`` (B, W, T-1):
+the full-vocabulary KL of every earlier loop towards the stop-gradient last loop
+(``loop_kd_divergence``: ``forward`` = KL(sg P^(T) || P^(t)), ``reverse`` = KL(P^(t) || sg P^(T)))
+on the last ``loop_kd_window`` predicting positions (the response tokens), and ``loop_kd_stats``
+(``rltt_per_loop.KD_STATS``, without grad).
+
 Model-config keys read here (written by ``prepare_model``):
     rltt_logprob_chunk_size (int | None), rltt_logprob_checkpoint (bool),
     rltt_detach_exit_pdf (bool).
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modeling_ouro_base import *  # noqa: F401,F403
 from .modeling_ouro_base import OuroForCausalLM as _OfficialOuroForCausalLM
-from .rltt_per_loop import exit_pdf_from_gates, per_loop_token_stats
+from .rltt_per_loop import exit_pdf_from_gates, per_loop_kd, per_loop_token_stats
 
 
 @dataclass
@@ -39,6 +45,8 @@ class RLTTCausalLMOutput(CausalLMOutputWithPast):
     per_loop_entropies: Optional[List[torch.Tensor]] = None
     per_loop_logits: Optional[List[torch.Tensor]] = None
     exit_pdf: Optional[torch.Tensor] = None
+    loop_kd: Optional[torch.Tensor] = None
+    loop_kd_stats: Optional[Dict[str, torch.Tensor]] = None
 
 
 class OuroForCausalLM(_OfficialOuroForCausalLM):
@@ -61,9 +69,13 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
         return_exit_pdf: bool = False,
         log_prob_labels: Optional[torch.LongTensor] = None,
         log_prob_temperature: float = 1.0,
+        return_loop_kd: bool = False,
+        loop_kd_divergence: str = "forward",
+        loop_kd_window: Optional[int] = None,
         **kwargs,
     ):
-        if not (return_per_loop_log_probs or return_per_loop_logits or return_exit_pdf):
+        if not (return_per_loop_log_probs or return_per_loop_logits or return_exit_pdf
+                or return_loop_kd):
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -114,6 +126,24 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
         if return_per_loop_logits:
             per_loop_logits = [self.lm_head(hidden) for hidden in hidden_states_list]
 
+        loop_kd = loop_kd_stats = None
+        if return_loop_kd:
+            hiddens = hidden_states_list
+            if loop_kd_window is not None:
+                # position i predicts token i + 1: the last W tokens are predicted by
+                # positions -W - 1 .. -2
+                window = int(loop_kd_window)
+                if not 0 < window < hiddens[0].shape[1]:
+                    raise ValueError(f"loop_kd_window {window} does not fit the sequence")
+                hiddens = [h[:, -window - 1:-1] for h in hiddens]
+            loop_kd, loop_kd_stats = per_loop_kd(
+                hiddens,
+                self.lm_head,
+                temperature=log_prob_temperature,
+                divergence=loop_kd_divergence,
+                chunk_size=getattr(self.config, "rltt_logprob_chunk_size", None),
+            )
+
         return RLTTCausalLMOutput(
             loss=None,
             logits=None,
@@ -122,6 +152,8 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
             per_loop_entropies=per_loop_entropies,
             per_loop_logits=per_loop_logits,
             exit_pdf=exit_pdf,
+            loop_kd=loop_kd,
+            loop_kd_stats=loop_kd_stats,
         )
 
 

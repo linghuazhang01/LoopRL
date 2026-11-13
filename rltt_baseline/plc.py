@@ -26,6 +26,45 @@ from above only (variance); ``kl_coef`` sets how far loop t may move from the fi
 update per step the per-token gradient on loop t is ``-(lam / N) alpha_t (rho A + kl_coef)
 d log P^(t)``. ``lam = 0`` is GRPO on this code path; ``kl_coef = 0`` is the surrogate alone;
 ``weight_mode = early_prior`` drops the ratio (``rho = 1``). The gate gets no gradient.
+
+Optional anchor to the initial model (``init_kl_coef > 0``; off by default): each earlier loop is
+also pulled back towards its own distribution in the frozen starting model, on the same sampled
+tokens,
+
+    + lam * init_kl_coef * agg_j[ sum_{t<T} alpha_t * pen(d[j, t]) ]
+    d[j, t] = log P^(t)(y_j) - log P_init^(t)(y_j)
+
+with ``pen`` chosen by ``init_kl_form`` (all three are 0 with zero gradient at d = 0):
+
+    k3          r = P_init / P_new :  e^{-d} + d - 1   (verl low_var_kl for small |d|; verl
+                clamps the value at 10, d < -2.48, with zero gradient beyond); per-token slope
+                1 - e^{-d}: at most 1 on raised tokens, unbounded on lowered ones
+    k3_reverse  r = P_new / P_init :  e^{d} - d - 1;   slope e^{d} - 1: unbounded on raised tokens
+                (the direction the rollout tokens of the final loop push), at most 1 on lowered
+    k2          d^2 / 2;                               slope d, symmetric in log space
+
+Beyond ``|d| > init_kl_log_ratio_cap`` the penalty continues linearly with its slope at the cap,
+so the value stays continuous and the per-token gradient is bounded. Unlike ``k1`` above, the
+anchor is a fixed point of loop t itself: the sampled-token ``k1`` to the initial model would have
+the same gradient as the ``k1`` to the final loop, because ``log P_init`` carries no gradient.
+
+``loop_loss`` selects the earlier-loop term. ``surrogate`` (default) is everything above.
+``kd`` replaces the surrogate and the ``k1`` trust region by full-vocabulary distillation towards
+the stop-gradient final loop on the same rollouts (the final loop's own samples), with fixed
+weights and no advantage:
+
+    loss = -agg_j[ PPO_j^(T)(A) ]  +  lam * sum_{t<T} alpha_t * agg_j[ D_j^(t) ]
+    D_j^(t) = KL( sg P^(T)(.|s_j) || P^(t)(.|s_j) )     kd_divergence = forward
+            = KL( P^(t)(.|s_j) || sg P^(T)(.|s_j) )     kd_divergence = reverse
+
+over the full vocabulary at every response position ``s_j = (x, y_<j)``, ``alpha_t = 1 / (T - 1)``.
+The gradient on loop t's logits is ``(lam / N) alpha_t (P^(t) - P^(T))`` (forward) or
+``(lam / N) alpha_t P^(t) (log P^(t) - log P^(T) - D)`` (reverse). The forward form is the exact
+expectation, over the sampled token, of the ``k1`` trust region (its gradient ``P^(t) - e_y``
+averages to ``P^(t) - P^(T)`` under ``y ~ P^(T)``). ``kd`` needs ``weight_mode = early_prior``
+and ``kl_coef = 0``; the anchor (``init_kl_coef``) can be added on top. ``D`` comes from the
+model forward (``return_loop_kd``, ``rltt_per_loop.per_loop_kd``), since it needs every loop's
+logits.
 """
 
 import math
@@ -35,6 +74,9 @@ from typing import Dict, Mapping, Optional, Tuple
 import torch
 
 WEIGHT_MODES = ("is_trunc", "early_prior")
+INIT_KL_FORMS = ("k3", "k3_reverse", "k2")
+LOOP_LOSSES = ("surrogate", "kd")
+KD_DIVERGENCES = ("forward", "reverse")
 LOSS_AGG_MODES = ("token-mean", "seq-mean-token-sum", "seq-mean-token-mean",
                   "seq-mean-token-sum-norm")
 LOG_EPS = 1e-8
@@ -50,6 +92,11 @@ class PLCSettings:
     trunc_cap: float = 1.0              # is_trunc: upper cap c of the cross-loop ratio (>= 1)
     kl_coef: float = 0.2                # forward-KL trust region of the earlier loops
     log_weight_stats: bool = True
+    init_kl_coef: float = 0.0           # anchor of the earlier loops to the initial model; 0 = off
+    init_kl_form: str = "k3_reverse"    # k3 | k3_reverse | k2 (see the module docstring)
+    init_kl_log_ratio_cap: float = 3.0  # |log P^(t) - log P_init^(t)| where pen turns linear
+    loop_loss: str = "surrogate"        # surrogate (above) | kd (full-vocabulary distillation)
+    kd_divergence: str = "forward"      # kd: forward KL(sg P^(T) || P^(t)) | reverse
 
     @classmethod
     def from_mapping(cls, values: Optional[Mapping]) -> "PLCSettings":
@@ -86,10 +133,46 @@ class PLCSettings:
             raise ValueError("plc.trunc_cap only applies to plc.weight_mode=is_trunc")
         if self.kl_coef < 0:
             raise ValueError("plc.kl_coef must be >= 0")
+        if self.init_kl_coef < 0:
+            raise ValueError("plc.init_kl_coef must be >= 0")
+        if self.init_kl_form not in INIT_KL_FORMS:
+            raise ValueError(f"plc.init_kl_form must be one of {INIT_KL_FORMS}")
+        if self.init_kl_log_ratio_cap <= 0:
+            raise ValueError("plc.init_kl_log_ratio_cap must be > 0")
+        if self.init_kl_coef > 0 and self.lam == 0:
+            # the anchor is scaled by lam: it would load the frozen model for a zero gradient
+            raise ValueError("plc.init_kl_coef > 0 needs plc.lam > 0 (the anchor is scaled by "
+                             "lam; its strength is lam * init_kl_coef)")
+        if self.loop_loss not in LOOP_LOSSES:
+            raise ValueError(f"plc.loop_loss must be one of {LOOP_LOSSES}")
+        if self.kd_divergence not in KD_DIVERGENCES:
+            raise ValueError(f"plc.kd_divergence must be one of {KD_DIVERGENCES}")
+        if self.loop_loss == "kd":
+            if self.weight_mode != "early_prior":
+                raise ValueError("plc.loop_loss=kd uses the fixed weights alpha_t: set "
+                                 "plc.weight_mode=early_prior")
+            if self.kl_coef != 0:
+                raise ValueError("plc.loop_loss=kd replaces the k1 trust region: set "
+                                 "plc.kl_coef=0")
+        elif self.kd_divergence != "forward":
+            raise ValueError("plc.kd_divergence only applies to plc.loop_loss=kd")
+
+    @property
+    def uses_init_model(self) -> bool:
+        """True when the worker must load the frozen initial model (``init_kl_coef > 0``)."""
+        return self.enabled and self.init_kl_coef > 0
 
     def describe(self) -> str:
-        return (f"weight_mode={self.weight_mode} lam={self.lam} trunc_cap={self.trunc_cap} "
-                f"kl_coef={self.kl_coef}")
+        if self.loop_loss == "kd":
+            text = (f"loop_loss=kd kd_divergence={self.kd_divergence} lam={self.lam} "
+                    f"init_kl_coef={self.init_kl_coef}")
+        else:
+            text = (f"weight_mode={self.weight_mode} lam={self.lam} trunc_cap={self.trunc_cap} "
+                    f"kl_coef={self.kl_coef} init_kl_coef={self.init_kl_coef}")
+        if self.init_kl_coef > 0:
+            text += (f" init_kl_form={self.init_kl_form} "
+                     f"init_kl_log_ratio_cap={self.init_kl_log_ratio_cap}")
+        return text
 
 
 # ---------- weights ----------
@@ -170,6 +253,32 @@ def ppo_objective(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: to
     return -losses, info
 
 
+def init_anchor_penalty(logp_new: torch.Tensor, logp_init: torch.Tensor, form: str,
+                        log_ratio_cap: float = 3.0) -> torch.Tensor:
+    """Per-element anchor penalty from ``d = logp_new - logp_init`` (``logp_init`` detached).
+
+    ``k3``: ``e^{-d} + d - 1`` (verl ``low_var_kl`` with ``r = P_init / P_new``); ``k3_reverse``:
+    ``e^{d} - d - 1`` (``r = P_new / P_init``); ``k2``: ``d^2 / 2``. For ``|d| > log_ratio_cap``
+    the penalty is extended linearly with its slope at the cap (continuous value, gradient
+    ``slope(+-cap)``), so no token's gradient can blow up and none is dropped.
+    """
+    if form not in INIT_KL_FORMS:
+        raise ValueError(f"unknown init_kl_form {form!r}; allowed {INIT_KL_FORMS}")
+    if log_ratio_cap <= 0:
+        raise ValueError("log_ratio_cap must be > 0")
+    d = logp_new - logp_init.detach()
+    dc = d.clamp(-log_ratio_cap, log_ratio_cap)
+    if form == "k3":
+        value, slope = torch.exp(-dc) + dc - 1.0, 1.0 - torch.exp(-dc)
+    elif form == "k3_reverse":
+        value, slope = torch.exp(dc) - dc - 1.0, torch.exp(dc) - 1.0
+    else:
+        value, slope = 0.5 * dc * dc, dc
+    # inside the cap d - dc is 0 with zero gradient; outside, dc is constant and the slope term
+    # carries the gradient
+    return value + slope.detach() * (d - dc)
+
+
 def _masked_mean_per_loop(values: torch.Tensor, mask3: torch.Tensor) -> list:
     denom = mask3.sum(dim=(0, 1)).clamp_min(1.0)
     return ((values * mask3).sum(dim=(0, 1)) / denom).tolist()
@@ -180,15 +289,23 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
                     clip_ratio: float, loss_agg_mode: str = "token-mean",
                     clip_ratio_low: Optional[float] = None, clip_ratio_high: Optional[float] = None,
                     clip_ratio_c: float = 3.0, kl_coef: float = 0.0,
-                    kl_weights: Optional[torch.Tensor] = None
+                    kl_weights: Optional[torch.Tensor] = None, init_kl_coef: float = 0.0,
+                    logp_init: Optional[torch.Tensor] = None,
+                    init_weights: Optional[torch.Tensor] = None,
+                    init_kl_form: str = "k3_reverse", init_kl_log_ratio_cap: float = 3.0
                     ) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """``-agg[PPO^(T)] - lam * agg[sum_t w PPO^(t)] + lam * kl_coef * agg[sum_t kl_w k1^(t)]``.
+    """``-agg[PPO^(T)] - lam * agg[sum_t w PPO^(t)] + lam * kl_coef * agg[sum_t kl_w k1^(t)]``
+    ``+ lam * init_kl_coef * agg[sum_t init_w pen^(t)]``.
 
     ``logp_new`` / ``logp_old``: ``[B, L, T]``; ``advantages``: ``[B]`` or ``[B, L]``;
     ``response_mask``: ``[B, L]``; ``weights``: ``[B, L, T]`` from ``compute_loop_weights``
     (treated as constants, 0 on the final loop). The trust region (``kl_coef > 0``) uses
     ``k1^(t) = logp_old[.., T] - logp_new[.., t]``, the sampled ``KL(P_old^(T) || P^(t))`` on the
     final loop's samples, weighted by ``kl_weights`` ``[B, L, T]`` (``alpha`` on t < T, 0 on T).
+    The anchor (``init_kl_coef > 0``) uses ``pen^(t) = init_anchor_penalty(logp_new[.., t],
+    logp_init[.., t])`` with ``logp_init`` ``[B, L, T]`` the frozen initial model's per-loop
+    log-probs of the same tokens, weighted by ``init_weights`` ``[B, L, T]`` (``alpha`` on t < T,
+    0 on T). ``init_kl_coef = 0`` leaves the loss bitwise unchanged.
     """
     if logp_new.shape != logp_old.shape or logp_new.dim() != 3:
         raise ValueError("logp_new and logp_old must both have shape [B, L, T]")
@@ -196,6 +313,11 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
         raise ValueError("kl_coef must be >= 0")
     if kl_coef > 0 and (kl_weights is None or kl_weights.shape != logp_new.shape):
         raise ValueError("kl_coef > 0 needs kl_weights of shape [B, L, T]")
+    if init_kl_coef < 0:
+        raise ValueError("init_kl_coef must be >= 0")
+    if init_kl_coef > 0 and (logp_init is None or logp_init.shape != logp_new.shape
+                             or init_weights is None or init_weights.shape != logp_new.shape):
+        raise ValueError("init_kl_coef > 0 needs logp_init and init_weights of shape [B, L, T]")
     if advantages.dim() == 1:
         advantages = advantages[:, None]
     adv3 = advantages.to(logp_new.dtype)[..., None]
@@ -211,6 +333,12 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
         k1 = logp_old.detach()[..., -1:] - logp_new                       # [B, L, T]
         kl_term = (kl_weights.detach().to(k1.dtype) * k1).sum(-1)          # [B, L]
         loss = loss + lam * kl_coef * agg_loss(kl_term, response_mask, loss_agg_mode)
+    init_pen = init_term = None
+    if init_kl_coef > 0:
+        init_pen = init_anchor_penalty(logp_new, logp_init.to(logp_new.dtype), init_kl_form,
+                                       init_kl_log_ratio_cap)                 # [B, L, T]
+        init_term = (init_weights.detach().to(init_pen.dtype) * init_pen).sum(-1)
+        loss = loss + lam * init_kl_coef * agg_loss(init_term, response_mask, loss_agg_mode)
 
     with torch.no_grad():
         mask = response_mask.to(ppo.dtype)
@@ -234,7 +362,103 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
             metrics["plc/kl_term_mean"] = agg_loss(kl_term, mask, "token-mean").item()
             metrics["plc/kl_k1_per_loop"] = _masked_mean_per_loop(k1.to(mask.dtype), mask3)
             metrics["plc/kl_k3_per_loop"] = _masked_mean_per_loop(k3.to(mask.dtype), mask3)
+        if init_term is not None:
+            # per loop, including the final one (weight 0 there: how far it moved, not trained)
+            d = (logp_new - logp_init).detach().to(mask.dtype)
+            metrics["plc/init_term_mean"] = agg_loss(init_term, mask, "token-mean").item()
+            metrics["plc/init_pen_per_loop"] = _masked_mean_per_loop(
+                init_pen.detach().to(mask.dtype), mask3)
+            metrics["plc/init_log_ratio_per_loop"] = _masked_mean_per_loop(d, mask3)
+            metrics["plc/init_beyond_cap_frac_per_loop"] = _masked_mean_per_loop(
+                (d.abs() > init_kl_log_ratio_cap).to(mask.dtype), mask3)
     return loss, metrics
+
+
+def plc_kd_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torch.Tensor,
+                response_mask: torch.Tensor, kd: torch.Tensor, lam: float, clip_ratio: float,
+                loss_agg_mode: str = "token-mean", clip_ratio_low: Optional[float] = None,
+                clip_ratio_high: Optional[float] = None, clip_ratio_c: float = 3.0,
+                init_kl_coef: float = 0.0, logp_init: Optional[torch.Tensor] = None,
+                init_kl_form: str = "k3_reverse", init_kl_log_ratio_cap: float = 3.0
+                ) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """``-agg[PPO^(T)] + lam * agg[sum_{t<T} alpha_t kd^(t)]`` (``loop_loss: kd``), plus
+    ``lam * init_kl_coef * agg[sum_{t<T} alpha_t pen^(t)]`` when the anchor is on.
+
+    ``logp_new`` / ``logp_old``: ``[B, L, T]`` (only the final loop's PPO enters the loss);
+    ``kd``: ``[B, L, T - 1]``, the per-position distillation losses of the earlier loops
+    (``rltt_per_loop.per_loop_kd``, with grad); ``alpha_t = 1 / (T - 1)``; ``logp_init``:
+    ``[B, L, T]`` as in ``plc_policy_loss``. ``lam = 0`` is GRPO on this code path.
+    """
+    if logp_new.shape != logp_old.shape or logp_new.dim() != 3:
+        raise ValueError("logp_new and logp_old must both have shape [B, L, T]")
+    num_loops = logp_new.shape[-1]
+    if tuple(kd.shape) != (*logp_new.shape[:2], num_loops - 1):
+        raise ValueError(f"kd must have shape [B, L, T - 1], got {tuple(kd.shape)}")
+    if init_kl_coef < 0:
+        raise ValueError("init_kl_coef must be >= 0")
+    if init_kl_coef > 0 and (logp_init is None or logp_init.shape != logp_new.shape):
+        raise ValueError("init_kl_coef > 0 needs logp_init of shape [B, L, T]")
+    if advantages.dim() == 1:
+        advantages = advantages[:, None]
+    adv3 = advantages.to(logp_new.dtype)[..., None]
+    ppo, info = ppo_objective(logp_new, logp_old.detach(), adv3, clip_ratio, clip_ratio_low,
+                              clip_ratio_high, clip_ratio_c)
+    final_term = ppo[..., -1]
+    alpha = 1.0 / (num_loops - 1)
+    kd_term = kd.float().sum(-1) * alpha                                       # [B, L]
+    loss = -agg_loss(final_term, response_mask, loss_agg_mode)
+    if lam > 0:
+        loss = loss + lam * agg_loss(kd_term, response_mask, loss_agg_mode)
+    init_pen = init_term = None
+    if init_kl_coef > 0:
+        init_pen = init_anchor_penalty(logp_new, logp_init.to(logp_new.dtype), init_kl_form,
+                                       init_kl_log_ratio_cap)                 # [B, L, T]
+        init_term = init_pen[..., :-1].sum(-1) * alpha
+        loss = loss + lam * init_kl_coef * agg_loss(init_term, response_mask, loss_agg_mode)
+
+    with torch.no_grad():
+        mask = response_mask.to(ppo.dtype)
+        mask3 = mask[..., None].expand_as(ppo)
+        metrics = {
+            "actor/pg_clipfrac": agg_loss(info["clipped"][..., -1], mask, "token-mean").item(),
+            "actor/ppo_kl": agg_loss(-info["negative_approx_kl"][..., -1], mask,
+                                     "token-mean").item(),
+            "actor/pg_clipfrac_lower": agg_loss(info["clipped_lower"][..., -1], mask,
+                                                "token-mean").item(),
+            "plc/clipfrac_per_loop": _masked_mean_per_loop(info["clipped"], mask3),
+            "plc/ratio_mean_per_loop": _masked_mean_per_loop(info["ratio"], mask3),
+            "plc/final_term_mean": agg_loss(final_term, mask, "token-mean").item(),
+            "plc/kd_term_mean": agg_loss(kd_term.detach(), mask, "token-mean").item(),
+            # entry t (t < T): the earlier loop's own distillation loss D^(t)
+            "plc/kd_loss_per_loop": _masked_mean_per_loop(
+                kd.detach().to(mask.dtype), mask[..., None].expand_as(kd)),
+        }
+        if init_term is not None:
+            d = (logp_new - logp_init).detach().to(mask.dtype)
+            metrics["plc/init_term_mean"] = agg_loss(init_term, mask, "token-mean").item()
+            metrics["plc/init_pen_per_loop"] = _masked_mean_per_loop(
+                init_pen.detach().to(mask.dtype), mask3)
+            metrics["plc/init_log_ratio_per_loop"] = _masked_mean_per_loop(d, mask3)
+            metrics["plc/init_beyond_cap_frac_per_loop"] = _masked_mean_per_loop(
+                (d.abs() > init_kl_log_ratio_cap).to(mask.dtype), mask3)
+    return loss, metrics
+
+
+@torch.no_grad()
+def kd_stats(stats: Mapping[str, torch.Tensor], response_mask: torch.Tensor
+             ) -> Dict[str, object]:
+    """Per earlier loop t < T, masked means of the ``rltt_per_loop.KD_STATS`` tensors
+    ``[B, L, T - 1]`` (``plc/kd_<name>/loop_t`` after ``flatten_loop_metrics``), plus the share
+    of response tokens where loop t is sharper than the final loop (``entropy_gap < 0``)."""
+    mask = response_mask.float()
+    out: Dict[str, object] = {}
+    for name, value in stats.items():
+        mask3 = mask[..., None].expand_as(value)
+        out[f"plc/kd_{name}_per_loop"] = _masked_mean_per_loop(value.float(), mask3)
+        if name == "entropy_gap":
+            out["plc/kd_below_teacher_frac_per_loop"] = _masked_mean_per_loop(
+                (value < 0).float(), mask3)
+    return out
 
 
 # ---------- diagnostics ----------
@@ -297,7 +521,10 @@ def flatten_loop_metrics(metrics: Mapping[str, object]) -> Dict[str, object]:
     the ``xloop_*`` statistics have T - 1 (the earlier loops 1..T-1 against the final loop). The
     ``loop_T`` entries of ``kl_k1`` / ``kl_k3`` / ``ratio_mean`` / ``clipfrac`` compare the final
     loop with its own old policy; ``kl_weights`` is 0 there, so they are not part of the trust
-    region. A list under ``<name>_per_transition`` becomes ``<name>/loop_<t>_to_<t+1>``. Scalars
+    region. Likewise the ``loop_T`` entries of ``init_pen`` / ``init_log_ratio`` /
+    ``init_beyond_cap_frac`` show how far the final loop moved from the initial model; the anchor
+    weight is 0 there. A list under ``<name>_per_transition`` becomes
+    ``<name>/loop_<t>_to_<t+1>``. Scalars
     pass through unchanged.
     """
     flat: Dict[str, object] = {}
@@ -325,7 +552,8 @@ def low_var_kl(logp: torch.Tensor, ref_logp: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "PLCSettings", "WEIGHT_MODES", "LOSS_AGG_MODES",
-    "compute_loop_weights", "agg_loss", "ppo_objective", "plc_policy_loss",
+    "PLCSettings", "WEIGHT_MODES", "LOSS_AGG_MODES", "INIT_KL_FORMS", "LOOP_LOSSES",
+    "KD_DIVERGENCES", "compute_loop_weights", "agg_loss", "ppo_objective", "init_anchor_penalty",
+    "plc_policy_loss", "plc_kd_loss", "kd_stats",
     "cross_loop_stats", "weight_stats", "flatten_loop_metrics", "low_var_kl",
 ]

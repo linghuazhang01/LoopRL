@@ -369,7 +369,10 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
                                   "grpo_baseline_1p4b_8gpu.yaml",
                                   "rltt_baseline_1p4b_8gpu.yaml",
                                   "plc_grpo_loopaux_1p4b_8gpu.yaml",
-                                  "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"])
+                                  "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml",
+                                  "plc_grpo_loopkd_1p4b_8gpu.yaml",
+                                  "plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml",
+                                  "plc_grpo_loopkd_rev_1p4b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
     cfg = rcfg.load_config(str(paths.config_file(name)))
@@ -385,7 +388,11 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 MATCHED_GROUPS = {
     "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
              "plc": "plc_grpo_loopaux_1p4b_8gpu.yaml",  # GRPO + loop aux term
-             "plc_nokl": "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml"},  # ... without the KL term
+             "plc_nokl": "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml",  # ... without the KL term
+             "plc_kd": "plc_grpo_loopkd_1p4b_8gpu.yaml",  # GRPO + cross-loop distillation
+             "plc_kd_rev": "plc_grpo_loopkd_rev_1p4b_8gpu.yaml",  # ... with the reverse KL
+             # exact ratio, k1 replaced by the anchor to the frozen initial model
+             "plc_nocap_refkl": "plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml"},
     "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},  # no PLC config
 }
 # verl settings the GRPO configs must override because grpo_train.py lacks them; rltt_train.py
