@@ -106,9 +106,14 @@
 
 `enabled`、`weight_mode`（`is_trunc`：前几轮权重 `α_t·min(trunc_cap, P_old^(t)/P_old^(T))`；`early_prior`：不乘比率）、
 `lam`（前几轮辅助项系数，0 = GRPO，只算最后一轮）、`trunc_cap`（比率上限，只对 is_trunc）、`kl_coef`
-（前几轮指向最后一轮的正向 KL 信赖域）、`log_weight_stats`。2026-11-13 起只有这几个键，旧的 posterior / gate
+（前几轮指向最后一轮的正向 KL 信赖域）、`log_weight_stats`，以及可选的初始模型锚定项 `init_kl_coef`
+（0 = 关；> 0 时 PLC worker 加载冻结初始模型）、`init_kl_form`（k3 / k3_reverse / k2）、
+`init_kl_log_ratio_cap`（默认 3），以及前几轮的监督形式 `loop_loss`（`surrogate` 默认 = 上面的代理目标；
+`kd` = 在第 4 轮 rollout 上把前几轮向 stop-gradient 第 4 轮做全词表蒸馏，要求 `weight_mode: early_prior`、
+`kl_coef: 0`，模型目录须用 `prepare_model` 重建）和 `kd_divergence`（forward / reverse，只对 kd）。
+2026-11-13 起只有这几个键，旧的 posterior / gate
 loss / prior / gamma 等键会被 launcher 当作未知键拒绝。其他配置里这段必须不存在或 `enabled: false`。
-消融用命令行覆盖这些键，不另存文件（`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` 是用户要求的例外）。
+消融用命令行覆盖这些键，不另存文件（`plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`、`plc_grpo_loopkd_1p4b_8gpu.yaml` 是用户要求的例外）。
 
 ## 两份原作脚本的默认值差异（`args` 没写就会在组内不一致）
 
@@ -133,6 +138,7 @@ loss / prior / gamma 等键会被 launcher 当作未知键拒绝。其他配置�
 - 参考模型：只有 GRPO 脚本注册参考模型。KL loss 和 KL in reward 都关时 launcher 把它去掉，
   `rltt_baseline_resolved.json` 的 `reference_policy` 应为 `dropped`（GRPO）或 `none`（RLTT / PLC）；
   若 GRPO 的 run 里是 `built`，它每步多跑一次参考模型前向，耗时不能和另外两种方法比。
+  PLC 打开 `plc.init_kl_coef` 时是 `plc anchor ...`：PLC worker 自己加载冻结初始模型，同样每步多一次前向。
 
 - 模型目录 `config.json` 的 `rltt_detach_exit_pdf`：决定 exit gate 是否被训练。prepare_model 默认 false
   RLTT 用 `exit_pdf` 权重时梯度因此会流进 gate；GRPO 和 PLC 的 loss 都不经过 gate。

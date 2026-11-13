@@ -1,0 +1,188 @@
+# PLC with cross-loop distillation on Ouro-1.4B-Thinking, REVERSE KL: GRPO on the final loop; the
+# earlier loops are distilled towards the stop-gradient final loop over the full vocabulary with
+# KL(P^(t) || sg P^(T)) (the divergence of on-policy distillation and LoopOPD), on the same
+# rollouts (plc.loop_loss: kd). No advantage on the earlier loops, no cross-loop ratio, no k1 term.
+# One node with 8 GPUs, one optimizer update per step. Saved 2026-11-13 at the user's request: a
+# copy of plc_grpo_loopkd_1p4b_8gpu.yaml (forward KL) with plc.kd_divergence: reverse and its own
+# wandb names, nothing else (tests/test_plc.py checks this). It differs from
+# grpo_baseline_1p4b_8gpu.yaml, rltt_baseline_1p4b_8gpu.yaml and the loop-aux configs only in the
+# method (tests/test_rltt_baseline.py checks this). Unlike on-policy distillation, the contexts are
+# the final loop's rollouts, not loop t's own samples. Reverse KL is mode-seeking: per position its
+# gradient on loop t's logits is p (log p - log q - KL(p || q)), which concentrates loop t on the
+# final loop's high-probability tokens, so the entropy may fall faster than with the forward file;
+# watch plc/kd_entropy_gap/loop_t, plc/kd_below_teacher_frac/loop_t and plc/kd_entropy_push/loop_t.
+#
+# Why: in the loop-aux runs the earlier loops collapse in entropy. The design note
+# (research/plc_entropy_design_2026-11-13.md, section 2) traces it to an advantage-independent
+# drift Abar(s) (m - |m| p) that exists because loop t is trained with advantage weights on tokens
+# sampled by the final loop. Full-distribution distillation has no advantage in the earlier-loop
+# gradient, so that term is absent; what remains is the pull towards the final loop's
+# distribution (the fixed point is P^(t) = P^(T), so loop t's entropy is expected to move towards
+# the final loop's, not below it).
+#
+# Objective (rltt_baseline.plc.plc_kd_loss):
+#   loss = -token-mean[ PPO^(T)(A) ]                                         (GRPO, unchanged)
+#          + lam * sum_{t<T} alpha_t * token-mean[ D^(t) ]
+#   D^(t) = KL( P^(t)(.|s) || sg P^(T)(.|s) )   plc.kd_divergence = reverse (this file)
+#         = KL( sg P^(T)(.|s) || P^(t)(.|s) )   plc.kd_divergence = forward (the forward file)
+#   over the full vocabulary at every response position s = (x, y_<j) of the rollouts sampled by
+#   the final loop; alpha_t = 1/3 fixed. Per-position gradient on loop t's logits:
+#   (lam / N) alpha_t P^(t) (log P^(t) - log P^(T) - D^(t)) (reverse; the forward file's is
+#   (lam / N) alpha_t (P^(t) - P^(T))). The teacher is the current final
+#   loop under stop-gradient (with one update per step it is the old policy). The gate gets no
+#   gradient. D comes from the model forward (return_loop_kd): LOOPRL_MODEL_DIR must be rebuilt by
+#   rltt_baseline.prepare_model (the flag is off for every other method).
+# Monitor: plc/kd_kl_forward|kl_reverse|entropy_gap|below_teacher_frac|top1_agree|
+# teacher_top1_prob|entropy_push/loop_t, plc/kd_loss/loop_t, actor/grad_norm (grad clip 0.1 is
+# global: a large distillation term shrinks the GRPO step), per-loop entropy, and the audit's
+# entropy_gap / below_teacher / kd_entropy_push_* and metrics_by_correct.
+#
+# Data and lengths follow SAPD (DeepMath-103K level >= 6, prompts <= 2,048, generations <= 16,384)
+# like the other configs here; training uses only the 14,684-row merged filtered subset
+# (AGENTS.md rule 1), and the launcher refuses any other training file.
+# Optimisation follows RLTT Table 6 apart from batch and length of run: 64 prompts x 8 rollouts
+# per step, accumulation 1, 100 steps = 100 updates (paper: 32 prompts, accumulation 2, 140
+# steps); lr 1e-6 constant + 10% warmup, betas (0.9, 0.99),
+# weight decay 0.1, grad clip 0.1, KL loss off, BF16, binary reward, group-normalised advantage.
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+# Ablations by override (give each its own wandb.run_name):
+#   plc.kd_divergence=forward                     = plc_grpo_loopkd_1p4b_8gpu.yaml
+#   plc.lam=1.0                                   stronger distillation
+#   plc.lam=0                                     GRPO on this code path
+
+trainer: rltt
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model (1.4B)
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false
+  ref_offload: true
+
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 2048
+  max_completion_length: 16384
+
+  # vendor loop weighting is replaced by the plc section below; this value only keeps the
+  # vendor's run name and logging consistent with the uniform prior used here
+  loop_weighting: uniform
+  progressive_alpha: 1.0
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
+  num_generations: 8
+  num_prompts_per_batch: 64
+  temperature: 1.0
+
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
+  num_train_epochs: 5
+  max_steps: 100
+  seed: 42
+
+  ppo_max_token_len: 32768      # >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 1
+  logging_steps: 1
+
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 16384
+
+plc:
+  enabled: true
+  loop_loss: kd                 # earlier loops: full-vocabulary distillation to sg P^(T)
+  kd_divergence: reverse        # KL(P^(t) || sg P^(T)); forward = KL(sg P^(T) || P^(t))
+  weight_mode: early_prior      # fixed alpha_t = 1/3, no cross-loop ratio (required by kd)
+  lam: 0.1                      # distillation coefficient (GRPO term unscaled); 0 = GRPO
+  trunc_cap: 1.0                # unused with early_prior
+  kl_coef: 0.0                  # no k1 trust region (required by kd)
+  log_weight_stats: true
+
+wandb:
+  enabled: true
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
+  project: looprl-ouro            # one wandb project for every method and size
+  entity: null
+  run_name: plc-grpo-loopkd-rev-1p4b
+  tags: [plc, grpo-loopkd, kd-reverse, no-gate-loss, ouro-1.4b-thinking, deepmath-level6]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides:
+  data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
+  actor_rollout_ref:
+    model:
+      override_config:
+        # HF actor forward = the last loop, the loop vLLM samples from. With the Ouro config's
+        # early_exit_threshold 1.0, the official forward takes per token the first loop whose
+        # cumulative exit probability reaches 1.0, an earlier loop when bf16 rounds it to 1.
+        # Read only by the official forward (GRPO log-probs, RLTT's old_log_probs); the
+        # per-loop RLTT / PLC forward and vLLM never use it.
+        early_exit_threshold: null
+    rollout:
+      max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
+                                     # below max_model_len 18,432, which verl refuses with
+                                     # chunked prefill on (both vendor scripts turn it on)
+      # sampling and engine settings written out (verl 0.6.1 defaults, same for every method)
+      top_p: 1.0                     # no nucleus truncation
+      top_k: -1                      # no top-k truncation
+      do_sample: true                # sample at args.temperature, not greedy
+      ignore_eos: false              # stop at EOS
+      max_num_seqs: 1024             # vLLM concurrent sequences cap
+      dtype: bfloat16                # vLLM weights / activations
+    actor:
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
+      optim:
+        betas: [0.9, 0.99]
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]
+  trainer:
+    logger: [wandb, console]
+
+rollout:
+  kv_layout: full
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
+
+model:
+  num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. On in every config of the comparison groups (shared key):
+  # read-only, no extra forward (hooks the compute_log_prob pass), so the loss is unchanged; it
+  # costs an lm_head call per loop on the response tokens and about 220 bytes per token on disk
+  # before compression.
+  loop_distribution:
+    enabled: true
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory
+    loop_weights: true  # also per-token exit_pdf (n, T) and, in PLC runs, the PLC loop weights
+                        # plc_weight (n, T); 16 bytes per token each

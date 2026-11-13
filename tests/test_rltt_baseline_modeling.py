@@ -208,3 +208,44 @@ def test_plc_loss_on_the_real_per_loop_outputs(models):
     gate_grad = rltt.model.early_exit_gate.weight.grad
     assert gate_grad is None or gate_grad.abs().sum() == 0   # the gate is not in the loss
     assert len(metrics["plc/kl_k3_per_loop"]) == 4
+
+
+@pytest.mark.parametrize("divergence", ["forward", "reverse"])
+def test_loop_kd_on_the_real_per_loop_outputs(models, divergence):
+    """``return_loop_kd``: full-vocabulary KL of every earlier loop towards the stop-gradient last
+    loop on the response window; gradient reaches the backbone only, not the gate, and the
+    PLC kd loss runs on it."""
+    from rltt_baseline import plc
+    from rltt_baseline.ouro_rltt.rltt_per_loop import kd_divergence
+
+    base, rltt = models
+    ids, mask, pos, labels = _inputs()
+    window = 4
+    with torch.no_grad():
+        _, hiddens, _ = base.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                                   use_cache=False)
+        out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+                   return_per_loop_log_probs=True, log_prob_labels=labels,
+                   log_prob_temperature=0.8, return_loop_kd=True,
+                   loop_kd_divergence=divergence, loop_kd_window=window)
+    assert out.loop_kd.shape == (2, window, 3)
+    log_q = F.log_softmax(base.lm_head(hiddens[-1][:, -window - 1:-1]).float() / 0.8, -1)
+    for t in range(3):
+        log_p = F.log_softmax(base.lm_head(hiddens[t][:, -window - 1:-1]).float() / 0.8, -1)
+        torch.testing.assert_close(out.loop_kd[..., t], kd_divergence(log_p, log_q, divergence))
+    assert out.loop_kd_stats["entropy_gap"].shape == (2, window, 3)
+
+    rltt.zero_grad()
+    out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+               return_per_loop_log_probs=True, log_prob_labels=labels, return_loop_kd=True,
+               loop_kd_divergence=divergence, loop_kd_window=window)
+    ell = torch.stack([lp[:, -window - 1:-1] for lp in out.per_loop_log_probs], dim=-1).float()
+    loss, _ = plc.plc_kd_loss(ell, ell.detach(), torch.zeros(2), mask[:, -window:].float(),
+                              out.loop_kd, lam=1.0, clip_ratio=0.2)
+    loss.backward()   # advantage 0: only the distillation term has a gradient
+    assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+    gate_grad = rltt.model.early_exit_gate.weight.grad
+    assert gate_grad is None or gate_grad.abs().sum() == 0
+    with pytest.raises(ValueError, match="loop_kd_window"):
+        rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+             return_loop_kd=True, loop_kd_window=ids.shape[1])

@@ -48,6 +48,9 @@ configs/rltt_baseline.yaml  RLTT 论文 Table 6 口径的配置（Ouro-2.6B-Thin
 configs/rltt_baseline_1p4b_8gpu.yaml  RLTT 8 卡训练配置（Ouro-1.4B-Thinking，与 GRPO 1.4B / PLC 配置对齐）
 configs/plc_grpo_loopaux_1p4b_8gpu.yaml  PLC：GRPO + 中间轮 off-policy 辅助项（截断重要性权重 + 正向 KL 信赖域、无 gate），1.4B
 configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml  同上但去掉正向 KL 项（`plc.kl_coef=0`），1.4B
+configs/plc_grpo_loopkd_1p4b_8gpu.yaml  PLC：GRPO + 前几轮向 stop-gradient 第 4 轮做全词表蒸馏（`plc.loop_loss: kd`），1.4B
+configs/plc_grpo_loopkd_rev_1p4b_8gpu.yaml  同上但用 reverse KL（`plc.kd_divergence: reverse`，OPD / LoopOPD 的方向），1.4B
+configs/plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml  PLC：精确比率（无上界）+ 初始模型锚定项（k3，0.1），去掉 k1，1.4B
 configs/rltt_env.lock.txt   训练环境锁定文件
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
@@ -120,6 +123,9 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 | 1.4B，8 卡，每步一次更新 | `grpo_baseline_1p4b_8gpu.yaml` | `rltt_baseline_1p4b_8gpu.yaml` | `plc_grpo_loopaux_1p4b_8gpu.yaml` |
 | 2.6B，8 卡，每步一次更新 | `grpo_baseline_8gpu.yaml` | `rltt_baseline.yaml` | —（暂无） |
 | 1.4B 消融：PLC 去掉 KL 项 | — | — | `plc_grpo_loopaux_nokl_1p4b_8gpu.yaml` |
+| 1.4B：PLC 前几轮改为跨轮蒸馏 | — | — | `plc_grpo_loopkd_1p4b_8gpu.yaml` |
+| 1.4B：同上，reverse KL | — | — | `plc_grpo_loopkd_rev_1p4b_8gpu.yaml` |
+| 1.4B：PLC 精确比率 + 初始模型锚定项 | — | — | `plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml` |
 
 测试 `test_matched_configs_share_all_non_method_settings` 检查这一点（允许不同的键和改配置的规则见
 `CLAUDE.md`）。改一个共享超参要改整组文件；临时实验用命令行覆盖，不要另存配置。
@@ -290,7 +296,21 @@ PPO 代理目标学习，再加指向最后一轮的正向 KL 信赖域：
   （`test_trust_region_gradient_is_rho_a_plus_kl_coef_per_token`）。熵项和 KL（`low_var_kl`）只加在最后一轮，
   与原作相同；对照组配置里 KL 关闭，熵系数为 0。gate 不进入 loss。
 - **`plc` 段**：`weight_mode`（`is_trunc`，或 `early_prior` 即 ρ̄=1）、`lam`（0.1）、`trunc_cap`（1.0）、
-  `kl_coef`（0.2）、`log_weight_stats`。
+  `kl_coef`（0.2）、`log_weight_stats`；可选的初始模型锚定项 `init_kl_coef`（0 = 关）、`init_kl_form`
+  （`k3_reverse`）、`init_kl_log_ratio_cap`（3），见下一条。
+- **初始模型锚定项（可选，默认关闭）**：`init_kl_coef > 0` 时 loss 再加
+  `λ·init_kl_coef·agg_j[Σ_{t<T} α_t·pen(d[j,t])]`，`d = log P^(t)(y_j) − log P_init^(t)(y_j)`，
+  `P_init` 是冻结的初始模型（与 actor 同一个 `model.path`，verl 参考模型的构建方式：fp32 主权重、
+  同样的 bf16 混合精度、参数 offload 到 CPU；`compute_log_prob` 时在同一批 micro-batch 上无梯度前向一次，
+  结果放进批次的 `init_log_probs_loops` `[B,L,T]`）。`pen` 由 `init_kl_form` 选：
+  `k3` = e^{−d}+d−1（r = P_init/P_new；|d| 较小时与 verl `low_var_kl` 相同，verl 在值 ≥ 10 处截断、梯度为 0，这里改为在 cap 处线性延伸；对被抬高的 token 回复力 ≤ 1）、
+  `k3_reverse` = e^{d}−d−1（r = P_new/P_init；对被抬高的 token 回复力无上限，即最后一轮样本推动的方向）、
+  `k2` = d²/2（两个方向对称）。三者在 d = 0 处值和梯度都为 0，锚点是第 t 轮自己的初始分布；
+  |d| 超过 `init_kl_log_ratio_cap` 后惩罚按该处斜率线性延伸，梯度有界且不会被截成 0。
+  采样 token 上的 k1 不能当锚：`log P_init` 没有梯度，它的梯度和指向最后一轮的 k1 完全相同。
+  指标：`plc/init_term_mean`、`plc/init_pen/loop_<t>`、`plc/init_log_ratio/loop_<t>`、
+  `plc/init_beyond_cap_frac/loop_<t>`（`loop_4` 只是监控，权重为 0）。锚定项乘 λ，实际强度是
+  `λ·init_kl_coef`；`plc.lam=0` 时设 `init_kl_coef > 0` 会被拒绝（否则加载冻结模型却没有梯度）。
 - **指标**（逐轮的量每轮一个键，`/loop_<t>` 即第 t 轮；verl 的 `reduce_metrics` 对每个键的列表取均值，
   所以不能把一个逐轮列表放在同一个键里，见 `plc.flatten_loop_metrics`）：
   `plc/clipfrac/loop_<t>`、`plc/ratio_mean/loop_<t>`、`plc/loop_term_mean`、`plc/final_term_mean`、
@@ -303,12 +323,33 @@ PPO 代理目标学习，再加指向最后一轮的正向 KL 信赖域：
   （k1⁽ᵗ⁾ = ℓ⁽⁴⁾ − ℓ⁽ᵗ⁾）。完整词表上的精确 KL 没有实现，监控用审计里已有的
   `loop_audit/kl/4_t`（精确的 `KL(P^(4)‖P^(t))`）。
 - **批次里新增的张量**：`old_log_probs_loops` `[B,L,T]`；`old_log_probs` 就是它的最后一轮。
+  锚定项打开时还有 `init_log_probs_loops` `[B,L,T]`。
 
 消融用命令行覆盖：`plc.kl_coef=0.05 / 1.0`（信赖域大小）、`plc.kl_coef=0`（只有代理目标）、
-`plc.trunc_cap=2`、`plc.weight_mode=early_prior`（不乘比率）、`plc.lam=0`（PLC 代码路径上的 GRPO）。
-去掉 KL 项的消融另存为 `configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`（用户 2026-11-12 要求）。
+`plc.trunc_cap=2`、`plc.weight_mode=early_prior`（不乘比率）、`plc.lam=0`（PLC 代码路径上的 GRPO）、
+`plc.kl_coef=0 plc.init_kl_coef=0.05 [plc.init_kl_form=k3|k3_reverse|k2]`（用初始模型锚定项替换
+指向最后一轮的 KL；每步多一次冻结模型前向，耗时不能直接和 GRPO / RLTT 比）。去掉 KL 项的消融另存为 `configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml`（用户 2026-11-12 要求）。
 状态：只有 CPU 单元测试和 tiny 随机模型测试（`tests/test_plc.py`、`test_rltt_baseline_modeling.py`），
 没有在真实权重或 GPU 上运行过。
+
+#### 前几轮改为跨轮蒸馏（`plc.loop_loss: kd`，`configs/plc_grpo_loopkd_1p4b_8gpu.yaml`）
+
+- **损失**：`-agg_j[PPO^(T)(Â)] + λ·Σ_{t<T} α_t·agg_j[D_j^(t)]`，α_t = 1/3 固定，不用 advantage、不乘比率、
+  没有 k1。`D_j^(t)` 是第 j 个回答位置 `s_j = (x, y_<j)` 上的全词表 KL：`kd_divergence: forward` 为
+  `KL(sg P^(T)(·|s_j) ‖ P^(t)(·|s_j))`，`reverse` 为 `KL(P^(t) ‖ sg P^(T))`。rollout 就是第 4 轮采样的那一批，
+  不额外生成。教师是当前第 4 轮（含 `lm_head`）的 stop-gradient，每步一次更新时就是旧策略。
+- **梯度**：第 t 轮 logits 上 forward 为 `(λ/N)·α_t·(P^(t) − P^(T))`，reverse 为
+  `(λ/N)·α_t·P^(t)⊙(log P^(t) − log P^(T) − D)`；不经过 gate。forward 是 k1 信赖域梯度 `P^(t) − e_y`
+  在 `y ~ P^(T)` 下的精确期望。不动点是 `P^(t) = P^(T)`，所以前几轮的熵按设计会靠近第 4 轮；判断漂移看
+  `entropy_gap < 0`（比教师还尖）的比例、第 4 轮自己的熵，以及答对 / 答错回答之间的差别。
+- **实现**：模型 forward 的 `return_loop_kd`（`rltt_per_loop.per_loop_kd`）只在回答窗口上分块计算，每块都做
+  checkpoint（反向时重算 logits，否则每个位置要留 T 份词表大小的张量）。**`LOOPRL_MODEL_DIR` 要用
+  `prepare_model` 重建**；旧目录会在 actor 初始化时报错。
+- **指标**（每步，`plc/kd_<name>/loop_t`，t = 1..3）：`kl_forward`、`kl_reverse`、`entropy_gap`
+  （H(P^(t)) − H(P^(T))）、`below_teacher_frac`、`top1_agree`、`teacher_top1_prob`（P^(t) 在教师 top-1 上的概率）、
+  `entropy_push`（只看蒸馏梯度时第 t 轮熵的一阶变化，负 = 降熵），以及 `plc/kd_loss/loop_t`、`plc/kd_term_mean`。
+  梯度裁剪 0.1 是对总梯度，蒸馏项太大会压小 GRPO 那部分，要看 `actor/grad_norm`。
+- **消融**：`plc.kd_divergence=reverse`、`plc.lam=1.0`、`plc.lam=0`（GRPO）。可以叠加 `plc.init_kl_coef`。
 
 ### 配置与覆盖
 
@@ -407,6 +448,16 @@ audit:
 
 每一轮上采样 token 的概率就是已有的 `exp(sampled_log_prob)`，不另存。这个开关只控制上面两组新增数组，
 关掉后审计与之前完全相同。
+
+跨轮蒸馏的诊断（所有方法都记录，可直接比较；最后一轮是教师）：
+
+- `teacher_topk_probs` (n, T, k)：第 t 轮在第 4 轮 top-k 词上的概率，求和就是第 t 轮放在教师候选上的质量；
+- `kd_entropy_push_forward` / `kd_entropy_push_reverse` (n, T)：向第 4 轮走一步蒸馏时第 t 轮熵的一阶变化
+  （负 = 降熵，最后一轮为 0）；forward 那个也是 PLC k1 信赖域的期望推力。
+- summary 另有 `entropy_gap/loop_t`（H(P^(t)) − H(P^(4))）、`below_teacher/loop_t`（比第 4 轮还尖的 token
+  比例）、`teacher_top1_prob/loop_t`、`teacher_topk_mass/loop_t`，并在 `metrics_by_correct` 里把熵、KL、
+  `entropy_gap`、推力、`xloop_log_rho` 按答对 / 答错分开统计（wandb：`loop_audit/{correct,wrong}/<name>/mean`）。
+  和 advantage 有关的漂移会表现为两组之间的系统差异。压缩前每个 token 多约 112 字节（top_k 5 时 80 + 32；不受 `loop_weights` 控制），下面的 220 字节估计因此变为约 330 字节。
 
 审计不加前向：它挂在训练本来就要做的 `compute_log_prob` 那次前向上，读出各轮隐状态再算
 `lm_head`，所以不改变 loss 和梯度，只多花 `lm_head` 的计算和磁盘。逐 token 数组压缩前约每 token
