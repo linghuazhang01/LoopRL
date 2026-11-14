@@ -71,6 +71,7 @@ class RowAggPPOActor(DataParallelPPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        tracker = loss_agg.LossTracker()  # loss/<term>: the exact objective of each update
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
@@ -116,18 +117,21 @@ class RowAggPPOActor(DataParallelPPOActor):
                         clip_ratio_high=self.config.clip_ratio_high,
                         clip_ratio_c=float(self.config.get("clip_ratio_c", 3.0)),
                         row_div=row_div)
+                    terms = loss_agg.pop_loss_terms(pg_metrics)
                     micro_batch_metrics.update(pg_metrics)
 
                     policy_loss = pg_loss
                     if entropy_coeff != 0:
                         entropy_loss = loss_agg.agg_rows(entropy, response_mask, row_div)
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        terms["entropy"] = -float(entropy_loss.detach()) * entropy_coeff
 
                     if self.config.use_kl_loss:
                         kld = kl_penalty(logprob=log_prob, ref_logprob=model_inputs["ref_log_prob"],
                                          kl_penalty=self.config.kl_loss_type)
                         kl_loss = loss_agg.agg_rows(kld, response_mask, row_div)
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        terms["kl"] = float(kl_loss.detach()) * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = (kl_loss.detach().item()
                                                                 * loss_scale_factor)
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
@@ -137,6 +141,8 @@ class RowAggPPOActor(DataParallelPPOActor):
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    terms["total"] = float(policy_loss.detach())
+                    tracker.add(terms, loss_scale_factor)
 
                     micro_batch_metrics["actor/pg_loss"] = (pg_loss.detach().item()
                                                             * loss_scale_factor)
@@ -144,7 +150,8 @@ class RowAggPPOActor(DataParallelPPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item(),
+                                         **tracker.flush()})
         self.actor_optimizer.zero_grad()
         return metrics
 
