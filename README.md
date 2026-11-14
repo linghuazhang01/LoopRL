@@ -449,6 +449,24 @@ verl 自带：`critic/score/mean`（平均奖励）、`response_length/*`（含 
 RLTT 另有原作的 `rltt/loop_<t>_log_prob`、各轮退出概率，以及本仓库新增的
 `rltt/loop_<t>_entropy`、`rltt/expected_exit_step`、`actor/total_loss`。
 
+**实际优化的 loss：`loss/*`**（GRPO、RLTT、PLC 都有，2026-11-14 起）。verl 的 `actor/pg_loss` 不是
+实际的 loss：每个 micro-batch 记一个数，verl 对所有 micro-batch 和卡取平均；verl 的 actor 记的是
+`pg_loss × B/N`，所以等于真实 loss 除以 micro-batch 个数，PLC 记的是各块未缩放值的简单平均。
+`loss/<项>` 在每张卡上把每个 micro-batch 的该项乘上 backward 前的缩放 `B/N` 再求和（每卡每次更新一个数），
+verl 再对 8 张卡取平均，正好是这次更新优化的目标函数（FSDP 也是对各卡梯度取平均）：
+
+| 键 | 含义 |
+|---|---|
+| `loss/total` | backward 的 loss，各项之和 |
+| `loss/pg` | 最后一轮的 GRPO / PPO 项（RLTT 是原作的逐轮加权 REINFORCE 项） |
+| `loss/kd`、`loss/loop`、`loss/k1`、`loss/init_anchor` | PLC 的前几轮各项（只记配置里打开的项），已乘 `lam` 等系数 |
+| `loss/entropy`、`loss/kl` | 熵奖励和 KL 项，系数不为 0 时才记 |
+
+读数注意：每步只做一次更新，比率等于 1，策略梯度项的**数值**是 `−Σ w_i·A_i` 这类加权 advantage 和，
+不反映训练进度（梯度才有用）。GRPO 用逐条回答平均时 `loss/pg = −mean(A_i)`，组内标准化后恒约为 0；
+PLC 用 Dr. GRPO 时 `loss/pg = −Σ_i A_i·L_i / (N·16384)`，反映 advantage 与回答长度的相关性；
+`loss/kd` 是实际的跨轮 KL，有直接含义。
+
 ### 逐轮分布审计
 
 采样只用最后一轮，但每一轮 t 都有自己的下一 token 分布

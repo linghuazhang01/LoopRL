@@ -81,7 +81,7 @@ from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 
-from rltt_baseline.loss_agg import agg_rows
+from rltt_baseline.loss_agg import agg_rows, loss_term_metrics
 
 WEIGHT_MODES = ("is_trunc", "early_prior")
 INIT_KL_FORMS = ("k3", "k3_reverse", "k2")
@@ -347,20 +347,24 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
                               clip_ratio_high, clip_ratio_c)
     loop_term = (weights * ppo).sum(-1)
     final_term = ppo[..., -1]
-    loss = -(agg_term(final_term, response_mask, loss_agg_mode, row_div)
-             + lam * agg_term(loop_term, response_mask, loss_agg_mode, row_div))
+    final_agg = agg_term(final_term, response_mask, loss_agg_mode, row_div)
+    loop_agg = agg_term(loop_term, response_mask, loss_agg_mode, row_div)
+    loss = -(final_agg + lam * loop_agg)
+    terms = {"pg": -final_agg, "loop": -lam * loop_agg}
     k1 = kl_term = None
     if kl_coef > 0:
         k1 = logp_old.detach()[..., -1:] - logp_new                       # [B, L, T]
         kl_term = (kl_weights.detach().to(k1.dtype) * k1).sum(-1)          # [B, L]
-        loss = loss + lam * kl_coef * agg_term(kl_term, response_mask, loss_agg_mode, row_div)
+        terms["k1"] = lam * kl_coef * agg_term(kl_term, response_mask, loss_agg_mode, row_div)
+        loss = loss + terms["k1"]
     init_pen = init_term = None
     if init_kl_coef > 0:
         init_pen = init_anchor_penalty(logp_new, logp_init.to(logp_new.dtype), init_kl_form,
                                        init_kl_log_ratio_cap)                 # [B, L, T]
         init_term = (init_weights.detach().to(init_pen.dtype) * init_pen).sum(-1)
-        loss = loss + lam * init_kl_coef * agg_term(init_term, response_mask, loss_agg_mode,
-                                                    row_div)
+        terms["init_anchor"] = lam * init_kl_coef * agg_term(init_term, response_mask,
+                                                             loss_agg_mode, row_div)
+        loss = loss + terms["init_anchor"]
 
     with torch.no_grad():
         mask = response_mask.to(ppo.dtype)
@@ -375,6 +379,7 @@ def plc_policy_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: 
             "plc/ratio_mean_per_loop": _masked_mean_per_loop(info["ratio"], mask3),
             "plc/loop_term_mean": agg_loss(loop_term, mask, "token-mean").item(),
             "plc/final_term_mean": agg_loss(final_term, mask, "token-mean").item(),
+            **loss_term_metrics(terms),
         }
         if kl_term is not None:
             # k1 is the loss's estimate; k3 = r - 1 - log r (r = P^(t) / P_old^(T)) estimates the
@@ -431,15 +436,18 @@ def plc_kd_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torc
     alpha = 1.0 / (num_loops - 1)
     kd_term = kd.float().sum(-1) * alpha                                       # [B, L]
     loss = -agg_term(final_term, response_mask, loss_agg_mode, row_div)
+    terms = {"pg": loss}
     if lam > 0:
-        loss = loss + lam * agg_term(kd_term, response_mask, loss_agg_mode, row_div)
+        terms["kd"] = lam * agg_term(kd_term, response_mask, loss_agg_mode, row_div)
+        loss = loss + terms["kd"]
     init_pen = init_term = None
     if init_kl_coef > 0:
         init_pen = init_anchor_penalty(logp_new, logp_init.to(logp_new.dtype), init_kl_form,
                                        init_kl_log_ratio_cap)                 # [B, L, T]
         init_term = init_pen[..., :-1].sum(-1) * alpha
-        loss = loss + lam * init_kl_coef * agg_term(init_term, response_mask, loss_agg_mode,
-                                                    row_div)
+        terms["init_anchor"] = lam * init_kl_coef * agg_term(init_term, response_mask,
+                                                             loss_agg_mode, row_div)
+        loss = loss + terms["init_anchor"]
 
     with torch.no_grad():
         mask = response_mask.to(ppo.dtype)
@@ -457,6 +465,7 @@ def plc_kd_loss(logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torc
             # entry t (t < T): the earlier loop's own distillation loss D^(t)
             "plc/kd_loss_per_loop": _masked_mean_per_loop(
                 kd.detach().to(mask.dtype), mask[..., None].expand_as(kd)),
+            **loss_term_metrics(terms),
         }
         if init_term is not None:
             d = (logp_new - logp_init).detach().to(mask.dtype)
@@ -496,6 +505,7 @@ def grpo_policy_loss(log_prob: torch.Tensor, old_log_prob: torch.Tensor, advanta
             "actor/pg_clipfrac": agg_loss(info["clipped"], mask, "token-mean").item(),
             "actor/ppo_kl": agg_loss(-info["negative_approx_kl"], mask, "token-mean").item(),
             "actor/pg_clipfrac_lower": agg_loss(info["clipped_lower"], mask, "token-mean").item(),
+            **loss_term_metrics({"pg": loss}),
         }
     return loss, metrics
 

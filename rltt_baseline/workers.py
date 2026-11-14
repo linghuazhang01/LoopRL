@@ -6,7 +6,10 @@ Added metrics (per micro-batch during ``update_policy``, averaged by verl):
 - ``rltt/expected_exit_step``: mean over response tokens of sum_t t * exit_pdf_t, when
   ``loop_weighting=exit_pdf``;
 - ``actor/total_loss``: pg_loss + kl_coef * kl_loss - entropy_coeff * entropy_loss, i.e. the
-  loss the vendor actor backpropagates (before gradient-accumulation scaling).
+  loss the vendor actor backpropagates (before gradient-accumulation scaling);
+- ``loss/total``, ``loss/pg`` (and ``loss/kl`` / ``loss/entropy`` when their coefficients are not
+  0): the exact objective of the update, ``sum_micro (B / N) * term`` with the vendor's own scale
+  (``rltt_baseline.loss_agg.LossTracker``), one value per rank; verl averages the ranks.
 
 The vendor actor computes per-loop entropies but discards all but the last; they are read
 here with a forward hook on the actor module, so the vendor loss code runs unchanged.
@@ -25,6 +28,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl_rltt.rltt_actor import RLTTDataParallelPPOActor
 
 from rltt_baseline.loop_audit import attach_loop_audit
+from rltt_baseline.loss_agg import rltt_loss_terms
 
 
 class MetricsRLTTActor(RLTTDataParallelPPOActor):
@@ -32,6 +36,7 @@ class MetricsRLTTActor(RLTTDataParallelPPOActor):
         super().__init__(*args, **kwargs)
         self._captured = None
         self._pending = []
+        self._micro_rows = []  # rows of each micro-batch of the update, for loss/<term>
         self.actor_module.register_forward_hook(self._capture_output)
 
     def _capture_output(self, module, inputs, output):
@@ -47,6 +52,8 @@ class MetricsRLTTActor(RLTTDataParallelPPOActor):
     def _forward_micro_batch_rltt(self, micro_batch, temperature):
         self._captured = None
         result = super()._forward_micro_batch_rltt(micro_batch, temperature)
+        if torch.is_grad_enabled():
+            self._micro_rows.append(int(micro_batch["responses"].shape[0]))
         if torch.is_grad_enabled() and self._captured is not None:
             self._pending.append(self._loop_metrics(micro_batch))
         self._captured = None
@@ -70,6 +77,7 @@ class MetricsRLTTActor(RLTTDataParallelPPOActor):
 
     def update_policy(self, data):
         self._pending = []
+        self._micro_rows = []
         metrics = super().update_policy(data)
         for record in self._pending:
             append_to_dict(metrics, record)
@@ -82,6 +90,12 @@ class MetricsRLTTActor(RLTTDataParallelPPOActor):
             coeff = float(self.config.entropy_coeff)
             totals = [p + c * k - coeff * e for p, k, c, e in zip(pg, kl, kl_coef, ent)]
             append_to_dict(metrics, {"actor/total_loss": totals})
+            # one mini-batch per update (ppo_epochs 1): its micro-batches are the lists above
+            if len(metrics.get("actor/grad_norm", [])) == 1 and len(self._micro_rows) == len(pg):
+                append_to_dict(metrics, rltt_loss_terms(
+                    pg, kl, kl_coef, ent, coeff, self._micro_rows,
+                    int(self.config.ppo_mini_batch_size)))
+        self._micro_rows = []
         return metrics
 
 

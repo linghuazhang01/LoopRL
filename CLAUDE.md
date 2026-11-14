@@ -125,6 +125,10 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 - 后果，写实验记录时要注明：三种方法的曲线差异里包含聚合方式的差异；`plc.lam=0` 不再等于 GRPO 配置
   （只差聚合）；2026-11-14 之前的 GRPO / PLC 结果是旧聚合方式；`actor/pg_loss`、`actor/total_loss`
   的量级变了（drgrpo 下约小 `平均长度/16384` 倍），`loss_agg/row_div_mean` 记录平均除数。
+- wandb 的 `loss/total`、`loss/pg`、`loss/kd` 等（三种方法都有）是实际优化的目标函数：每卡把各 micro-batch
+  的项乘 backward 前的缩放 `B/N` 求和，verl 再对卡取平均（`loss_agg.LossTracker`）。verl 的 `actor/pg_loss`
+  是 micro-batch 平均，不等于实际 loss，比较时用 `loss/*`。比率为 1 时策略梯度项的数值只是加权 advantage
+  和（GRPO 逐回答平均下恒约为 0），不反映训练进度。
 - 新增一种 PLC 配置时照样写 `loss_agg` 段；`tests/test_loss_agg.py` 检查各配置的取值、切分无关性和
   dry-run 输出，`_method_free_view` 把 `loss_agg` 当作方法相关的段。
 

@@ -202,7 +202,9 @@ def test_grpo_policy_loss_is_verl_vanilla():
     loss, metrics = plc.grpo_policy_loss(lp, old, adv2, mask, clip_ratio=0.2)
     ppo, info = plc.ppo_objective(lp, old, adv2, 0.2)
     assert torch.equal(loss, -plc.agg_loss(ppo, mask, "token-mean"))
-    assert set(metrics) == {"actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower"}
+    assert set(metrics) == {"actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower",
+                            "loss_term/pg"}
+    assert metrics["loss_term/pg"] == pytest.approx(float(loss))
     div = torch.tensor([4.0, 4.0, 2.0, 2.0])
     loss_div, _ = plc.grpo_policy_loss(lp, old, adv2, mask, clip_ratio=0.2, row_div=div)
     assert torch.allclose(loss_div, -loss_agg.agg_rows(ppo, mask, div))
@@ -211,6 +213,79 @@ def test_grpo_policy_loss_is_verl_vanilla():
     plc_loss, _ = plc.plc_kd_loss(ell_new, ell_old, adv, mask, kd, 0.0, clip_ratio=0.2,
                                   row_div=div)
     assert torch.allclose(loss_div, plc_loss)
+
+
+# ---------- logged loss (loss/<term>) ----------
+
+def test_loss_terms_of_the_plc_losses_sum_to_the_loss():
+    ell_new, ell_old, adv, mask = _plc_inputs(seed=4)
+    div = loss_agg.row_divisors(DRGRPO, mask)
+    w = plc.compute_loop_weights(ell_old, "is_trunc", 1.0)
+    alpha = plc.compute_loop_weights(ell_old, "early_prior")
+    logp_init = ell_old - 0.2
+    loss, m = plc.plc_policy_loss(ell_new, ell_old, adv, mask, w, 0.1, clip_ratio=0.2,
+                                  kl_coef=0.2, kl_weights=alpha, init_kl_coef=0.05,
+                                  logp_init=logp_init, init_weights=alpha, row_div=div)
+    terms = loss_agg.pop_loss_terms(m)
+    assert set(terms) == {"pg", "loop", "k1", "init_anchor"} and not any(
+        k.startswith(loss_agg.LOSS_TERM_PREFIX) for k in m)
+    assert sum(terms.values()) == pytest.approx(float(loss), rel=1e-6)
+    kd = torch.rand(*ell_new.shape[:2], 3)
+    loss, m = plc.plc_kd_loss(ell_new, ell_old, adv, mask, kd, 0.1, clip_ratio=0.2,
+                              init_kl_coef=0.05, logp_init=logp_init, row_div=div)
+    terms = loss_agg.pop_loss_terms(m)
+    assert set(terms) == {"pg", "kd", "init_anchor"}
+    assert sum(terms.values()) == pytest.approx(float(loss), rel=1e-6)
+    _, m = plc.plc_kd_loss(ell_new, ell_old, adv, mask, kd, 0.0, clip_ratio=0.2, row_div=div)
+    assert set(loss_agg.pop_loss_terms(m)) == {"pg"}  # lam = 0: no kd term
+
+
+def test_tracker_sums_the_scaled_terms_of_one_mini_batch():
+    tracker = loss_agg.LossTracker()
+    tracker.add({"pg": 1.0, "total": 3.0}, 0.25)
+    tracker.add({"pg": -2.0, "total": 1.0}, 0.75)
+    assert tracker.flush() == {"loss/pg": -1.25, "loss/total": 1.5}
+    assert tracker.flush() == {}  # flush starts the next mini-batch
+
+
+def _logged_total(settings, mask, x, seed):
+    """loss/total as an actor logs it, averaged over ranks as verl does, for random splits."""
+    g = torch.Generator().manual_seed(seed)
+    shard = P * G // R
+    per_rank = []
+    for rank in range(R):
+        rows = torch.arange(rank * shard, (rank + 1) * shard)
+        order = torch.randperm(shard, generator=g)
+        cuts = sorted(torch.randperm(shard - 1, generator=g)[:3].add(1).tolist())
+        tracker = loss_agg.LossTracker()
+        for idx in torch.tensor_split(order, cuts):
+            xm, mm = x[rows][idx], mask[rows][idx]
+            micro = loss_agg.agg_rows(xm, mm, loss_agg.row_divisors(settings, mm))
+            tracker.add({"total": float(micro)}, len(idx) / shard)
+        per_rank.append(tracker.flush()["loss/total"])
+    return sum(per_rank) / R
+
+
+def test_logged_total_is_the_objective_of_the_update():
+    mask = _batch(5)
+    x = torch.randn_like(mask)
+    lengths = mask.sum(-1)
+    expected = {DRGRPO: float((x * mask).sum() / (P * G * 16384)),
+                SEQ: float(((x * mask).sum(-1) / lengths).mean())}
+    for settings, value in expected.items():
+        for seed in range(3):
+            assert _logged_total(settings, mask, x, seed) == pytest.approx(value, rel=1e-5)
+
+
+def test_rltt_loss_terms_use_the_vendor_scale():
+    # three micro-batches of 10, 20 and 34 rows of a 64-row mini-batch
+    out = loss_agg.rltt_loss_terms(pg=[1.0, 2.0, -1.0], kl=[0.5, 0.5, 0.5],
+                                   kl_coef=[0.0, 0.0, 0.0], ent=[3.0, 3.0, 3.0],
+                                   entropy_coeff=0.0, rows=[10, 20, 34], mini_batch_rows=64)
+    assert out == pytest.approx({"loss/pg": (10 - 34 + 40) / 64, "loss/total": 16 / 64})
+    out = loss_agg.rltt_loss_terms([1.0], [0.5], [0.1], [3.0], 0.01, [64], 64)
+    assert out == pytest.approx({"loss/pg": 1.0, "loss/kl": 0.05, "loss/entropy": -0.03,
+                                 "loss/total": 1.02})
 
 
 # ---------- configs ----------

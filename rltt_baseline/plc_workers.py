@@ -270,6 +270,7 @@ class PLCActor(MetricsRLTTActor):
         row_normalized = self.loss_agg.row_normalized
         batch = data.select(batch_keys=select_keys).batch
         metrics: Dict[str, object] = {}
+        tracker = loss_agg.LossTracker()  # loss/<term>: the exact objective of each update
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         for _ in range(self.config.ppo_epochs):
@@ -320,14 +321,17 @@ class PLCActor(MetricsRLTTActor):
                             init_kl_log_ratio_cap=settings.init_kl_log_ratio_cap,
                             row_div=row_div, **clip)
                     policy_loss = pg_loss
+                    terms = loss_agg.pop_loss_terms(step_metrics)
 
                     # entropy_loss / kl_loss are logged as token means; the loss terms use the
                     # configured aggregation (agg_term = agg_loss when row_div is None)
                     entropy_loss = plc.agg_loss(entropy, response_mask, loss_agg_mode)
                     entropy_coeff = float(self.config.entropy_coeff)
                     if entropy_coeff != 0:
-                        policy_loss = policy_loss - entropy_coeff * plc.agg_term(
+                        entropy_term = entropy_coeff * plc.agg_term(
                             entropy, response_mask, loss_agg_mode, row_div)
+                        policy_loss = policy_loss - entropy_term
+                        terms["entropy"] = -float(entropy_term.detach())
 
                     # KL to the frozen reference on the final loop only (RLTT Eq. 7)
                     ref_key = "ref_log_prob" if use_ref_log_prob else "old_log_probs"
@@ -335,15 +339,20 @@ class PLCActor(MetricsRLTTActor):
                     kld = plc.low_var_kl(ell_new[..., -1], ref_log_prob.float())
                     kl_loss = plc.agg_loss(kld, response_mask, loss_agg_mode)
                     kl_coef = float(self.config.kl_loss_coef)
-                    policy_loss = policy_loss + plc.agg_term(
-                        kld, response_mask, loss_agg_mode, row_div) * kl_coef
+                    kl_term = plc.agg_term(kld, response_mask, loss_agg_mode, row_div) * kl_coef
+                    policy_loss = policy_loss + kl_term
+                    if kl_coef != 0:
+                        terms["kl"] = float(kl_term.detach())
 
                     if self.config.use_dynamic_bsz:
                         scale = response_mask.shape[0] / self.config.ppo_mini_batch_size
                         loss = policy_loss * scale
                     else:
+                        scale = 1.0 / self.gradient_accumulation
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+                    terms["total"] = float(policy_loss.detach())
+                    tracker.add(terms, scale)
 
                     step_metrics.update({
                         "actor/pg_loss": pg_loss.detach().item(),
@@ -364,7 +373,8 @@ class PLCActor(MetricsRLTTActor):
                     append_to_dict(metrics, plc.flatten_loop_metrics(step_metrics))
 
                 grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item(),
+                                         **tracker.flush()})
 
         self.actor_optimizer.zero_grad()
         for record in self._pending:
