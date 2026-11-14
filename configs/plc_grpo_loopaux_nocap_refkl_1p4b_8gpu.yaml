@@ -122,6 +122,12 @@ plc:
   init_kl_form: k3              # r - 1 - log r, r = P_init^(t) / P^(t) (verl low_var_kl form)
   init_kl_log_ratio_cap: 3.0    # |log r| beyond which the penalty continues linearly
 
+loss_agg:
+  # Dr. GRPO aggregation (user 2026-11-14): every loss term = sum over response tokens /
+  # (rows x norm_len), independent of the micro-batch split and of response lengths
+  mode: drgrpo
+  norm_len: 16384               # the constant M of Dr. GRPO (= max_completion_length)
+
 wandb:
   enabled: true
   mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local

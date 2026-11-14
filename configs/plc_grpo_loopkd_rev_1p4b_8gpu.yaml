@@ -118,6 +118,12 @@ plc:
   kl_coef: 0.0                  # no k1 trust region (required by kd)
   log_weight_stats: true
 
+loss_agg:
+  # Dr. GRPO aggregation (user 2026-11-14): every loss term = sum over response tokens /
+  # (rows x norm_len), independent of the micro-batch split and of response lengths
+  mode: drgrpo
+  norm_len: 16384               # the constant M of Dr. GRPO (= max_completion_length)
+
 wandb:
   enabled: true
   mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local

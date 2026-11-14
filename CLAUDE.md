@@ -39,7 +39,8 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 
 组内**允许**不同的只有：
 
-- `trainer`（`grpo` / `rltt`）、`plc` 段、`wandb` 的 `run_name / tags / notes`；
+- `trainer`（`grpo` / `rltt`）、`plc` 段、`loss_agg` 段（loss 聚合方式，2026-11-14 起属于方法，见下文）、
+  `wandb` 的 `run_name / tags / notes`；
 - 两份原作脚本参数名不同但取值等价的键：GRPO 的 `use_ppo`；RLTT 的 `use_rltt_model`、
   `rltt_model_path`（= GRPO 的 `model_path`，即 `LOOPRL_MODEL_DIR`）、`rltt_logprob_chunk_size`、
   `loop_weighting`、`progressive_alpha`、`ref_offload: true`、`no_gradient_checkpointing: false`、
@@ -102,6 +103,30 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 （512 条 rollout）、梯度累积 1、mini-batch 64 题、100 步 = 100 次优化器更新，warmup 10 步
 （用户 2026-11-05 指定；论文 Table 6 是每步 32 题、累积 2、140 步）。
 `test_matched_groups_are_one_update_per_step` 锁定这些值，改动要整组一起改。
+
+## loss 聚合：按方法设置（`loss_agg` 段，用户 2026-11-14 指定）
+
+- verl 0.6.1 的 `token-mean` 在每个 micro-batch 内按 token 平均再乘 `B/N`，动态 batch 下 token 权重取决于
+  切分。`loss_agg` 段（`rltt_baseline/loss_agg.py`）改为每条回答一个只取决于它自己的除数 `d_i`，
+  micro-batch 贡献 `(1/B)·Σ_i S_i/d_i`（每个 micro-batch 从自己的 `response_mask` 算 `d_i`），整步 loss 与切分无关：
+  - **PLC（所有 PLC 配置）**：`mode: drgrpo`、`norm_len: 16384`（Dr. GRPO，`d_i = M`），整步
+    `Σ token loss / (条数 · 16384)`。作用于 PLC loss 的每一项（最后一轮 GRPO、代理目标、k1、KD、锚定项、
+    熵和 KL 项）。
+  - **GRPO（两份 GRPO 配置）**：`mode: seq-mean-token-mean`（`d_i = L_i`，该回答自己的长度），每条回答先在
+    自己的 token 上平均、再对 512 条回答平均，即原始 GRPO（DeepSeekMath）的 `1/G Σ_i 1/|o_i| Σ_t`（用户
+    2026-11-14 指定；同日早先的 `group-token-mean` 已删除）。Dr. GRPO 指出它有长度偏差。由
+    `grpo_workers.py` 的 `RowAggPPOActor` 实现（verl 0.6.1 `update_policy` 的副本，只换聚合；策略项是
+    `plc.grpo_policy_loss`，与 verl vanilla 和 PLC 最后一轮同一个逐元素目标）。不直接用 verl 的
+    `loss_agg_mode: seq-mean-token-mean`，因为 driver 的 `actor/entropy` 指标也用它，会让 GRPO 的熵指标和
+    PLC / RLTT 的口径不同。
+  - **RLTT**：不写 `loss_agg`，保留原作 micro-batch 内 token-mean（loss 在 `third_party` 里，不能改）。
+    launcher 拒绝给不带 PLC 的 `trainer: rltt` 设别的模式。
+- verl 的 `actor.loss_agg_mode` 保持 `token-mean`（driver 的 `actor/entropy` 指标用它），launcher 拒绝改它。
+- 后果，写实验记录时要注明：三种方法的曲线差异里包含聚合方式的差异；`plc.lam=0` 不再等于 GRPO 配置
+  （只差聚合）；2026-11-14 之前的 GRPO / PLC 结果是旧聚合方式；`actor/pg_loss`、`actor/total_loss`
+  的量级变了（drgrpo 下约小 `平均长度/16384` 倍），`loss_agg/row_div_mean` 记录平均除数。
+- 新增一种 PLC 配置时照样写 `loss_agg` 段；`tests/test_loss_agg.py` 检查各配置的取值、切分无关性和
+  dry-run 输出，`_method_free_view` 把 `loss_agg` 当作方法相关的段。
 
 ## vLLM token 预算：32768
 

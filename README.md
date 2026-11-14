@@ -30,7 +30,8 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/metrics.py` | driver 端的推理 RL 指标（训练正确率、组内全对/全错/混合比例、截断率、正确与错误回答长度等） |
 | `rltt_baseline/workers.py` | RLTT 训练时额外记录逐轮熵、期望退出轮次和总 loss，原作的 loss 计算不变 |
 | `rltt_baseline/plc.py`、`plc_workers.py` | PLC（`plc.enabled`，默认关闭）：最后一轮做 GRPO，前几轮用截断重要性比率的 off-policy PPO 代理目标加指向最后一轮的正向 KL 信赖域；λ=0 退回 GRPO |
-| `rltt_baseline/loop_audit.py`、`grpo_workers.py` | 逐轮分布审计（`audit.loop_distribution`，所有配置都打开）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
+| `rltt_baseline/loop_audit.py` | 逐轮分布审计（`audit.loop_distribution`，所有配置都打开）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
+| `rltt_baseline/loss_agg.py`、`grpo_workers.py` | loss 聚合方式（`loss_agg` 段）：Dr. GRPO 常数归一化、按题组内 token 平均；结果与 micro-batch 怎么切无关。GRPO 由 `grpo_workers.py` 的 `RowAggPPOActor` 实现，PLC 由 `plc_workers.py` 实现；`grpo_workers.py` 同时挂逐轮分布审计 |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
 | `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
 
@@ -115,7 +116,7 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 
 ### 配置对照组
 
-配置按对照组组织，组内文件除方法本身（`trainer`、loss、`plc` 段、wandb 命名）外每个参数都必须相同，
+配置按对照组组织，组内文件除方法本身（`trainer`、loss、`plc` 段、`loss_agg` 段、wandb 命名）外每个参数都必须相同，
 这样三种方法可以直接对比：
 
 | 组 | GRPO | RLTT | PLC |
@@ -133,6 +134,29 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
 随机种子全部锁定 42：`args.seed: 42`，且 `verl_overrides.data.seed: ${args.seed}`（verl 0.6.1 的 dataloader
 打乱种子默认为空，不从 `args.seed` 派生）；vLLM 引擎 seed 在 verl 0.6.1 不可配置（固定 0，各方法相同）。
 诊断脚本 `rltt_baseline.diagnostics.rollouts` / `probe` 和原作评估脚本的默认 seed 也都是 42。
+
+### loss 聚合（`loss_agg` 段，2026-11-14 起按方法设置）
+
+verl 0.6.1 的 `token-mean` 在每个 micro-batch 内部按 token 平均，再乘 `该块条数 / mini-batch 条数`；
+开着动态 batch 时 micro-batch 按 token 数切分，同一个 token 的权重因此取决于和谁分在一块。
+`loss_agg` 段换成与切分无关的聚合：每条回答 i 有一个只取决于它自己的除数 `d_i`（每个 micro-batch
+从自己的 `response_mask` 算出），一个 B 条的 micro-batch 贡献 `(1/B)·Σ_i S_i / d_i`（`S_i` 为该条回答所有 token 的 loss 之和），
+乘上 verl 的 `B/N` 并经 FSDP 跨卡平均后，整步的 loss 就是 `Σ_i S_i / d_i / (总条数)`：
+
+| `mode` | `d_i` | 整步 loss | 使用者 |
+|---|---|---|---|
+| `token-mean`（默认） | — | verl 原样，micro-batch 内 token 平均 | RLTT（原作 loss 写死在 `third_party`，不能改） |
+| `drgrpo` | `norm_len`（M） | `Σ_i S_i / (总条数 · M)`，Dr. GRPO | 所有 PLC 配置，`norm_len: 16384` |
+| `seq-mean-token-mean` | 该回答自己的长度 `L_i` | `Σ_i (S_i / L_i) / 总条数`，每条回答先按自己的 token 平均，再对回答平均（原始 GRPO） | 两份 GRPO 配置 |
+
+`seq-mean-token-mean` 就是 DeepSeekMath 里 GRPO 的 `1/G Σ_i 1/|o_i| Σ_t`；Dr. GRPO 指出它有长度偏差
+（长的错误回答每个 token 受的惩罚更小）。GRPO 不直接用 verl 的同名 `loss_agg_mode`，是因为 driver 的
+`actor/entropy` 指标也读它，GRPO 的熵指标会和其他方法口径不同。verl 自己的
+`loss_agg_mode` 保持 `token-mean`（driver 的 `actor/entropy` 指标用它），launcher 拒绝改成别的值。
+记录的 `actor/entropy_loss`、`actor/kl_loss` 仍是 token 平均；`actor/pg_loss`、`actor/total_loss`
+按新的聚合计算，数值量级与以前不同（`drgrpo` 约小 `平均长度/16384` 倍）。新指标
+`loss_agg/row_div_mean` 是每个 micro-batch 的平均除数。`tests/test_loss_agg.py` 模拟 verl 的切分和
+跨卡平均，检查两种模式的每 token 梯度与闭式解一致、与切分无关。
 
 ### GRPO 8 卡配置要点（`configs/grpo_baseline_8gpu.yaml`）
 
@@ -158,7 +182,8 @@ W=/path/to/workdir        # venv、数据、模型、输出都放这里
   （论文：每步 32 题、累积 2、140 步）。
 - AdamW8bit，lr 1e-6（constant，前 10% 步 warmup），betas (0.9, 0.99)，weight decay 0.1，
   梯度裁剪 0.1；KL 关闭（`beta: 0`、`use_kl_loss: false`、`kl_loss_coef: 0`，所有配置相同）；
-  clip 0.2，token-mean。
+  clip 0.2；loss 每条回答先按自己的 token 平均、再对回答平均，即原始 GRPO（`loss_agg.mode:
+  seq-mean-token-mean`，2026-11-14 起；之前是 verl 的 micro-batch 内 token-mean）。
 - 每步存 checkpoint（`save_steps: 1`，用户 2026-11-07 要求；含 `hf_model`，供逐轮梯度探测）。
   内容是 model + optimizer + extra + hf_model，verl 默认全部保留，100 步就是 100 份；粗估每份 1.4B 约 20 GB、
   2.6B 约 40 GB（未实测），要留足磁盘，或整组一起加 `verl_overrides.trainer.max_actor_ckpt_to_keep`。
@@ -289,9 +314,12 @@ PPO 代理目标学习，再加指向最后一轮的正向 KL 信赖域：
 - **损失**：`-agg_j[PPO^(T)(Â)] + λ·Σ_{t<T} α_t·( -agg_j[ρ̄[j,t]·PPO^(t)(Â)] + kl_coef·agg_j[k1[j,t]] )`，
   `ρ̄[j,t] = min(trunc_cap, P_old^(t)(y_j)/P_old^(T)(y_j))`（只截上限，不回传梯度），
   `k1[j,t] = log P_old^(T)(y_j) − log P^(t)(y_j)`（最后一轮自己样本上 `KL(P^(T)‖P^(t))` 的无偏估计，
-  梯度就是第 t 轮在 rollout token 上的交叉熵），`α_t = 1/(T−1)`，`agg` 是 actor 的 `loss_agg_mode`
-  （token-mean）。每轮一个 PPO ratio `exp(ℓ_new − ℓ_old)`，clip 用 verl 的 `clip_ratio` / 双重 clip。
-  最后一轮那一项就是 GRPO，λ=0 时与 verl GRPO 的 loss 逐位相等（`test_lam0_is_verl_grpo_on_the_final_loop`）。
+  梯度就是第 t 轮在 rollout token 上的交叉熵），`α_t = 1/(T−1)`。`agg` 由 `loss_agg` 段决定：
+  2026-11-14 起所有 PLC 配置用 Dr. GRPO（`mode: drgrpo`，`norm_len: 16384`），每一项都是
+  `Σ token / (条数 · 16384)`；不写 `loss_agg` 时是 verl 的 micro-batch 内 token-mean。每轮一个 PPO ratio `exp(ℓ_new − ℓ_old)`，clip 用 verl 的 `clip_ratio` / 双重 clip。
+  最后一轮那一项就是 GRPO，λ=0 且 `loss_agg` 为 token-mean 时与 verl GRPO 的 loss 逐位相等
+  （`test_lam0_is_verl_grpo_on_the_final_loop`）；用 Dr. GRPO 聚合时，λ=0 是"Dr. GRPO 聚合的 GRPO"，
+  与 GRPO 配置（按题组内 token 平均）不同。
   每步一次更新时，第 t 轮每个 token 的梯度系数是 `−(λ/N)·α_t·(ρ̄·Â + kl_coef)`
   （`test_trust_region_gradient_is_rho_a_plus_kl_coef_per_token`）。熵项和 KL（`low_var_kl`）只加在最后一轮，
   与原作相同；对照组配置里 KL 关闭，熵系数为 0。gate 不进入 loss。
@@ -538,6 +566,9 @@ python -m pytest tests          # 需要 transformers >= 4.56 的测试会自动
 - RLTT：原作论文写 140 步、Ouro-2.6B-Thinking；原作 `run_rltt.slurm` 默认 1.4B、5 个 epoch。配置按论文。
 - RLTT：原作 actor 没有对 `exit_pdf` 权重做 detach，梯度会流入 exit gate；`prepare_model --detach-exit-pdf` 可关闭。
 - RLTT：不支持熵正则（`entropy_coeff` 必须为 0），逐轮熵只用于记录。
+- loss 聚合三种方法不同（2026-11-14 起）：GRPO 用原始 GRPO 的逐回答平均，PLC 用 Dr. GRPO（M = 16384），RLTT 保留
+  原作的 micro-batch 内 token-mean。PLC 的 `plc.lam=0` 因此不再等于 GRPO 配置（只差聚合方式），三种方法的
+  曲线差异里也包含聚合方式的差异；之前跑的 GRPO / PLC 结果是旧的聚合方式。
 - 少于 2 张 GPU 时原作会换用自己的单卡训练器，本仓库的配置覆盖和新增指标不会生效，因此 launcher 直接拒绝。
 - `rollout.kv_layout=decode_last` 只作用于 vLLM rollout；训练 forward 仍是完整 KV，见上文。
 - RLTT 原作的 requirements 是自身有冲突的 pip freeze（numpy 1.26.4 与 opencv-python-headless 4.12），
