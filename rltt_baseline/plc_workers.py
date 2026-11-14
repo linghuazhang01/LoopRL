@@ -32,6 +32,13 @@ the response positions only) and backpropagates ``plc.plc_kd_loss`` instead: GRP
 loop plus ``lam * alpha_t`` times those losses; the KD statistics go to ``plc/kd_*/loop_t``. The
 old-policy pass is unchanged.
 
+With a row-normalized ``loss_agg.mode`` (``actor_rollout_ref.loss_agg``, from the config
+section ``loss_agg``) every micro-batch computes per-response divisors ``d_i`` from its own
+``response_mask`` (``rltt_baseline.loss_agg.row_divisors``: ``norm_len`` for drgrpo, the response
+length for seq-mean-token-mean) and every loss term aggregates as ``(1 / B) sum_i S_i / d_i``
+instead of the micro-batch token mean. With the default ``token-mean``
+nothing changes. The logged ``actor/entropy_loss`` and ``actor/kl_loss`` stay token means.
+
 Per-token weight statistics are logged under ``plc/``, one scalar key per loop
 (``plc/<name>/loop_<t>``, ``plc.flatten_loop_metrics``): verl's ``reduce_metrics`` takes the mean
 of each key's per-micro-batch list, which would also average a per-loop list over its loops.
@@ -61,7 +68,7 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
-from rltt_baseline import plc
+from rltt_baseline import loss_agg, plc
 from rltt_baseline.loop_audit import attach_loop_audit
 from rltt_baseline.workers import MetricsRLTTActor
 
@@ -71,7 +78,8 @@ INIT_LOOPS_KEY = "init_log_probs_loops"
 
 class PLCActor(MetricsRLTTActor):
     def __init__(self, config, actor_module, actor_optimizer=None, settings=None,
-                 total_ut_steps: int = 4, init_module=None):
+                 total_ut_steps: int = 4, init_module=None,
+                 loss_agg_settings: Optional[loss_agg.LossAggSettings] = None):
         if settings is None:
             raise ValueError("PLCActor needs PLCSettings")
         super().__init__(
@@ -81,6 +89,7 @@ class PLCActor(MetricsRLTTActor):
             total_ut_steps=total_ut_steps,
         )
         self.settings = settings
+        self.loss_agg = loss_agg_settings or loss_agg.LossAggSettings()
         if settings.uses_init_model and init_module is None:
             raise ValueError("plc.init_kl_coef > 0 needs the frozen initial model (init_module)")
         self.init_module = init_module if settings.uses_init_model else None
@@ -258,6 +267,7 @@ class PLCActor(MetricsRLTTActor):
         use_ref_log_prob = "ref_log_prob" in data.batch.keys()
         if use_ref_log_prob:
             select_keys.append("ref_log_prob")
+        row_normalized = self.loss_agg.row_normalized
         batch = data.select(batch_keys=select_keys).batch
         metrics: Dict[str, object] = {}
         dataloader = batch.split(self.config.ppo_mini_batch_size)
@@ -284,6 +294,9 @@ class PLCActor(MetricsRLTTActor):
                     weights, kl_weights, init_weights = self._loop_weights(ell_old)
                     ell_init = (micro[INIT_LOOPS_KEY].float()
                                 if self.init_module is not None else None)
+                    # per-response divisors d_i (a function of each row alone)
+                    row_div = (loss_agg.row_divisors(self.loss_agg, response_mask)
+                               if row_normalized else None)
 
                     kd_stats = None
                     if settings.loop_loss == "kd":
@@ -293,7 +306,8 @@ class PLCActor(MetricsRLTTActor):
                             ell_new, ell_old, advantages, response_mask, kd, settings.lam,
                             loss_agg_mode=loss_agg_mode, init_kl_coef=settings.init_kl_coef,
                             logp_init=ell_init, init_kl_form=settings.init_kl_form,
-                            init_kl_log_ratio_cap=settings.init_kl_log_ratio_cap, **clip)
+                            init_kl_log_ratio_cap=settings.init_kl_log_ratio_cap,
+                            row_div=row_div, **clip)
                         del kd
                     else:
                         entropy, ell_new = self._forward_micro_batch_plc(micro, temperature)
@@ -303,13 +317,17 @@ class PLCActor(MetricsRLTTActor):
                             kl_weights=kl_weights, init_kl_coef=settings.init_kl_coef,
                             logp_init=ell_init, init_weights=init_weights,
                             init_kl_form=settings.init_kl_form,
-                            init_kl_log_ratio_cap=settings.init_kl_log_ratio_cap, **clip)
+                            init_kl_log_ratio_cap=settings.init_kl_log_ratio_cap,
+                            row_div=row_div, **clip)
                     policy_loss = pg_loss
 
+                    # entropy_loss / kl_loss are logged as token means; the loss terms use the
+                    # configured aggregation (agg_term = agg_loss when row_div is None)
                     entropy_loss = plc.agg_loss(entropy, response_mask, loss_agg_mode)
                     entropy_coeff = float(self.config.entropy_coeff)
                     if entropy_coeff != 0:
-                        policy_loss = policy_loss - entropy_loss * entropy_coeff
+                        policy_loss = policy_loss - entropy_coeff * plc.agg_term(
+                            entropy, response_mask, loss_agg_mode, row_div)
 
                     # KL to the frozen reference on the final loop only (RLTT Eq. 7)
                     ref_key = "ref_log_prob" if use_ref_log_prob else "old_log_probs"
@@ -317,7 +335,8 @@ class PLCActor(MetricsRLTTActor):
                     kld = plc.low_var_kl(ell_new[..., -1], ref_log_prob.float())
                     kl_loss = plc.agg_loss(kld, response_mask, loss_agg_mode)
                     kl_coef = float(self.config.kl_loss_coef)
-                    policy_loss = policy_loss + kl_loss * kl_coef
+                    policy_loss = policy_loss + plc.agg_term(
+                        kld, response_mask, loss_agg_mode, row_div) * kl_coef
 
                     if self.config.use_dynamic_bsz:
                         scale = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -333,6 +352,8 @@ class PLCActor(MetricsRLTTActor):
                         "actor/kl_coef": kl_coef,
                         "actor/total_loss": policy_loss.detach().item(),
                     })
+                    if row_div is not None:
+                        step_metrics["loss_agg/row_div_mean"] = row_div.mean().item()
                     if settings.log_weight_stats:
                         step_metrics.update(plc.weight_stats(weights, ell_old, response_mask))
                     step_metrics.update(plc.cross_loop_stats(
@@ -369,6 +390,10 @@ class PLCActorRolloutRefWorker(ActorRolloutRefWorker):
         super().__init__(native_config, role, **kwargs)
         self.settings = settings
         self.total_ut_steps = config.get("total_ut_steps", 4)
+        # actor_rollout_ref.loss_agg (launcher, only when loss_agg.mode is row-normalized)
+        raw_agg = config.get("loss_agg", None)
+        self.loss_agg_settings = loss_agg.LossAggSettings.from_mapping(
+            OmegaConf.to_container(raw_agg, resolve=True) if raw_agg is not None else None)
 
     def _build_init_module(self):
         """Frozen copy of the initial model, built like verl 0.6.1's reference model.
@@ -418,10 +443,12 @@ class PLCActorRolloutRefWorker(ActorRolloutRefWorker):
                 settings=self.settings,
                 total_ut_steps=self.total_ut_steps,
                 init_module=self.init_module_fsdp,
+                loss_agg_settings=self.loss_agg_settings,
             )
             attach_loop_audit(self.actor, self.config.get("loop_audit"), self.rank)
             if self.rank == 0:
-                print(f"[rltt_baseline] PLCActor {self.settings.describe()} pid={os.getpid()} "
+                print(f"[rltt_baseline] PLCActor {self.settings.describe()} "
+                      f"{self.loss_agg_settings.describe()} pid={os.getpid()} "
                       f"python={sys.executable}", flush=True)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

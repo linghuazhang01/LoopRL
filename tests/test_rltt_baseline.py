@@ -383,7 +383,8 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 
 # ---------- comparison groups (CLAUDE.md) ----------
 
-# Configs in one group differ only in the method (trainer, loss, plc section, wandb naming);
+# Configs in one group differ only in the method (trainer, loss, plc and loss_agg sections, wandb
+# naming);
 # every other setting must be identical so the runs can be compared.
 MATCHED_GROUPS = {
     "1.4B": {"grpo": "grpo_baseline_1p4b_8gpu.yaml", "rltt": "rltt_baseline_1p4b_8gpu.yaml",
@@ -425,6 +426,9 @@ def _method_free_view(name):
     cfg = OmegaConf.to_container(rcfg.load_config(str(paths.config_file(name))), resolve=True)
     trainer = cfg.pop("trainer")
     cfg.pop("plc", None)
+    # loss aggregation is part of the method since 2026-11-14 (user): GRPO group-token-mean,
+    # PLC Dr. GRPO, RLTT the vendor token-mean (test_loss_agg.py checks the values)
+    cfg.pop("loss_agg", None)
     for key in WANDB_NAMING_KEYS:
         cfg["wandb"].pop(key, None)
     args = cfg["args"]

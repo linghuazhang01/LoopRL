@@ -51,6 +51,15 @@ A config file has these top-level keys:
     When enabled
     the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
     uses ``PLCActorRolloutRefWorker``.
+``loss_agg``
+    How each loss term is aggregated over tokens (``rltt_baseline.loss_agg``). ``mode``:
+    ``token-mean`` (default: verl's own aggregation, a token mean inside each micro-batch),
+    ``drgrpo`` (Dr. GRPO: sum over tokens / (rows * ``norm_len``), ``norm_len`` required) or
+    ``seq-mean-token-mean`` (original GRPO: each response's token mean, then mean over responses).
+    Both row-normalized modes are independent of the micro-batch split. They are
+    implemented for PLC (``PLCActorRolloutRefWorker``) and GRPO (``RowAggPPOActor`` in
+    ``LoopRLGRPOActorRolloutRefWorker``); the vendor RLTT loss only has ``token-mean``. When not
+    ``token-mean`` the section is passed to the workers as ``actor_rollout_ref.loss_agg``.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
 ``args.learning_rate=2e-6 verl_overrides.trainer.save_freq=20 wandb.mode=online``.
@@ -62,17 +71,20 @@ import difflib
 import hashlib
 import os
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Mapping, MutableMapping, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
 from rltt_baseline import decode_last
+from rltt_baseline.loss_agg import LossAggSettings
 from rltt_baseline.plc import PLCSettings
 
 SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit",
-            "plc")
-DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit", "plc")
+            "plc", "loss_agg")
+DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit", "plc",
+                 "loss_agg")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
@@ -118,6 +130,7 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
         raise KeyError(f"unknown audit keys {sorted(bad)}; allowed {sorted(AUDIT_KEYS)}")
     check_loop_audit(cfg.audit.get("loop_distribution"))
     plc_settings(cfg)  # validates the plc section
+    loss_agg_settings(cfg)  # validates the loss_agg section
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
     if cfg.rollout.kv_layout not in KV_LAYOUTS:
@@ -478,6 +491,33 @@ def add_plc_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace
         raise ValueError("plc.enabled cannot be combined with args.loop_weighting=learned")
     values = {k: v for k, v in settings.__dict__.items()}
     return _deep_merge(overrides, {"actor_rollout_ref": {"actor": {"plc": values}}})
+
+
+def loss_agg_settings(cfg: DictConfig) -> LossAggSettings:
+    """The validated ``loss_agg`` section (``token-mean`` when the section is empty)."""
+    section = cfg.get("loss_agg")
+    values = OmegaConf.to_container(section, resolve=True) if section is not None else {}
+    return LossAggSettings.from_mapping(values)
+
+
+def add_loss_agg_overrides(cfg: DictConfig, overrides: dict) -> dict:
+    """``overrides`` plus ``actor_rollout_ref.loss_agg`` when ``loss_agg.mode`` is not token-mean.
+
+    Refuses the combinations the actors cannot honour: the vendor RLTT loss (``trainer: rltt``
+    without PLC) aggregates inside ``third_party``; a verl ``loss_agg_mode`` other than token-mean
+    would be silently ignored by the loss.
+    """
+    settings = loss_agg_settings(cfg)
+    if not settings.row_normalized:
+        return overrides
+    if cfg.trainer == "rltt" and not plc_settings(cfg).enabled:
+        raise ValueError(f"loss_agg.mode={settings.mode} is implemented for PLC and GRPO only; "
+                         "the vendor RLTT loss (trainer=rltt without plc) is token-mean")
+    actor = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
+    if actor.get("loss_agg_mode", "token-mean") != "token-mean":
+        raise ValueError(f"loss_agg.mode={settings.mode} replaces verl's loss_agg_mode in the "
+                         "loss; leave actor_rollout_ref.actor.loss_agg_mode at token-mean")
+    return _deep_merge(overrides, {"actor_rollout_ref": {"loss_agg": asdict(settings)}})
 
 
 def check_rollout_token_budget(overrides: dict, args: argparse.Namespace) -> None:

@@ -23,7 +23,7 @@ What this adds around the vendor script (whose files are not modified; located b
 8. the resolved config is saved to ``<output_dir>/rltt_baseline_config.yaml``;
 9. ``audit.loop_distribution.enabled`` writes per-loop token distributions to
    ``<output_dir>/audit/`` (``rltt_baseline.loop_audit``); for GRPO it also selects
-   ``AuditGRPOActorRolloutRefWorker``;
+   ``LoopRLGRPOActorRolloutRefWorker``;
 10. ``plc.enabled`` (RLTT trainer) replaces the vendor loss by PLC (``rltt_baseline.plc``: GRPO
     on the final loop plus the earlier-loop auxiliary term) through ``PLCActorRolloutRefWorker``;
 11. when neither ``actor.use_kl_loss`` nor ``algorithm.use_kl_in_reward`` is on in the final verl
@@ -40,6 +40,10 @@ What this adds around the vendor script (whose files are not modified; located b
 14. the HF actor forward must give the last loop's logits (the loop vLLM samples from): the
     final verl overrides must set ``actor_rollout_ref.model.override_config.early_exit_threshold``
     to null, else the dry-run already refuses (``check_last_loop_logits``).
+15. a row-normalized ``loss_agg.mode`` (``rltt_baseline.loss_agg``) passes the section as
+    ``actor_rollout_ref.loss_agg``; PLC applies it in ``PLCActor``, GRPO through
+    ``LoopRLGRPOActorRolloutRefWorker`` (``RowAggPPOActor``). Not available for the vendor RLTT
+    loss (``add_loss_agg_overrides`` refuses it).
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -61,6 +65,7 @@ from omegaconf import OmegaConf
 
 from rltt_baseline.config import (
     add_audit_overrides,
+    add_loss_agg_overrides,
     add_plc_overrides,
     add_rollout_overrides,
     apply_verl_overrides,
@@ -72,6 +77,7 @@ from rltt_baseline.config import (
     env_file_path,
     load_config,
     load_env_file,
+    loss_agg_settings,
     plc_settings,
     policy_violations,
     reference_policy_status,
@@ -195,12 +201,12 @@ def install_plc_worker() -> None:
     verl_rltt.RLTTActorRolloutRefWorker = PLCActorRolloutRefWorker
 
 
-def install_grpo_audit_worker() -> None:
+def install_grpo_worker() -> None:
     import verl_grpo
 
-    from rltt_baseline.grpo_workers import AuditGRPOActorRolloutRefWorker
+    from rltt_baseline.grpo_workers import LoopRLGRPOActorRolloutRefWorker
 
-    verl_grpo.GRPOActorRolloutRefWorker = AuditGRPOActorRolloutRefWorker
+    verl_grpo.GRPOActorRolloutRefWorker = LoopRLGRPOActorRolloutRefWorker
 
 
 def install_reasoning_metrics(args, loop_audit=None) -> None:
@@ -245,7 +251,9 @@ def main(argv=None) -> int:
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
     overrides = add_audit_overrides(cfg, add_rollout_overrides(cfg, verl_overrides(cfg)), args)
     overrides = add_plc_overrides(cfg, overrides, args)
+    overrides = add_loss_agg_overrides(cfg, overrides)
     plc = plc_settings(cfg)
+    agg = loss_agg_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
     check_rollout_token_budget(overrides, args)
     check_last_loop_logits(overrides)
@@ -305,8 +313,8 @@ def main(argv=None) -> int:
         install_plc_worker()
     elif cfg.trainer == "rltt":
         install_metrics_worker()
-    elif loop_audit:
-        install_grpo_audit_worker()
+    elif loop_audit or agg.row_normalized:
+        install_grpo_worker()
     install_reasoning_metrics(args, loop_audit)
     vendor.main()
     return 0

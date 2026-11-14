@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf, open_dict
 
-from rltt_baseline import plc
+from rltt_baseline import loss_agg, plc
 
 pytest.importorskip("verl", reason="requires the train extra (verl 0.6.1)")
 
@@ -47,6 +47,7 @@ def worker_type():
         "ActorRolloutRefWorker": NativeWorker,
         "OmegaConf": OmegaConf,
         "plc": plc,
+        "loss_agg": loss_agg,
         "PLCActor": lambda **kwargs: SimpleNamespace(**kwargs),
         "attach_loop_audit": lambda *args: None,
         "os": os,
