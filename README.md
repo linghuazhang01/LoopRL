@@ -583,6 +583,36 @@ python -m rltt_baseline.diagnostics.probe --model $LOOPRL_MODEL_DIR --rollouts r
 `probe.py` 对每个 batch 把题目组分成 A、B 两半，按 GRPO、第 4 轮 NLL、Ouro SFT 式（exit 概率混合 logits）
 三种 loss 分别求每一轮的梯度，保存每个参数张量的 Gram 矩阵（`grams.pt`）和汇总（`summary.json`）。
 
+### LoopCD 跨轮对比解码评测（只用于评测）
+
+Apple 的 LoopCD（Liu et al., arXiv 2610.02185）：以最后一轮 s 为来源轮、较早的第 r 轮为参照轮做外推，
+不训练。代码在 `rltt_baseline/loop_cd.py`（公式与配置）、`rltt_baseline/vllm_loop_cd.py`（vLLM 模型类
+`OuroLoopCDForCausalLM`）、`rltt_baseline/eval_loopcd.py`（评测入口）。训练、rollout 和配置对照组都不受影响。
+
+- logits 形式：z' = z_s + ω(z_s − z_r)，等价于 p' ∝ p_s (p_s/p_r)^ω。外推结果本身不归一化，代码返回
+  log_softmax；temperature / top-p 在外推之后由 sampler 施加，与论文一致。
+- 自适应强度：ω = ω_max[1 − (p₍₁₎ − p₍₂₎)]，p 取第 s 轮在温度 1 下的分布。
+- hidden 形式：在最终 RMSNorm 之前的状态上做 h_s + ω(h_s − h_r)，lm_head 只算一次；只支持固定强度。
+- 论文在 Ouro 上的取值（Table A4，参照轮都是第 1 轮）：1.4B-Thinking 数学推理固定 0.5，自适应上限 1.0；
+  2.6B-Thinking 分别是 0.5 和 1.5；greedy 生成固定 0.3。ω 超过约 0.6 时生成质量崩溃。
+- `--delta-cap` 是本仓库加的（论文没有，默认关闭）：把 log p_s − log p_r 截断到 [−c, c]。
+
+```bash
+python -m rltt_baseline.eval_loopcd --model <dir> --data aime24.jsonl --out out/aime24_base        # 不引导
+python -m rltt_baseline.eval_loopcd --model <dir> --data aime24.jsonl --out out/aime24_cd05 --omega 0.5
+python -m rltt_baseline.eval_loopcd --model <dir> --data aime24.jsonl --out out/aime24_ada --omega 1.0 --adaptive
+python -m rltt_baseline.eval_loopcd ... --ref-loop 2 --omega 0.3      # 第 4 轮对第 2 轮
+python -m rltt_baseline.eval_loopcd ... --loops 2 --omega 0.5         # 半深度：来源轮 = 第 2 轮
+```
+
+默认设置：每题 8 次、16,384 token、temperature 0.6、top-p 0.95、seed 42，prompt 和判分沿用 RLTT 评测的
+`math_utils`。默认 `enforce_eager`：logits 形式的 forward 输出宽度是 2×hidden，CUDA graph 下还没验证。
+适用的 vLLM 版本：0.12 / 0.14 / 0.15 和 B200 目标环境的 0.24.0（`runtime_compat.require_loop_cd_runtime`），
+这些版本的 Ouro 模型接口一致，Ouro 都走 V1 model runner；其他版本直接报错。
+vLLM 部分只能在 GPU 环境里验证；`tests/test_loop_cd.py` 在 CPU 上检查公式、归一化，以及在模拟 vLLM
+原地 fused add 的桩上检查逐轮读出。第一次在 GPU 上跑时，先用 `--omega 0 --loopcd-arch-at-zero` 和
+不加这个开关各跑一次，确认两者结果相同。
+
 ## 测试
 
 ```bash

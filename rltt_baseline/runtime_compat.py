@@ -57,3 +57,23 @@ def require_decode_last_runtime(version=None):
         "Supported contracts are vLLM 0.12.x/0.15.x and 0.24.0. "
         "No automatic fallback to another KV layout is applied."
     )
+
+
+LOOP_CD_VLLM = ("0.12.", "0.14.", "0.15.", "0.24.0")
+
+
+def require_loop_cd_runtime(version=None):
+    """vLLM versions whose Ouro model (loop, fused-add norm, lm_head) LoopCD was checked against.
+
+    LoopCD only replaces ``OuroModel.forward``'s readout and ``compute_logits``; it does not touch
+    KV caches, so it has no cache contract. 0.14 and 0.24 Ouro sources differ only in typing and
+    kv-scale loading.
+    """
+    version = version or metadata.version("vllm")
+    base = version.split("+", 1)[0]
+    if base.startswith(LOOP_CD_VLLM[:3]) or base == LOOP_CD_VLLM[3]:
+        return base
+    raise RuntimeError(
+        f"LoopCD is not validated for vLLM {version}; checked: 0.12.x, 0.14.x, 0.15.x, 0.24.0. "
+        "Compare vllm/model_executor/models/ouro.py with 0.24.0 before adding a version."
+    )

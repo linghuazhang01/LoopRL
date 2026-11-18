@@ -29,3 +29,13 @@ def test_decode_last_selects_audited_cache_contract():
     assert require_decode_last_runtime("0.15.0") == "legacy"
     with pytest.raises(RuntimeError, match="not validated"):
         require_decode_last_runtime("0.25.0")
+
+
+def test_loop_cd_accepts_checked_vllm_versions():
+    from rltt_baseline.runtime_compat import require_loop_cd_runtime
+
+    for version in ("0.12.0", "0.14.0", "0.15.1", "0.24.0+cu130"):
+        assert require_loop_cd_runtime(version) == version.split("+")[0]
+    for version in ("0.24.1", "0.25.0", "0.11.2"):
+        with pytest.raises(RuntimeError, match="not validated"):
+            require_loop_cd_runtime(version)
