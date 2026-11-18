@@ -7,10 +7,10 @@ name = "looprl"
 version = "0.1.0"
 description = "RL on looped language models; RLTT baseline on Ouro"
 requires-python = ">=3.10"
-dependencies = ["omegaconf>=2.3", "pyyaml>=6", "numpy", "torch"]
+dependencies = ["omegaconf>=2.3", "pyyaml>=6", "numpy", "torch==2.11.0"]
 
 [project.optional-dependencies]
-train = ["verl==0.6.1", "vllm==0.12.0", "transformers==4.57.3", "ray", "wandb"]
+train = ["verl==0.9.1", "vllm==0.24.0", "transformers==5.9.0", "ray", "wandb"]
 dev = ["pytest>=8", "ruff>=0.9"]
 
 [tool.setuptools.packages.find]

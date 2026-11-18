@@ -33,9 +33,9 @@ commit `06189850`，不做任何修改。本仓库只补上原作缺少的部分
 | `rltt_baseline/loop_audit.py` | 逐轮分布审计（`audit.loop_distribution`，所有配置都打开）：每个生成 token 上各轮分布的 KL、熵和 top-k，按步写入 `audit/` |
 | `rltt_baseline/loss_agg.py`、`grpo_workers.py` | loss 聚合方式（`loss_agg` 段）：Dr. GRPO 常数归一化、按题组内 token 平均；结果与 micro-batch 怎么切无关。GRPO 由 `grpo_workers.py` 的 `RowAggPPOActor` 实现，PLC 由 `plc_workers.py` 实现；`grpo_workers.py` 同时挂逐轮分布审计 |
 | `rltt_baseline/diagnostics/` | 逐轮梯度探测：rollout 生成（`rollouts.py`）与探测（`probe.py`），GRPO loss 与 verl 0.6.1 逐项一致 |
-| `configs/rltt_env.lock.txt`、`scripts/setup_env.sh` | 训练环境（verl 0.6.1、vLLM 0.12.0、torch 2.9.0、transformers 4.57.3）的锁定文件和安装脚本 |
+| `b300.environment.yaml`、`configs/b300.requirements.txt`、`scripts/setup_env.sh` | 历史 B300 环境目标；新迁移目标见 `b200_environment.yaml` |
 
-对官方 Ouro 代码只做了一处修改：transformers 4.57 把 `check_model_inputs` 改成了 decorator
+对官方 Ouro 代码的兼容改动包括 mask/cache 签名桥接，以及 decorator 适配：transformers 4.57 把 `check_model_inputs` 改成了 decorator
 factory，官方 `modeling_ouro.py` 直接加载会报 `wrapped_fn() got an unexpected keyword argument`。
 `prepare_model` 在生成的 `modeling_ouro_base.py` 中加了一个兼容 wrapper，同时支持新旧两种接口。
 
@@ -52,7 +52,9 @@ configs/plc_grpo_loopaux_nokl_1p4b_8gpu.yaml  同上但去掉正向 KL 项（`pl
 configs/plc_grpo_loopkd_1p4b_8gpu.yaml  PLC：GRPO + 前几轮向 stop-gradient 第 4 轮做全词表蒸馏（`plc.loop_loss: kd`），1.4B
 configs/plc_grpo_loopkd_rev_1p4b_8gpu.yaml  同上但用 reverse KL（`plc.kd_divergence: reverse`，OPD / LoopOPD 的方向），1.4B
 configs/plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml  PLC：精确比率（无上界）+ 初始模型锚定项（k3，0.1），去掉 k1，1.4B
-configs/rltt_env.lock.txt   训练环境锁定文件
+b200_environment.yaml     B200 迁移目标环境定义
+configs/b200.requirements.txt  对应 pip 依赖
+configs/rltt_env.lock.txt   历史 H200 环境快照，仅用于旧实验复现
 scripts/                    setup_env / prepare_data / prepare_model / run_train / smoke_grpo
 scripts/deepmath_filter_portable/  训练集数据过滤的便携采样脚本（见下文“数据过滤采样”）
 scripts/deepmath_filter_results/   过滤采样的判分与训练子集导出（见该目录的 README）
@@ -75,6 +77,14 @@ git clone --recurse-submodules https://github.com/linghuazhang01/LoopRL.git
 cd LoopRL
 W=/path/to/workdir        # venv、数据、模型、输出都放这里
 ```
+
+> 新迁移目标为 `b200_environment.yaml`：verl 0.9.1、vLLM 0.24.0、
+> Transformers 5.9.0、PyTorch 2.11.0（cu130）。对应依赖在
+> `configs/b200.requirements.txt`。旧 B300 文件保留为历史目标。
+> 新版本通过 `verl09_launcher` / `verl09_workers` / `verl09_engine` / `verl09_losses`
+> 进入原生异步 rollout 与 FSDP 路径；旧 0.6.1 入口仍保留。尚未完成目标环境导入及
+> 分布式运行验证，安装依赖不代表训练可用。
+> FlashAttention 的训练扩展需匹配 torch 2.11/CUDA 13 ABI，不能复用旧 torch 2.9 wheel。
 
 1. **环境**（需要 [uv](https://docs.astral.sh/uv/)；用 uv 管理的 CPython 3.12，自带 Triton 需要的 `Python.h`）：
    ```bash
@@ -590,4 +600,16 @@ python -m pytest tests          # 需要 transformers >= 4.56 的测试会自动
 - 少于 2 张 GPU 时原作会换用自己的单卡训练器，本仓库的配置覆盖和新增指标不会生效，因此 launcher 直接拒绝。
 - `rollout.kv_layout=decode_last` 只作用于 vLLM rollout；训练 forward 仍是完整 KV，见上文。
 - RLTT 原作的 requirements 是自身有冲突的 pip freeze（numpy 1.26.4 与 opencv-python-headless 4.12），
-  `setup_env.sh` 用 `--no-deps` 按锁定版本逐个安装。
+  旧快照仅供历史复现；当前 `setup_env.sh` 使用正常依赖解析安装 B200 目标环境。
+
+
+### verl 0.9.1 迁移路径
+
+目标依赖由 `b200_environment.yaml` 和 `configs/b200.requirements.txt` 声明。
+launcher 按精确版本组合选择原生 engine 路径，dry-run 同时输出 `native_verl_config`。
+需要显式指定 `verl_overrides.data.val_files`（Parquet）。旧模型目录不会自动修改；
+使用新版 `prepare_model` 在新目录生成兼容 Transformers 5 的建模文件。
+
+当前 dense Ouro 路径使用 FSDP/FSDP2、Ulysses=1，关闭 remove-padding 和 fused kernels。
+不支持 learned loop weights、vendor 跨 rollout 梯度累积大于 1、PPO critic 或 RM；
+这些设置会显式报错。CPU 契约检查不替代多卡 loss/gradient/checkpoint/恢复验收。

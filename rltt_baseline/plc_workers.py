@@ -70,6 +70,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from rltt_baseline import loss_agg, plc
 from rltt_baseline.loop_audit import attach_loop_audit
+from rltt_baseline.per_loop_forward import per_loop_forward
 from rltt_baseline.workers import MetricsRLTTActor
 
 OLD_LOOPS_KEY = "old_log_probs_loops"
@@ -136,43 +137,7 @@ class PLCActor(MetricsRLTTActor):
             return entropy, ell, kd, kd_stats
         return entropy, ell
 
-    @staticmethod
-    def _per_loop_forward(module, micro_batch, temperature: float,
-                          kd_divergence: Optional[str] = None):
-        """The padded per-loop forward of ``module`` (the actor, or the frozen initial model):
-        ``(entropy, ell, kd, kd_stats)``; ``kd`` / ``kd_stats`` are None unless
-        ``kd_divergence`` is given."""
-        response_length = micro_batch["responses"].size(-1)
-        kd_kwargs = {}
-        if kd_divergence is not None:
-            kd_kwargs = {"return_loop_kd": True, "loop_kd_divergence": kd_divergence,
-                         "loop_kd_window": response_length}
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            input_ids = micro_batch["input_ids"]
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
-            if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)
-            labels = torch.nn.functional.pad(input_ids[:, 1:], (0, 1), value=0)
-            output = module(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                return_per_loop_log_probs=True,
-                return_exit_pdf=False,
-                log_prob_labels=labels,
-                log_prob_temperature=temperature,
-                use_cache=False,
-                **kd_kwargs,
-            )
-            window = slice(-response_length - 1, -1)
-            ell = torch.stack([lp[:, window] for lp in output.per_loop_log_probs], dim=-1).float()
-            entropy = output.per_loop_entropies[-1][:, window]
-            kd = kd_stats = None
-            if kd_divergence is not None:
-                kd, kd_stats = output.loop_kd, output.loop_kd_stats
-            del output
-        return entropy, ell, kd, kd_stats
+    _per_loop_forward = staticmethod(per_loop_forward)
 
     # ---------- old policy ----------
 

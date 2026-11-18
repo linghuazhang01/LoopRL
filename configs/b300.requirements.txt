@@ -1,0 +1,17 @@
+# B300 training dependencies. Keep in sync with b300.environment.yaml.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.9.1+cu130
+torchaudio==2.9.1+cu130
+torchvision==0.24.1+cu130
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.14.1/vllm-0.14.1%2Bcu130-cp38-abi3-manylinux_2_35_x86_64.whl
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+verl==0.6.1
+transformers==4.57.3
+math-verify==0.8.0
+torchdata==0.11.0
+omegaconf>=2.3
+pyyaml>=6
+numpy<2.3
+wandb
+setuptools==80.9.0
+pytest>=8

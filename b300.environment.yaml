@@ -1,0 +1,31 @@
+# Status: dependency resolution blocked by verl 0.6.1 (numpy<2) versus
+# vLLM 0.14.1 -> OpenCV>=4.13 (numpy>=2). Not a validated training environment.
+# Unified B300 training environment: Linux x86_64, Python 3.12.
+# CUDA 13.0 runtime comes from the cu130 wheels; the host supplies the NVIDIA driver.
+# This does not install a system CUDA toolkit/nvcc or change the host driver.
+# From LoopRL/: conda env create -f b300.environment.yaml
+# Or: bash scripts/setup_env.sh /path/to/new/venv
+# Keep pip entries in sync with configs/b300.requirements.txt.
+name: looprl-b300
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.9.1+cu130
+      - torchaudio==2.9.1+cu130
+      - torchvision==0.24.1+cu130
+      - vllm @ https://github.com/vllm-project/vllm/releases/download/v0.14.1/vllm-0.14.1%2Bcu130-cp38-abi3-manylinux_2_35_x86_64.whl
+      - flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+      - verl==0.6.1
+      - transformers==4.57.3
+      - math-verify==0.8.0
+      - torchdata==0.11.0
+      - omegaconf>=2.3
+      - pyyaml>=6
+      - numpy<2.3
+      - wandb
+      - setuptools==80.9.0
+      - pytest>=8

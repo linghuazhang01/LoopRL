@@ -1,0 +1,26 @@
+# Linux x86_64 / Python 3.12 / CUDA 13.0 wheel runtime.
+# Migration target; distributed training validation is still required.
+# Does not install the host driver or system CUDA toolkit.
+name: looprl-b200
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.11.0+cu130
+      - torchaudio==2.11.0+cu130
+      - torchvision==0.26.0+cu130
+      - flash-attn==2.8.3
+      - verl==0.9.1
+      - vllm==0.24.0
+      - transformers==5.9.0
+      - numpy>=2,<2.4
+      - pyarrow>=19
+      - math-verify==0.8.0
+      - omegaconf>=2.3
+      - pyyaml>=6
+      - wandb
+      - setuptools>=77,<81
+      - pytest>=8

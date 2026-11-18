@@ -88,6 +88,7 @@ from rltt_baseline.config import (
     wandb_key_status,
 )
 from rltt_baseline.paths import SRC_DIR, rltt_source_dir
+from rltt_baseline.runtime_compat import require_legacy_trainer, runtime_status
 
 TRAINER_MODULES = {"rltt": ("rltt_experiments", "rltt_train"),
                    "grpo": ("grpo_experiments", "grpo_train")}
@@ -261,7 +262,26 @@ def main(argv=None) -> int:
     train_check = train_file_check(args.train_file)
     violations = policy_violations(cfg, args, overrides, train_check)
 
+    runtime = runtime_status()
+    native_config = None
+    if runtime["installed"]["verl"] == "0.9.1":
+        if not runtime["target_versions_match"]:
+            raise RuntimeError("verl 0.9.1 requires the pinned LoopRL target runtime tuple")
+        from rltt_baseline.verl09_launcher import build_native_config
+        legacy = apply_verl_overrides(OmegaConf.create(vendor.build_verl_config(args)), overrides)
+        method = "plc" if plc.enabled else cfg.trainer
+        legacy.actor_rollout_ref.looprl = {
+            "method": method,
+            "plc": OmegaConf.to_container(cfg.get("plc", {}), resolve=True),
+            "loss_agg": OmegaConf.to_container(cfg.get("loss_agg", {}), resolve=True),
+            "loop_weighting": getattr(args, "loop_weighting", "uniform"),
+            "progressive_alpha": getattr(args, "progressive_alpha", 1.0),
+        }
+        native_config = build_native_config(legacy, args)
+
     resolved = {
+        "runtime_compatibility": runtime,
+        "native_verl_config": OmegaConf.to_container(native_config, resolve=True) if native_config is not None else None,
         "trainer": cfg.trainer,
         "config_file": str(Path(opts.config).resolve()),
         "cli_overrides": list(opts.overrides),
@@ -285,6 +305,8 @@ def main(argv=None) -> int:
     if problems:
         raise SystemExit("refusing to train, project rules broken (AGENTS.md):\n  - "
                          + "\n  - ".join(problems))
+    if native_config is None:
+        require_legacy_trainer(runtime)
     n_gpus = args.n_gpus
     if n_gpus is None:
         import torch
@@ -306,6 +328,10 @@ def main(argv=None) -> int:
         json.dump(resolved, fh, indent=2, default=str)
 
     os.environ.update(env)
+    if native_config is not None:
+        from rltt_baseline.verl09_launcher import run
+        run(native_config)
+        return 0
     vendor.parse_args = lambda: args
     install_trainer_overrides(overrides)
     if loop_audit:

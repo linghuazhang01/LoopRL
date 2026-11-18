@@ -18,8 +18,14 @@ build the engine with `hf_overrides={"architectures": [ARCHITECTURE]}` and no to
 (`compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}`, or `enforce_eager`).
 Importing registers the architecture and wraps `GPUModelRunner._prepare_inputs`; both are no-ops
 for other models. Supports the TRITON_ATTN and FLASH_ATTN backends with a bf16/fp16 KV cache;
-written against vLLM 0.12 and 0.15 (same runner, backend and Ouro interfaces).
+source-audited for vLLM 0.12/0.15 and 0.24.0. The 0.24 path uses per-layer
+slot mappings and the V1 GPU model runner; V2, microbatching, context parallelism and
+pipeline parallelism are rejected explicitly until their token slicing is validated.
 """
+
+from rltt_baseline.runtime_compat import require_decode_last_runtime
+
+CACHE_CONTRACT = require_decode_last_runtime()  # before importing vLLM internals
 
 import numpy as np
 import torch
@@ -35,13 +41,20 @@ BUFFER = "kv_share_is_generated"
 
 
 def _write_kv(layer, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor,
-              virtual_engine: int) -> None:
+              virtual_engine: int = 0) -> None:
     """Write K/V into ``layer``'s cache with the backend's own kernel (slot -1 is skipped)."""
     impl = layer.impl
     if str(impl.kv_cache_dtype) not in ("auto", "bfloat16", "float16"):
         raise NotImplementedError("decode_last supports bf16/fp16 KV caches only")
-    kv_cache = layer.kv_cache[virtual_engine]
     backend = type(impl).__module__
+    if CACHE_CONTRACT == "per_layer_slots":
+        if not backend.endswith((".triton_attn", ".flash_attn")):
+            raise NotImplementedError(f"decode_last does not support the {backend} backend")
+        # 0.24 stores a Tensor, not a virtual-engine list. Both audited backends
+        # expose this method and own their cache layout/stride handling.
+        impl.do_kv_cache_update(layer, key, value, layer.kv_cache, slots)
+        return
+    kv_cache = layer.kv_cache[virtual_engine]
     if backend.endswith(".triton_attn"):
         from vllm.v1.attention.backends import triton_attn
 
@@ -75,18 +88,38 @@ class DecodeLastKVAttention(vouro.OuroAttention):
     def _keep_last_loop_kv(self, key: torch.Tensor, value: torch.Tensor) -> None:
         context = get_forward_context()
         metadata = context.attn_metadata
-        if isinstance(metadata, dict):
-            metadata = metadata.get(self.attn[-1].layer_name)
         if metadata is None:  # profiling / dummy runs
             return
-        # static shapes only, so FULL_DECODE_ONLY cudagraphs capture this
-        slots = metadata.slot_mapping
-        n = slots.shape[0]
-        slots = slots.masked_fill(~self.kv_share_is_generated[:n], -1)
-        key = key[:n].view(n, self.num_kv_heads, self.head_dim)
-        value = value[:n].view(n, self.num_kv_heads, self.head_dim)
+        if CACHE_CONTRACT == "per_layer_slots":
+            mappings = context.slot_mapping
+            if isinstance(mappings, list) or isinstance(metadata, list):
+                raise NotImplementedError("decode_last: microbatch slot slicing is unsupported")
+            if not metadata:  # 0.24 dummy forward has no attention metadata
+                return
+            for layer in self.attn[:-1]:
+                if layer.layer_name not in mappings:
+                    raise RuntimeError(f"decode_last: missing slot mapping for {layer.layer_name}")
+                # Different loop layers may have different KV-cache groups; never
+                # reuse the final loop's physical slots to write another cache.
+                slots = mappings[layer.layer_name]
+                self._rewrite_layer(layer, key, value, slots)
+            return
+        if isinstance(metadata, dict):
+            metadata = metadata.get(self.attn[-1].layer_name)
+        if metadata is None:
+            return
         for layer in self.attn[:-1]:
-            _write_kv(layer, key, value, slots, context.virtual_engine)
+            self._rewrite_layer(layer, key, value, metadata.slot_mapping,
+                                context.virtual_engine)
+
+    def _rewrite_layer(self, layer, key, value, slots, virtual_engine=0):
+        n = slots.shape[0]
+        if n > self.kv_share_is_generated.shape[0] or n > min(key.shape[0], value.shape[0]):
+            raise RuntimeError("decode_last: slot mapping exceeds token buffers")
+        slots = slots.masked_fill(~self.kv_share_is_generated[:n], -1)
+        k = key[:n].reshape(n, self.num_kv_heads, self.head_dim)
+        v = value[:n].reshape(n, self.num_kv_heads, self.head_dim)
+        _write_kv(layer, k, v, slots, virtual_engine)
 
 
 class DecodeLastKVDecoderLayer(vouro.OuroDecoderLayer):
@@ -97,6 +130,7 @@ class DecodeLastKVDecoderLayer(vouro.OuroDecoderLayer):
 
 class OuroDecodeLastKVForCausalLM(vouro.OuroForCausalLM):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
+        _validate_runner_config(vllm_config)
         torch.nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
         self.config = config
@@ -124,7 +158,51 @@ class OuroDecodeLastKVForCausalLM(vouro.OuroForCausalLM):
                 object.__setattr__(layer.self_attn, BUFFER, generated)
 
 
+def _validate_runner_config(config):
+    if CACHE_CONTRACT != "per_layer_slots":
+        return
+    if config.use_v2_model_runner:
+        raise NotImplementedError("decode_last: vLLM V2 model runner is not supported; use V1")
+    parallel = config.parallel_config
+    if getattr(parallel, "use_ubatching", False) or getattr(parallel, "enable_dbo", False):
+        raise NotImplementedError("decode_last: DBO/microbatching is not supported")
+    for name in ("pipeline_parallel_size", "decode_context_parallel_size",
+                 "prefill_context_parallel_size"):
+        if getattr(parallel, name, 1) != 1:
+            raise NotImplementedError(f"decode_last: {name} must be 1")
+
+
+def _generated_mask_024(runner, total, prompt_lengths):
+    # 0.24's async scheduler corrects num_computed_tokens on the GPU. CPU
+    # positions_np can be stale after speculative acceptance or batch changes.
+    owners = runner.req_indices.gpu[:total].long()
+    return runner.positions[:total] >= prompt_lengths[owners]
+
+
+def _fill_generated_024(runner, scheduler_output, buffer):
+    total = int(scheduler_output.total_num_scheduled_tokens)
+    num_reqs = runner.input_batch.num_reqs
+    if total > buffer.shape[0] or num_reqs > buffer.shape[0]:
+        raise RuntimeError("decode_last: scheduled tokens exceed mask buffer")
+    staging = getattr(runner, "_kv_share_prompt_staging", None)
+    if staging is None:
+        staging = [(torch.zeros(buffer.shape, dtype=torch.int64, pin_memory=True),
+                    torch.empty(buffer.shape, dtype=torch.int64, device=buffer.device),
+                    torch.cuda.Event()) for _ in range(2)]
+        runner._kv_share_prompt_staging, runner._kv_share_prompt_next = staging, 0
+    host, prompt_gpu, copied = staging[runner._kv_share_prompt_next]
+    runner._kv_share_prompt_next ^= 1
+    copied.synchronize()
+    host[:num_reqs] = torch.as_tensor(runner.input_batch.num_prompt_tokens[:num_reqs])
+    prompt_gpu[:num_reqs].copy_(host[:num_reqs], non_blocking=True)
+    buffer.zero_()  # padded CUDA-graph rows must never inherit a previous decode mask
+    buffer[:total].copy_(_generated_mask_024(runner, total, prompt_gpu))
+    copied.record()
+
+
 def _fill_generated(runner, scheduler_output, buffer: torch.Tensor) -> None:
+    if CACHE_CONTRACT == "per_layer_slots":
+        return _fill_generated_024(runner, scheduler_output, buffer)
     batch = runner.input_batch
     req_ids = batch.req_ids
     num_scheduled = np.array([scheduler_output.num_scheduled_tokens[r] for r in req_ids],

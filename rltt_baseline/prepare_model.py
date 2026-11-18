@@ -48,10 +48,32 @@ def check_model_inputs(func):  # rltt_baseline compat edit (see prepare_model.py
 '''
 
 
+MASK_COMPAT = """
+# Signature bridge for Transformers 4.x and 5.x; preserve mask semantics.
+def _ouro_mask_bridge(function):
+    parameters = _inspect.signature(function).parameters
+    def wrapped(**kwargs):
+        if "inputs_embeds" in parameters and "input_embeds" in kwargs:
+            kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+        if "cache_position" not in parameters:
+            kwargs.pop("cache_position", None)
+        return function(**kwargs)
+    return wrapped
+
+create_causal_mask = _ouro_mask_bridge(create_causal_mask)
+create_sliding_window_causal_mask = _ouro_mask_bridge(create_sliding_window_causal_mask)
+"""
+
+
 def compat_base_source(official: str) -> str:
     if official.count(CHECK_INPUTS_IMPORT) != 1:
         raise ValueError("official modeling_ouro.py does not import check_model_inputs as expected")
-    return official.replace(CHECK_INPUTS_IMPORT, CHECK_INPUTS_COMPAT)
+    source = official.replace(CHECK_INPUTS_IMPORT, CHECK_INPUTS_COMPAT + MASK_COMPAT)
+    # Transformers 5 passes query length rather than a cache-position tensor.
+    source = source.replace("query_length = cache_position.shape[0]",
+                            "query_length = (cache_position if isinstance(cache_position, int) "
+                            "else cache_position.shape[0])")
+    return source
 
 
 def vendor_modeling() -> Path:
@@ -110,7 +132,7 @@ def build(source: Path, out: Path, allowed_modeling_sha: set, chunk_size, checkp
     manifest = {
         "source_dir": str(source),
         "source_modeling_sha256": source_modeling_sha,
-        "base_edits": ["check_model_inputs compat wrapper (transformers 4.55-4.57)"],
+        "base_edits": ["check_model_inputs and causal-mask/cache signature bridges (transformers 4.x/5.x)"],
         "written_sha256": {name: sha256(out / name) for name in written},
         "symlinked": linked,
         "rltt_config": {k: config[k] for k in config if k.startswith("rltt_")},
