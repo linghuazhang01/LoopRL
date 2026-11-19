@@ -50,6 +50,10 @@ class OuroFSDPEngine(FSDPEngineWithLMHead):
         if kd:
             kwargs.update(return_loop_kd=True, loop_kd_divergence=plc_cfg.get("kd_divergence", "forward"),
                           loop_kd_window=ids.shape[1] - 1)
+        extrap = settings.get("method") == "extrap"
+        if extrap:
+            from rltt_baseline.extrap import ExtrapSettings
+            kwargs.update(ExtrapSettings.from_mapping(settings.get("extrap")).model_kwargs())
         dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         precision = nullcontext() if dtype == torch.float32 else torch.autocast("cuda", dtype=dtype)
         with precision:
@@ -64,6 +68,12 @@ class OuroFSDPEngine(FSDPEngineWithLMHead):
                      "per_loop_entropies": torch.stack(raw.per_loop_entropies, -1).float()}
             dense["log_probs"] = dense["per_loop_log_probs"][..., -1]
             dense["entropy"] = dense["per_loop_entropies"][..., -1]
+            if extrap:
+                # EP-GRPO: the policy (and old_log_probs) is the extrapolated LoopCD policy
+                dense["log_probs"] = raw.extrap["log_probs"].float()
+                dense["entropy"] = raw.extrap["entropy"].float()
+                dense["extrap_omega"] = raw.extrap["omega"].float()
+                dense["extrap_margin"] = raw.extrap["margin"].float()
             if kwargs["return_exit_pdf"]:
                 dense["exit_pdf"] = raw.exit_pdf
             if kd:

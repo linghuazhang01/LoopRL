@@ -583,6 +583,43 @@ python -m rltt_baseline.diagnostics.probe --model $LOOPRL_MODEL_DIR --rollouts r
 `probe.py` 对每个 batch 把题目组分成 A、B 两半，按 GRPO、第 4 轮 NLL、Ouro SFT 式（exit 概率混合 logits）
 三种 loss 分别求每一轮的梯度，保存每个参数张量的 Gram 矩阵（`grams.pt`）和汇总（`summary.json`）。
 
+### EP-GRPO：在外推策略上做 on-policy GRPO（`configs/extrap_grpo_loopcd_1p4b_8gpu.yaml`）
+
+训练的策略就是 LoopCD 的解码分布：π_ω = softmax(((1+ω)·log P⁽⁴⁾ − ω·sg[log P⁽¹⁾]) / T)。
+vLLM 从 π_ω 采样，loss 是 π_ω 上的 GRPO，所以更新是 on-policy 的，没有 RLTT / PLC 前几轮那种
+跨轮 off-policy 漂移。代码在 `rltt_baseline/extrap.py`（设置与 loss）、`extrap_workers.py`
+（verl 0.6.1 actor）、`verl09_losses.py` / `verl09_engine.py`（verl 0.9 路径）；
+π_ω 的逐 token log-prob 由模型前向的 `return_extrap_log_probs` 计算（`rltt_per_loop.extrap_token_stats`）。
+
+- 对最后一轮 logits 的梯度：(1+ω)·A·(e_y − π_ω)，不除以 1+ω（用户 2026-11-19 决定）。ω 固定时这只是
+  整体乘一个常数，AdamW 和梯度裁剪基本会把它抵消，所以学习率沿用对照组的 1e-6；`adaptive` 时它还会让
+  犹豫的位置（ω_j 大）权重更大。
+- 参照轮（第 1 轮）默认 stop-gradient（`ref_grad: false`）。打开梯度后，正优势会压低好 token
+  在第 1 轮的概率，π_ω 变好但最后一轮没有学到东西（“对比 hacking”），这只作为消融。
+- `extrap.omega=0` 就是这条代码路径上的 GRPO。loss 聚合用 GRPO 的 `seq-mean-token-mean`，
+  所以 ω=0 与 GRPO 配置的 loss 一致（逐轮 padded 前向与 verl remove-padding 数值路径不同）。
+- `margin_alpha`：按位置的权重 1 + α·(1 − (p₍₁₎ − p₍₂₎))，只依赖位置，不引入漂移；
+  `adaptive`：自适应强度 ω·(1 − top-2 差)（rollout 和 loss 同时使用）；`delta_cap`：截断 log P⁽⁴⁾ − log P⁽¹⁾。
+- launcher 自动加的 rollout 设置（`config.add_extrap_overrides`，yaml 里看不到）：
+  `model.external_lib` 加 `rltt_baseline.vllm_loop_cd`；`rollout.engine_kwargs.vllm.hf_overrides`
+  选 `OuroLoopCDForCausalLM` 并写入相同的 `loop_cd_*` 设置；`compilation_config={"mode": 0,
+  "cudagraph_mode": "FULL_DECODE_ONLY"}`（不用 torch.compile，与 decode_last 相同）；
+  `rollout.calculate_log_probs: true`，verl 记录 `training/rollout_probs_diff_*`
+  （vLLM 的外推 log-prob 与 actor 的 log π_ω 之差，应接近 0）。不能与 `rollout.kv_layout=decode_last` 同用。
+- verl 的 `old_log_probs` 和 `actor/entropy` 是 π_ω 的；最后一轮单独的值见 `rltt/loop_4_entropy`、
+  `extrap/log_prob_minus_last_loop` 和逐轮审计（审计的 `last_loop_log_prob_gap` 改用 `old_log_probs_loops`
+  的最后一轮比较）。其余指标：`extrap/entropy`、`extrap/omega_mean`、`extrap/margin_mean`、`extrap/weight_mean`。
+- **`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**（新增的前向开关默认关闭，其他方法不受影响）。
+- 每步耗时与 GRPO / PLC 不能直接比较：rollout 不用 torch.compile，actor 每个回答位置多算两次
+  全词表 lm_head（第 1、4 轮）。
+
+```bash
+python -m rltt_baseline.launch --config configs/extrap_grpo_loopcd_1p4b_8gpu.yaml --dry-run
+```
+
+消融（命令行覆盖，各起一个 `wandb.run_name`）：`extrap.omega=0.3`、`extrap.adaptive=true extrap.omega=1.0`、
+`extrap.margin_alpha=0.5`、`extrap.ref_grad=true`、`extrap.omega=0`。
+
 ### LoopCD 跨轮对比解码评测（只用于评测）
 
 Apple 的 LoopCD（Liu et al., arXiv 2610.02185）：以最后一轮 s 为来源轮、较早的第 r 轮为参照轮做外推，

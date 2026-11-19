@@ -51,14 +51,26 @@ A config file has these top-level keys:
     When enabled
     the section is passed to the workers as ``actor_rollout_ref.actor.plc`` and the launcher
     uses ``PLCActorRolloutRefWorker``.
+``extrap``
+    EP-GRPO (``rltt_baseline.extrap``): on-policy GRPO on the extrapolated LoopCD policy
+    softmax((1 + w) log P^(T) - w sg log P^(r)), ``trainer: rltt`` only, not with ``plc``. Keys
+    and defaults are the fields of ``extrap.ExtrapSettings``: ``enabled`` (false), ``omega``
+    (0.5; 0 = GRPO), ``adaptive`` (false), ``ref_loop`` (1), ``ref_grad`` (false),
+    ``margin_alpha`` (0), ``delta_cap`` (null). When enabled the
+    section is passed to the workers as ``actor_rollout_ref.actor.extrap``, the launcher uses
+    ``ExtrapActorRolloutRefWorker`` and the vLLM rollout samples from the same policy
+    (``rltt_baseline.vllm_loop_cd`` through ``model.external_lib`` and ``hf_overrides``, no
+    torch.compile, CUDA graphs for decode batches; ``rollout.calculate_log_probs`` on unless
+    ``rollout.log_probs: false``). Not with ``rollout.kv_layout=decode_last``.
 ``loss_agg``
     How each loss term is aggregated over tokens (``rltt_baseline.loss_agg``). ``mode``:
     ``token-mean`` (default: verl's own aggregation, a token mean inside each micro-batch),
     ``drgrpo`` (Dr. GRPO: sum over tokens / (rows * ``norm_len``), ``norm_len`` required) or
     ``seq-mean-token-mean`` (original GRPO: each response's token mean, then mean over responses).
     Both row-normalized modes are independent of the micro-batch split. They are
-    implemented for PLC (``PLCActorRolloutRefWorker``) and GRPO (``RowAggPPOActor`` in
-    ``LoopRLGRPOActorRolloutRefWorker``); the vendor RLTT loss only has ``token-mean``. When not
+    implemented for PLC (``PLCActorRolloutRefWorker``), EP-GRPO (``ExtrapActorRolloutRefWorker``)
+    and GRPO (``RowAggPPOActor`` in ``LoopRLGRPOActorRolloutRefWorker``); the vendor RLTT loss
+    only has ``token-mean``. When not
     ``token-mean`` the section is passed to the workers as ``actor_rollout_ref.loss_agg``.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
@@ -77,14 +89,15 @@ from typing import Dict, List, Mapping, MutableMapping, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
-from rltt_baseline import decode_last
+from rltt_baseline import decode_last, loop_cd
+from rltt_baseline.extrap import ExtrapSettings
 from rltt_baseline.loss_agg import LossAggSettings
 from rltt_baseline.plc import PLCSettings
 
 SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit",
-            "plc", "loss_agg")
+            "plc", "loss_agg", "extrap")
 DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit", "plc",
-                 "loss_agg")
+                 "loss_agg", "extrap")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
@@ -130,6 +143,7 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
         raise KeyError(f"unknown audit keys {sorted(bad)}; allowed {sorted(AUDIT_KEYS)}")
     check_loop_audit(cfg.audit.get("loop_distribution"))
     plc_settings(cfg)  # validates the plc section
+    extrap_settings(cfg)  # validates the extrap section
     loss_agg_settings(cfg)  # validates the loss_agg section
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
@@ -495,6 +509,70 @@ def add_plc_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace
     return _deep_merge(overrides, {"actor_rollout_ref": {"actor": {"plc": values}}})
 
 
+def extrap_settings(cfg: DictConfig) -> ExtrapSettings:
+    """The validated ``extrap`` section (all defaults when the section is empty)."""
+    section = cfg.get("extrap")
+    values = OmegaConf.to_container(section, resolve=True) if section is not None else {}
+    return ExtrapSettings.from_mapping(values)
+
+
+def add_extrap_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
+    """``overrides`` plus ``actor_rollout_ref.actor.extrap`` and the LoopCD rollout when EP-GRPO
+    is on.
+
+    The rollout must sample from the policy the loss trains: vLLM imports
+    ``rltt_baseline.vllm_loop_cd`` (``model.external_lib``), ``hf_overrides`` selects its
+    architecture and the same LoopCD settings (logit form), and the engine runs without
+    torch.compile (CUDA graphs for decode batches). Settings that would contradict it are refused.
+    """
+    settings = extrap_settings(cfg)
+    if not settings.enabled:
+        return overrides
+    if cfg.trainer != "rltt":
+        raise ValueError("extrap.enabled needs trainer=rltt (the per-loop model)")
+    if plc_settings(cfg).enabled:
+        raise ValueError("extrap.enabled and plc.enabled are different methods; enable one")
+    if not args.use_rltt_model:
+        raise ValueError("extrap.enabled needs args.use_rltt_model=true (per-loop model)")
+    if args.loop_weighting == "learned":
+        raise ValueError("extrap.enabled cannot be combined with args.loop_weighting=learned")
+    if cfg.rollout.kv_layout != "full":
+        raise ValueError("extrap.enabled needs rollout.kv_layout=full (decode_last selects its "
+                         "own vLLM architecture)")
+    total_loops = int(getattr(args, "total_ut_steps", None) or 4)
+    settings.validate(total_loops)
+    actor_rollout_ref = overrides.get("actor_rollout_ref") or {}
+    rollout = actor_rollout_ref.get("rollout") or {}
+    if rollout.get("name", "vllm") != "vllm":
+        raise ValueError("extrap.enabled needs the vLLM rollout")
+    if rollout.get("cudagraph_capture_sizes"):
+        raise ValueError("extrap.enabled sets its own compilation_config; drop "
+                         "actor_rollout_ref.rollout.cudagraph_capture_sizes")
+    engine = (rollout.get("engine_kwargs") or {}).get("vllm") or {}
+    hf = engine.get("hf_overrides") or {}
+    if hf.get("architectures") not in (None, [loop_cd.ARCHITECTURE]):
+        raise ValueError("extrap.enabled selects its own vLLM architecture")
+    wanted = {"architectures": [loop_cd.ARCHITECTURE], **settings.loop_cd().hf_overrides()}
+    clash = {k for k in hf if k in wanted and hf[k] != wanted[k]}
+    if clash:
+        raise ValueError(f"extrap.enabled sets hf_overrides {sorted(clash)} from the extrap "
+                         "section; do not override them")
+    if engine.get("compilation_config") not in (None, loop_cd.COMPILATION):
+        raise ValueError("extrap.enabled cannot use torch.compile in the rollout")
+    libs = (actor_rollout_ref.get("model") or {}).get("external_lib") or []
+    libs = [libs] if isinstance(libs, str) else list(libs)
+    if loop_cd.LIB not in libs:
+        libs.append(loop_cd.LIB)
+    log_probs = cfg.rollout.get("log_probs")
+    return _deep_merge(overrides, {"actor_rollout_ref": {
+        "model": {"external_lib": libs},
+        "actor": {"extrap": asdict(settings)},
+        "rollout": {
+            "calculate_log_probs": True if log_probs is None else bool(log_probs),
+            "engine_kwargs": {"vllm": {"hf_overrides": wanted,
+                                       "compilation_config": dict(loop_cd.COMPILATION)}}}}})
+
+
 def loss_agg_settings(cfg: DictConfig) -> LossAggSettings:
     """The validated ``loss_agg`` section (``token-mean`` when the section is empty)."""
     section = cfg.get("loss_agg")
@@ -512,9 +590,11 @@ def add_loss_agg_overrides(cfg: DictConfig, overrides: dict) -> dict:
     settings = loss_agg_settings(cfg)
     if not settings.row_normalized:
         return overrides
-    if cfg.trainer == "rltt" and not plc_settings(cfg).enabled:
-        raise ValueError(f"loss_agg.mode={settings.mode} is implemented for PLC and GRPO only; "
-                         "the vendor RLTT loss (trainer=rltt without plc) is token-mean")
+    if cfg.trainer == "rltt" and not (plc_settings(cfg).enabled
+                                      or extrap_settings(cfg).enabled):
+        raise ValueError(f"loss_agg.mode={settings.mode} is implemented for PLC, EP-GRPO and "
+                         "GRPO only; the vendor RLTT loss (trainer=rltt without plc or extrap) "
+                         "is token-mean")
     actor = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
     if actor.get("loss_agg_mode", "token-mean") != "token-mean":
         raise ValueError(f"loss_agg.mode={settings.mode} replaces verl's loss_agg_mode in the "

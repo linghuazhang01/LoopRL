@@ -58,7 +58,9 @@ Files of an audited step, in ``<output_dir>/audit/step_<step>/``:
     tokens_rank<r>.npz    the per-token arrays above, read with ``read_response``
 
 ``last_loop_log_prob_gap`` in the summary compares the audited last loop with verl's
-``old_log_probs``; it is close to 0 when tokens and distributions are aligned.
+``old_log_probs`` (the last loop of ``old_log_probs_loops`` when the batch has it: EP-GRPO's
+``old_log_probs`` belong to the extrapolated policy); it is close to 0 when tokens and
+distributions are aligned.
 """
 
 import hashlib
@@ -426,7 +428,12 @@ def batch_rows(batch, correct_threshold: float = 0.5) -> Dict[str, List[dict]]:
     input_ids = tensors["input_ids"].cpu().numpy()
     attention_mask = tensors["attention_mask"].cpu().numpy()
     scores = tensors["token_level_scores"].sum(-1).float().cpu().numpy()
-    old_log_probs = tensors["old_log_probs"].float().cpu().numpy()
+    # the last loop of the per-loop old log-probs when the actor keeps them (PLC: identical to
+    # old_log_probs; EP-GRPO: old_log_probs is the extrapolated policy, not the last loop)
+    if "old_log_probs_loops" in tensors.keys():
+        old_log_probs = tensors["old_log_probs_loops"][..., -1].float().cpu().numpy()
+    else:
+        old_log_probs = tensors["old_log_probs"].float().cpu().numpy()
     capacity = tensors["responses"].shape[-1]
     non_tensor = batch.non_tensor_batch
     uids = non_tensor["uid"] if "uid" in non_tensor else [None] * len(scores)

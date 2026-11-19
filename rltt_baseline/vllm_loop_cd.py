@@ -14,7 +14,9 @@ loop, so the depth is set with ``total_ut_steps`` in the same overrides.
 
 KV caches are untouched: every loop still writes its own K/V exactly as in stock vLLM.
 
-Use: ``rltt_baseline.loop_cd.register()`` before building the engine, then
+Importing this module registers the architecture (verl ``model.external_lib`` for EP-GRPO
+rollouts); ``rltt_baseline.loop_cd.register()`` registers it lazily without importing vLLM
+internals. Then build the engine with
 ``LLM(..., hf_overrides={"architectures": [ARCHITECTURE], "total_ut_steps": s,
 **LoopCDConfig(...).hf_overrides()})``. Checked against the Ouro model of vLLM 0.12/0.14/0.15 and
 0.24.0 (``runtime_compat.require_loop_cd_runtime``); Ouro runs on the V1 model runner in all of
@@ -26,10 +28,16 @@ from rltt_baseline.runtime_compat import require_loop_cd_runtime
 VLLM_VERSION = require_loop_cd_runtime()  # before importing vLLM internals
 
 import torch  # noqa: E402
+from vllm import ModelRegistry  # noqa: E402
 from vllm.model_executor.models import ouro as vouro  # noqa: E402
 from vllm.model_executor.models.utils import maybe_prefix  # noqa: E402
 
-from rltt_baseline.loop_cd import from_hf_config, guided_logprobs, run_loops  # noqa: E402
+from rltt_baseline.loop_cd import (  # noqa: E402
+    ARCHITECTURE,
+    from_hf_config,
+    guided_logprobs,
+    run_loops,
+)
 
 
 class OuroLoopCDModel(vouro.OuroModel):
@@ -74,3 +82,11 @@ class OuroLoopCDForCausalLM(vouro.OuroForCausalLM):
         if z_s is None:  # non-driver tensor-parallel rank
             return None
         return guided_logprobs(z_s, z_r, cfg)
+
+
+def register() -> None:
+    if ARCHITECTURE not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(ARCHITECTURE, OuroLoopCDForCausalLM)
+
+
+register()  # on import: verl imports `external_lib` in the worker that builds the vLLM engine

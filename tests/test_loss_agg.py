@@ -19,6 +19,8 @@ ENV = {
     "LOOPRL_ENV_FILE": "/nonexistent/env.local",  # never read a real env.local in tests
 }
 GRPO_CONFIGS = ("grpo_baseline_1p4b_8gpu.yaml", "grpo_baseline_8gpu.yaml")
+# EP-GRPO uses GRPO's aggregation, so extrap.omega=0 is the GRPO config's loss
+EXTRAP_CONFIGS = ("extrap_grpo_loopcd_1p4b_8gpu.yaml",)
 PLC_CONFIGS = ("plc_grpo_loopaux_1p4b_8gpu.yaml", "plc_grpo_loopaux_nokl_1p4b_8gpu.yaml",
                "plc_grpo_loopkd_1p4b_8gpu.yaml", "plc_grpo_loopkd_rev_1p4b_8gpu.yaml",
                "plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml")
@@ -290,7 +292,7 @@ def test_rltt_loss_terms_use_the_vendor_scale():
 
 # ---------- configs ----------
 
-@pytest.mark.parametrize("name", GRPO_CONFIGS)
+@pytest.mark.parametrize("name", GRPO_CONFIGS + EXTRAP_CONFIGS)
 def test_grpo_configs_use_the_per_response_mean(env, name):
     cfg = rcfg.load_config(str(paths.config_file(name)))
     assert rcfg.loss_agg_settings(cfg) == SEQ
@@ -339,6 +341,7 @@ def test_unknown_loss_agg_key_is_refused(env):
 @pytest.mark.parametrize("name,expected", [
     (GRPO_CONFIGS[0], {"mode": "seq-mean-token-mean", "norm_len": None}),
     ("plc_grpo_loopkd_1p4b_8gpu.yaml", {"mode": "drgrpo", "norm_len": 16384}),
+    (EXTRAP_CONFIGS[0], {"mode": "seq-mean-token-mean", "norm_len": None}),
 ])
 def test_dry_run_passes_loss_agg_to_the_workers(env, capsys, monkeypatch, name, expected):
     from rltt_baseline import launch

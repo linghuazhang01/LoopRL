@@ -36,10 +36,11 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B：PLC 前几轮改为跨轮蒸馏 | — | — | `plc_grpo_loopkd_1p4b_8gpu.yaml` |
 | 1.4B：同上，reverse KL | — | — | `plc_grpo_loopkd_rev_1p4b_8gpu.yaml` |
 | 1.4B：PLC 精确比率 + 初始模型锚定项 | — | — | `plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml` |
+| 1.4B：EP-GRPO（外推策略上的 GRPO，ω = 0.5） | — | — | `extrap_grpo_loopcd_1p4b_8gpu.yaml`（方法段 `extrap`） |
 
 组内**允许**不同的只有：
 
-- `trainer`（`grpo` / `rltt`）、`plc` 段、`loss_agg` 段（loss 聚合方式，2026-11-14 起属于方法，见下文）、
+- `trainer`（`grpo` / `rltt`）、`plc` 段、`extrap` 段、`loss_agg` 段（loss 聚合方式，2026-11-14 起属于方法，见下文）、
   `wandb` 的 `run_name / tags / notes`；
 - 两份原作脚本参数名不同但取值等价的键：GRPO 的 `use_ppo`；RLTT 的 `use_rltt_model`、
   `rltt_model_path`（= GRPO 的 `model_path`，即 `LOOPRL_MODEL_DIR`）、`rltt_logprob_chunk_size`、
@@ -103,6 +104,20 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 （512 条 rollout）、梯度累积 1、mini-batch 64 题、100 步 = 100 次优化器更新，warmup 10 步
 （用户 2026-11-05 指定；论文 Table 6 是每步 32 题、累积 2、140 步）。
 `test_matched_groups_are_one_update_per_step` 锁定这些值，改动要整组一起改。
+
+## EP-GRPO：外推策略上的 on-policy GRPO（`extrap` 段，用户 2026-11-19 要求）
+
+- `extrap_grpo_loopcd_1p4b_8gpu.yaml`：训练 π_ω = softmax(((1+ω)·log P⁽⁴⁾ − ω·sg[log P⁽¹⁾]) / T)
+  （LoopCD-Logits，`rltt_baseline/loop_cd.py`），ω = 0.5，loss 是 π_ω 上的 GRPO（`rltt_baseline/extrap.py`），
+  vLLM rollout 从同一个 π_ω 采样。登记在 `MATCHED_GROUPS` 的 1.4B 组；`_method_free_view` 把 `extrap`
+  当作方法段。`extrap` 与 `plc` 不能同时打开，只用于 `trainer: rltt`。
+- loss 聚合用 GRPO 的 `seq-mean-token-mean`（`extrap.omega=0` 时与 GRPO 配置的 loss 一致）。
+- launcher 自动改 rollout（yaml 里看不到，写实验记录要注明）：`external_lib` 加 `rltt_baseline.vllm_loop_cd`、
+  `hf_overrides` 选 `OuroLoopCDForCausalLM`、rollout 不用 torch.compile（CUDA graph 只用于 decode）、
+  打开 `rollout.calculate_log_probs`。每步耗时不能和 GRPO / RLTT / PLC 直接比较。
+- 依赖模型前向的 `return_extrap_log_probs`，**`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
+- verl 的 `old_log_probs` / `actor/entropy` 是 π_ω 的，不是第 4 轮的。
+- 测试：`tests/test_extrap.py`（π_ω 与 vLLM LoopCD 一致、梯度、loss、配置与 launcher）。
 
 ## loss 聚合：按方法设置（`loss_agg` 段，用户 2026-11-14 指定）
 

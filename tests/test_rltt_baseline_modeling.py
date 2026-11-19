@@ -249,3 +249,35 @@ def test_loop_kd_on_the_real_per_loop_outputs(models, divergence):
     with pytest.raises(ValueError, match="loop_kd_window"):
         rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
              return_loop_kd=True, loop_kd_window=ids.shape[1])
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_extrap_on_the_real_per_loop_outputs(models, adaptive):
+    """``return_extrap_log_probs``: the LoopCD policy of the last loop against loop 1, equal to
+    ``loop_cd.guided_logprobs`` then the temperature; gradient reaches the backbone, and the
+    EP-GRPO loss runs on it."""
+    from rltt_baseline import extrap, loop_cd
+
+    base, rltt = models
+    ids, mask, pos, labels = _inputs()
+    settings = extrap.ExtrapSettings(enabled=True, omega=0.5, adaptive=adaptive)
+    with torch.no_grad():
+        _, hiddens, _ = base.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                                   use_cache=False)
+        out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+                   log_prob_labels=labels, log_prob_temperature=0.8, **settings.model_kwargs())
+    guided = loop_cd.guided_logprobs(base.lm_head(hiddens[-1]), base.lm_head(hiddens[0]),
+                                     settings.loop_cd())
+    log_pi = F.log_softmax(guided / 0.8, -1)
+    torch.testing.assert_close(out.extrap["log_probs"],
+                               log_pi.gather(-1, labels.unsqueeze(-1)).squeeze(-1))
+
+    rltt.zero_grad()
+    out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+               log_prob_labels=labels, **settings.model_kwargs())
+    ext = out.extrap
+    weights = extrap.token_weights(ext["omega"], ext["margin"], settings)
+    loss, _ = extrap.extrap_policy_loss(ext["log_probs"], ext["log_probs"].detach(),
+                                        torch.tensor([1.0, -1.0]), mask.float(), weights, 0.2)
+    loss.backward()
+    assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0

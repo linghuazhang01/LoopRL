@@ -14,11 +14,27 @@ import torch
 def per_loop_forward(module, micro_batch, temperature: float,
                      kd_divergence: Optional[str] = None):
     """Return response entropy, [batch, response, loop] logprobs, KD and KD stats."""
+    entropy, ell, kd, kd_stats, _ = _forward(module, micro_batch, temperature, kd_divergence)
+    return entropy, ell, kd, kd_stats
+
+
+def extrap_forward(module, micro_batch, temperature: float, model_kwargs: dict):
+    """Last-loop entropy and per-loop log-probs as ``per_loop_forward``, plus the extrapolated
+    policy's ``[batch, response]`` tensors (``log_probs``, ``entropy``, ``omega``, ``margin``;
+    ``rltt_per_loop.extrap_token_stats``). ``model_kwargs``: ``ExtrapSettings.model_kwargs()``."""
+    entropy, ell, _, _, extrap = _forward(module, micro_batch, temperature, None, model_kwargs)
+    return entropy, ell, extrap
+
+
+def _forward(module, micro_batch, temperature: float, kd_divergence: Optional[str] = None,
+             extrap_kwargs: Optional[dict] = None):
     response_length = micro_batch["responses"].size(-1)
     kd_kwargs = {}
     if kd_divergence is not None:
         kd_kwargs = {"return_loop_kd": True, "loop_kd_divergence": kd_divergence,
                      "loop_kd_window": response_length}
+    if extrap_kwargs:
+        kd_kwargs.update(extrap_kwargs)
     device_type = micro_batch["input_ids"].device.type
     precision = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                  if device_type == "cuda" else nullcontext())
@@ -43,8 +59,10 @@ def per_loop_forward(module, micro_batch, temperature: float,
         window = slice(-response_length - 1, -1)
         ell = torch.stack([lp[:, window] for lp in output.per_loop_log_probs], dim=-1).float()
         entropy = output.per_loop_entropies[-1][:, window]
-        kd = kd_stats = None
+        kd = kd_stats = extrap = None
         if kd_divergence is not None:
             kd, kd_stats = output.loop_kd, output.loop_kd_stats
+        if extrap_kwargs:
+            extrap = {name: value[:, window].float() for name, value in output.extrap.items()}
         del output
-    return entropy, ell, kd, kd_stats
+    return entropy, ell, kd, kd_stats, extrap

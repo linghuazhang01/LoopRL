@@ -23,6 +23,13 @@ the full-vocabulary KL of every earlier loop towards the stop-gradient last loop
 on the last ``loop_kd_window`` predicting positions (the response tokens), and ``loop_kd_stats``
 (``rltt_per_loop.KD_STATS``, without grad).
 
+``return_extrap_log_probs`` (EP-GRPO, ``rltt_baseline.extrap``) adds ``extrap``: the log-prob of
+``log_prob_labels`` under the extrapolated LoopCD policy
+softmax(((1 + w) log P^(T) - w log P^(r)) / temperature) (``extrap_omega`` = w,
+``extrap_ref_loop`` = r, ``extrap_adaptive``, ``extrap_delta_cap``; the reference loop is
+stop-gradient unless ``extrap_ref_grad``), with the policy's entropy, the per-position strength
+and the last loop's top-2 margin (``rltt_per_loop.extrap_token_stats``).
+
 Model-config keys read here (written by ``prepare_model``):
     rltt_logprob_chunk_size (int | None), rltt_logprob_checkpoint (bool),
     rltt_detach_exit_pdf (bool).
@@ -36,7 +43,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modeling_ouro_base import *  # noqa: F401,F403
 from .modeling_ouro_base import OuroForCausalLM as _OfficialOuroForCausalLM
-from .rltt_per_loop import exit_pdf_from_gates, per_loop_kd, per_loop_token_stats
+from .rltt_per_loop import (
+    exit_pdf_from_gates,
+    extrap_token_stats,
+    per_loop_kd,
+    per_loop_token_stats,
+)
 
 
 @dataclass
@@ -47,6 +59,7 @@ class RLTTCausalLMOutput(CausalLMOutputWithPast):
     exit_pdf: Optional[torch.Tensor] = None
     loop_kd: Optional[torch.Tensor] = None
     loop_kd_stats: Optional[Dict[str, torch.Tensor]] = None
+    extrap: Optional[Dict[str, torch.Tensor]] = None
 
 
 class OuroForCausalLM(_OfficialOuroForCausalLM):
@@ -72,10 +85,16 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
         return_loop_kd: bool = False,
         loop_kd_divergence: str = "forward",
         loop_kd_window: Optional[int] = None,
+        return_extrap_log_probs: bool = False,
+        extrap_omega: float = 0.0,
+        extrap_ref_loop: int = 1,
+        extrap_adaptive: bool = False,
+        extrap_delta_cap: Optional[float] = None,
+        extrap_ref_grad: bool = False,
         **kwargs,
     ):
         if not (return_per_loop_log_probs or return_per_loop_logits or return_exit_pdf
-                or return_loop_kd):
+                or return_loop_kd or return_extrap_log_probs):
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -144,6 +163,23 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
                 chunk_size=getattr(self.config, "rltt_logprob_chunk_size", None),
             )
 
+        extrap = None
+        if return_extrap_log_probs:
+            if log_prob_labels is None:
+                raise ValueError("return_extrap_log_probs=True requires log_prob_labels")
+            extrap = extrap_token_stats(
+                hidden_states_list,
+                self.lm_head,
+                log_prob_labels,
+                omega=extrap_omega,
+                ref_loop=extrap_ref_loop,
+                adaptive=extrap_adaptive,
+                delta_cap=extrap_delta_cap,
+                ref_grad=extrap_ref_grad,
+                temperature=log_prob_temperature,
+                chunk_size=getattr(self.config, "rltt_logprob_chunk_size", None),
+            )
+
         return RLTTCausalLMOutput(
             loss=None,
             logits=None,
@@ -154,6 +190,7 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
             exit_pdf=exit_pdf,
             loop_kd=loop_kd,
             loop_kd_stats=loop_kd_stats,
+            extrap=extrap,
         )
 
 

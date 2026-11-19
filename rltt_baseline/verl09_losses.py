@@ -34,6 +34,16 @@ def objective(config, settings, output, batch):
             loss, metrics = plc.plc_policy_loss(
                 ell, old, advantages, mask, weights, cfg.lam, kl_coef=cfg.kl_coef,
                 kl_weights=alpha, init_weights=alpha, **common)
+    elif method == "extrap":
+        from rltt_baseline import extrap
+        cfg = extrap.ExtrapSettings.from_mapping(settings.get("extrap"))
+        weights = extrap.token_weights(output["extrap_omega"], output["extrap_margin"], cfg)
+        loss, metrics = extrap.extrap_policy_loss(
+            output["log_probs"], batch["old_log_probs"], advantages, mask, weights,
+            loss_agg_mode=mode, row_div=row_div, **clip)
+        metrics.update(extrap.extrap_stats(
+            output["log_probs"].detach(), output["entropy"], output["extrap_omega"],
+            output["extrap_margin"], weights, ell[..., -1].detach(), mask))
     elif method == "grpo":
         loss, metrics = plc.grpo_policy_loss(ell[..., -1], batch["old_log_probs"], advantages,
                                             mask, loss_agg_mode=mode, row_div=row_div, **clip)
@@ -66,7 +76,9 @@ def objective(config, settings, output, batch):
     kl_coef = float(config.get("kl_loss_coef", 0.))
     if kl_coef and (use_ref or method != "grpo"):
         reference = batch["ref_log_prob" if use_ref else "old_log_probs"]
-        if method == "grpo":
+        if method == "extrap":
+            kl = plc.low_var_kl(output["log_probs"], reference)
+        elif method == "grpo":
             from verl.trainer.ppo.core_algos import kl_penalty
             kl = kl_penalty(logprob=ell[..., -1], ref_logprob=reference,
                             kl_penalty=config.get("kl_loss_type", "low_var_kl"))

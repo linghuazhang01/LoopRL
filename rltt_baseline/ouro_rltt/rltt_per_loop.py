@@ -232,3 +232,80 @@ def per_loop_kd(
     stats = ({name: torch.cat(values, dim=1) for name, values in stat_parts.items()}
              if with_stats else None)
     return kd, stats
+
+
+# ---------- extrapolated policy (EP-GRPO, ``rltt_baseline.extrap``) ----------
+
+def _chunk_extrap(source_hidden, ref_hidden, labels, lm_head, temperature, omega, adaptive,
+                  delta_cap):
+    """Log-prob of ``labels`` under the LoopCD policy, with its entropy, strength and margin.
+
+    pi = softmax(((1 + w) log P_s - w log P_r) / temperature), the reference clipped by
+    ``delta_cap`` in ``log P_s - log P_r``; ``w = omega`` or, when ``adaptive``, the per-position
+    ``omega * (1 - (p_(1) - p_(2)))`` of ``P_s`` at temperature 1. Same distribution as
+    ``rltt_baseline.loop_cd.guided_logprobs`` followed by the sampler's temperature. Gradient
+    flows through the inputs that require it (``ref_hidden`` is detached by the caller unless the
+    reference gets a gradient); the entropy, strength and margin never carry one.
+    """
+    log_s = F.log_softmax(lm_head(source_hidden).float(), dim=-1)
+    log_r = F.log_softmax(lm_head(ref_hidden).float(), dim=-1)
+    with torch.no_grad():
+        top2 = log_s.detach().exp().topk(2, dim=-1).values
+        margin = 1.0 - (top2[..., 0] - top2[..., 1])
+        strength = omega * margin if adaptive else torch.full_like(margin, float(omega))
+    delta = log_s - log_r
+    if delta_cap is not None:
+        delta = delta.clamp(-float(delta_cap), float(delta_cap))
+    logits = (log_s + strength.unsqueeze(-1) * delta) / temperature
+    log_pi = F.log_softmax(logits, dim=-1)
+    picked = log_pi.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    with torch.no_grad():
+        entropy = -(log_pi.detach().exp() * log_pi.detach()).sum(-1)
+    return picked, entropy, strength, margin
+
+
+def extrap_token_stats(
+    hidden_states_list: Sequence[torch.Tensor],
+    lm_head: torch.nn.Module,
+    labels: torch.Tensor,
+    omega: float,
+    ref_loop: int = 1,
+    adaptive: bool = False,
+    delta_cap: Optional[float] = None,
+    ref_grad: bool = False,
+    temperature: float = 1.0,
+    chunk_size: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """The extrapolated (LoopCD) policy on the sampled tokens, per position.
+
+    The source is the last loop; ``ref_loop`` is 1-based. Each chunk is checkpointed when grad is
+    enabled (two vocabulary-sized tensors per position would otherwise stay alive until backward).
+
+    Returns float32 (B, S) tensors: ``log_probs`` (grad through the last loop, and through the
+    reference loop only with ``ref_grad``), ``entropy`` of the policy, ``omega`` (per-position
+    strength) and ``margin`` (1 - top-2 gap of the last loop at temperature 1); the last three
+    without grad.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    loops = len(hidden_states_list)
+    if not 1 <= int(ref_loop) < loops:
+        raise ValueError(f"ref_loop must be in [1, {loops - 1}], got {ref_loop}")
+    seq_len = labels.shape[1]
+    step = seq_len if not chunk_size or chunk_size <= 0 else min(int(chunk_size), seq_len)
+    labels = labels.long()
+    source, ref = hidden_states_list[-1], hidden_states_list[int(ref_loop) - 1]
+    if not ref_grad:
+        ref = ref.detach()
+    parts = {name: [] for name in ("log_probs", "entropy", "omega", "margin")}
+    for start in range(0, seq_len, step):
+        args = (source[:, start:start + step], ref[:, start:start + step],
+                labels[:, start:start + step], lm_head, temperature, float(omega),
+                bool(adaptive), delta_cap)
+        if torch.is_grad_enabled() and (args[0].requires_grad or args[1].requires_grad):
+            out = checkpoint(_chunk_extrap, *args, use_reentrant=False)
+        else:
+            out = _chunk_extrap(*args)
+        for name, value in zip(parts, out):
+            parts[name].append(value)
+    return {name: torch.cat(values, dim=1) for name, values in parts.items()}

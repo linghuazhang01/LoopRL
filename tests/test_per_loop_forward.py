@@ -42,3 +42,34 @@ def test_alignment_labels_gradients_and_kd(kd, mrope):
     expected = torch.zeros_like(values)
     expected[:, 3:5] = 3
     torch.testing.assert_close(grad, expected)
+
+
+def test_extrap_forward_windows_the_policy_tensors():
+    from rltt_baseline.extrap import ExtrapSettings
+    from rltt_baseline.per_loop_forward import extrap_forward
+
+    values = torch.arange(12., requires_grad=True).reshape(2, 6)
+    ids = torch.arange(12).reshape(2, 6)
+    batch = dict(input_ids=ids, responses=ids[:, -2:], attention_mask=torch.ones_like(ids),
+                 position_ids=torch.zeros((2, 6), dtype=torch.long))
+    seen = {}
+
+    def model(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(per_loop_log_probs=[values, values * 2],
+                               per_loop_entropies=[values * 3, values * 4],
+                               extrap={"log_probs": values * 5, "entropy": values * 6,
+                                       "omega": values * 0 + .5, "margin": values * 7})
+
+    settings = ExtrapSettings(enabled=True, omega=.5)
+    entropy, loops, ext = extrap_forward(model, batch, 1.0, settings.model_kwargs())
+    assert seen["return_extrap_log_probs"] is True and seen["extrap_omega"] == .5
+    assert seen["extrap_ref_loop"] == 1 and seen["extrap_ref_grad"] is False
+    torch.testing.assert_close(loops[..., -1], values[:, 3:5] * 2)
+    torch.testing.assert_close(entropy, values[:, 3:5] * 4)
+    torch.testing.assert_close(ext["log_probs"], values[:, 3:5] * 5)
+    torch.testing.assert_close(ext["margin"], values[:, 3:5] * 7)
+    grad, = torch.autograd.grad(ext["log_probs"].sum(), values)
+    expected = torch.zeros_like(values)
+    expected[:, 3:5] = 5
+    torch.testing.assert_close(grad, expected)

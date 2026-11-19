@@ -37,6 +37,7 @@ def build_native_config(legacy, args, config_dir=None):
         ar.setdefault("looprl", {})["audit"] = audit
     ar.pop("loss_agg", None)  # transferred explicitly into ar.looprl by launch
     ar.setdefault("actor", {}).pop("plc", None)
+    ar["actor"].pop("extrap", None)  # transferred explicitly into ar.looprl by launch
     model = ar.setdefault("model", {})
     # The Ouro adapter computes dense per-loop logits; these are implementation
     # layout constraints, not changes to objective or sequence masking.
@@ -52,13 +53,17 @@ def build_native_config(legacy, args, config_dir=None):
         raise ValueError("Native LoopRL requires vLLM server rollouts")
     rollout.update(name="vllm", mode="async")
     from rltt_baseline.decode_last import ARCHITECTURE
+    from rltt_baseline.loop_cd import ARCHITECTURE as LOOP_CD_ARCHITECTURE
     engine = rollout.get("engine_kwargs", {}).get("vllm", {})
-    if ARCHITECTURE in engine.get("hf_overrides", {}).get("architectures", []):
+    architectures = engine.get("hf_overrides", {}).get("architectures", [])
+    for arch, name in ((ARCHITECTURE, "decode_last"), (LOOP_CD_ARCHITECTURE, "extrap (LoopCD)")):
+        if arch not in architectures:
+            continue
         # vLLM 0.24 selects V2 through an environment flag, not EngineArgs.
         env = patch.setdefault("ray_kwargs", {}).setdefault("ray_init", {}).setdefault(
             "runtime_env", {}).setdefault("env_vars", {})
         if env.get("VLLM_USE_V2_MODEL_RUNNER", "0") != "0":
-            raise ValueError("decode_last requires VLLM_USE_V2_MODEL_RUNNER=0")
+            raise ValueError(f"{name} requires VLLM_USE_V2_MODEL_RUNNER=0")
         env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     patch.setdefault("data", {})["train_files"] = [str(args.train_file)]
@@ -111,7 +116,7 @@ def run(config):
             routed = tu.get(output, "routed_experts")
             if routed is not None:
                 result["routed_experts"] = routed
-            if self.config.actor_rollout_ref.looprl.method in ("plc", "rltt"):
+            if self.config.actor_rollout_ref.looprl.method in ("plc", "rltt", "extrap"):
                 if "old_log_probs_loops" not in result:
                     raise RuntimeError("LoopRL worker did not return per-loop old policy log probabilities")
             return DataProto.from_tensordict(tu.get_tensordict(result)), tu.get(output, "metrics")["mfu"]

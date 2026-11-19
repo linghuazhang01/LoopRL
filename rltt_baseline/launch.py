@@ -44,6 +44,9 @@ What this adds around the vendor script (whose files are not modified; located b
     ``actor_rollout_ref.loss_agg``; PLC applies it in ``PLCActor``, GRPO through
     ``LoopRLGRPOActorRolloutRefWorker`` (``RowAggPPOActor``). Not available for the vendor RLTT
     loss (``add_loss_agg_overrides`` refuses it).
+16. ``extrap.enabled`` (RLTT trainer, not with PLC) trains the extrapolated LoopCD policy with
+    on-policy GRPO (``rltt_baseline.extrap``) through ``ExtrapActorRolloutRefWorker``, and makes
+    the vLLM rollout sample from that policy (``config.add_extrap_overrides``).
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -65,6 +68,7 @@ from omegaconf import OmegaConf
 
 from rltt_baseline.config import (
     add_audit_overrides,
+    add_extrap_overrides,
     add_loss_agg_overrides,
     add_plc_overrides,
     add_rollout_overrides,
@@ -75,6 +79,7 @@ from rltt_baseline.config import (
     check_rollout_token_budget,
     drop_unused_reference,
     env_file_path,
+    extrap_settings,
     load_config,
     load_env_file,
     loss_agg_settings,
@@ -202,6 +207,14 @@ def install_plc_worker() -> None:
     verl_rltt.RLTTActorRolloutRefWorker = PLCActorRolloutRefWorker
 
 
+def install_extrap_worker() -> None:
+    import verl_rltt
+
+    from rltt_baseline.extrap_workers import ExtrapActorRolloutRefWorker
+
+    verl_rltt.RLTTActorRolloutRefWorker = ExtrapActorRolloutRefWorker
+
+
 def install_grpo_worker() -> None:
     import verl_grpo
 
@@ -252,8 +265,10 @@ def main(argv=None) -> int:
     env = {**wandb_env(cfg), **{str(k): str(v) for k, v in cfg.env.items()}}
     overrides = add_audit_overrides(cfg, add_rollout_overrides(cfg, verl_overrides(cfg)), args)
     overrides = add_plc_overrides(cfg, overrides, args)
+    overrides = add_extrap_overrides(cfg, overrides, args)
     overrides = add_loss_agg_overrides(cfg, overrides)
     plc = plc_settings(cfg)
+    ext = extrap_settings(cfg)
     agg = loss_agg_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
     check_rollout_token_budget(overrides, args)
@@ -269,10 +284,11 @@ def main(argv=None) -> int:
             raise RuntimeError("verl 0.9.1 requires the pinned LoopRL target runtime tuple")
         from rltt_baseline.verl09_launcher import build_native_config
         legacy = apply_verl_overrides(OmegaConf.create(vendor.build_verl_config(args)), overrides)
-        method = "plc" if plc.enabled else cfg.trainer
+        method = "plc" if plc.enabled else "extrap" if ext.enabled else cfg.trainer
         legacy.actor_rollout_ref.looprl = {
             "method": method,
             "plc": OmegaConf.to_container(cfg.get("plc", {}), resolve=True),
+            "extrap": OmegaConf.to_container(cfg.get("extrap", {}), resolve=True),
             "loss_agg": OmegaConf.to_container(cfg.get("loss_agg", {}), resolve=True),
             "loop_weighting": getattr(args, "loop_weighting", "uniform"),
             "progressive_alpha": getattr(args, "progressive_alpha", 1.0),
@@ -341,6 +357,8 @@ def main(argv=None) -> int:
     install_parquet_train_data()
     if cfg.trainer == "rltt" and plc.enabled:
         install_plc_worker()
+    elif cfg.trainer == "rltt" and ext.enabled:
+        install_extrap_worker()
     elif cfg.trainer == "rltt":
         install_metrics_worker()
     elif loop_audit or agg.row_normalized:

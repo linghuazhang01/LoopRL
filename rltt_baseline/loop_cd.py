@@ -36,6 +36,9 @@ import torch
 
 ARCHITECTURE = "OuroLoopCDForCausalLM"
 LIB = "rltt_baseline.vllm_loop_cd"
+# rollouts (EP-GRPO): no torch.compile (the forward returns 2 x hidden_size), CUDA graphs for
+# decode batches only, as the decode_last rollout
+COMPILATION = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
 SPACES = ("logits", "hidden")
 HF_KEYS = {"ref_loop": "loop_cd_ref_loop", "omega": "loop_cd_omega",
            "adaptive": "loop_cd_adaptive", "space": "loop_cd_space",
