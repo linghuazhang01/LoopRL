@@ -38,6 +38,7 @@ def build_native_config(legacy, args, config_dir=None):
     ar.pop("loss_agg", None)  # transferred explicitly into ar.looprl by launch
     ar.setdefault("actor", {}).pop("plc", None)
     ar["actor"].pop("extrap", None)  # transferred explicitly into ar.looprl by launch
+    ar["actor"].pop("opd", None)  # transferred explicitly into ar.looprl by launch
     model = ar.setdefault("model", {})
     # The Ouro adapter computes dense per-loop logits; these are implementation
     # layout constraints, not changes to objective or sequence masking.
@@ -106,7 +107,8 @@ def run(config):
             result = {}
             keys = {"log_probs": "old_log_probs", "entropy": "entropys",
                     "per_loop_log_probs": "old_log_probs_loops",
-                    "init_log_probs_loops": "init_log_probs_loops"}
+                    "init_log_probs_loops": "init_log_probs_loops",
+                    "teacher_log_probs": "teacher_log_probs"}
             if calculate_sum:
                 keys["sum_pi_squared"] = "sum_pi_squared"
             for source, dest in keys.items():
@@ -116,9 +118,15 @@ def run(config):
             routed = tu.get(output, "routed_experts")
             if routed is not None:
                 result["routed_experts"] = routed
-            if self.config.actor_rollout_ref.looprl.method in ("plc", "rltt", "extrap"):
+            method = self.config.actor_rollout_ref.looprl.method
+            if method in ("plc", "rltt", "extrap", "opd"):
                 if "old_log_probs_loops" not in result:
                     raise RuntimeError("LoopRL worker did not return per-loop old policy log probabilities")
+            opd_cfg = self.config.actor_rollout_ref.looprl.get("opd") or {}
+            sampled = opd_cfg.get("estimator", "sampled") == "sampled"
+            if method == "opd" and sampled and "teacher_log_probs" not in result:
+                raise RuntimeError("OPD needs the frozen teacher's log probabilities "
+                                   "(teacher_log_probs)")
             return DataProto.from_tensordict(tu.get_tensordict(result)), tu.get(output, "metrics")["mfu"]
 
     class LoopRLTaskRunner(BaseTaskRunner):

@@ -309,3 +309,85 @@ def extrap_token_stats(
         for name, value in zip(parts, out):
             parts[name].append(value)
     return {name: torch.cat(values, dim=1) for name, values in parts.items()}
+
+
+# ---------- full-vocabulary OPD (``rltt_baseline.opd``, estimator ``full``) ----------
+
+def opd_teacher_log_probs(teacher_ref_logits: torch.Tensor, teacher_last_logits: torch.Tensor,
+                          omega: float, temperature: float = 1.0) -> torch.Tensor:
+    """The OPD teacher over the full vocabulary of the frozen model:
+    log_softmax(((1 + w) log P^(T) - w log P^(r)) / tau), i.e. LoopCD-Logits
+    (``rltt_baseline.loop_cd``) followed by the temperature."""
+    log_last = F.log_softmax(teacher_last_logits.float(), dim=-1)
+    log_ref = F.log_softmax(teacher_ref_logits.float(), dim=-1)
+    return F.log_softmax((log_last + float(omega) * (log_last - log_ref)) / temperature, dim=-1)
+
+
+def _chunk_opd(student_hidden, teacher_ref_hidden, teacher_last_hidden, student_lm_head,
+               teacher_lm_head, temperature, omega, divergence):
+    """Per-position full-vocabulary divergence of the student's last loop against the frozen
+    teacher, plus no-grad monitoring values. The teacher's logits are computed under no_grad (also
+    when a checkpoint recomputes the chunk in backward)."""
+    with torch.no_grad():
+        log_q = opd_teacher_log_probs(teacher_lm_head(teacher_ref_hidden),
+                                      teacher_lm_head(teacher_last_hidden), omega, temperature)
+    log_p = F.log_softmax(student_lm_head(student_hidden).float() / temperature, dim=-1)
+    kd = kd_divergence(log_p, log_q, divergence)
+    with torch.no_grad():
+        lp = log_p.detach()
+        other = kd_divergence(lp, log_q, "reverse" if divergence == "forward" else "forward")
+        q_entropy = -(log_q.exp() * log_q).sum(-1)
+        top1_agree = (lp.argmax(-1) == log_q.argmax(-1)).float()
+    return kd, other, q_entropy, top1_agree
+
+
+def opd_full_kd(
+    student_hidden: torch.Tensor,
+    teacher_ref_hidden: torch.Tensor,
+    teacher_last_hidden: torch.Tensor,
+    student_lm_head: torch.nn.Module,
+    teacher_lm_head: torch.nn.Module,
+    omega: float,
+    divergence: str = "reverse",
+    temperature: float = 1.0,
+    chunk_size: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Full-vocabulary distillation of the student's last loop towards the frozen OPD teacher.
+
+    At every position of ``student_hidden`` (the contexts of the student's own rollouts):
+    ``reverse`` = KL(P^(T) || pi_T), ``forward`` = KL(pi_T || P^(T)), with
+    pi_T = ``opd_teacher_log_probs`` of the teacher's reference and last loops.
+
+    Args:
+        student_hidden: (B, S, H) normed last-loop hidden state of the trained model.
+        teacher_ref_hidden, teacher_last_hidden: (B, S, H) normed hidden states of the frozen
+            model's reference and last loops (no gradient flows into them).
+        chunk_size: positions per chunk along S; ``None`` or <= 0 means one chunk. With grad each
+            chunk is checkpointed (the vocabulary-sized tensors are recomputed in backward).
+
+    Returns float32 (B, S) tensors: ``kd`` (the configured divergence, grad through the student),
+    and without grad ``kl_other`` (the other direction), ``teacher_entropy`` and ``top1_agree``.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    if divergence not in KD_DIVERGENCES:
+        raise ValueError(f"unknown divergence {divergence!r}; allowed {KD_DIVERGENCES}")
+    if not (student_hidden.shape[:2] == teacher_ref_hidden.shape[:2]
+            == teacher_last_hidden.shape[:2]):
+        raise ValueError("student and teacher hidden states must cover the same positions")
+    seq_len = student_hidden.shape[1]
+    step = seq_len if not chunk_size or chunk_size <= 0 else min(int(chunk_size), seq_len)
+    teacher_ref_hidden = teacher_ref_hidden.detach()
+    teacher_last_hidden = teacher_last_hidden.detach()
+    parts = {name: [] for name in ("kd", "kl_other", "teacher_entropy", "top1_agree")}
+    for start in range(0, seq_len, step):
+        args = (student_hidden[:, start:start + step], teacher_ref_hidden[:, start:start + step],
+                teacher_last_hidden[:, start:start + step], student_lm_head, teacher_lm_head,
+                temperature, float(omega), divergence)
+        if torch.is_grad_enabled() and args[0].requires_grad:
+            out = checkpoint(_chunk_opd, *args, use_reentrant=False)
+        else:
+            out = _chunk_opd(*args)
+        for name, value in zip(parts, out):
+            parts[name].append(value)
+    return {name: torch.cat(values, dim=1) for name, values in parts.items()}

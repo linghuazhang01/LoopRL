@@ -20,8 +20,11 @@ def compose_stub(monkeypatch):
 def test_native_server_and_explicit_data(compose_stub):
     old = {"data": {"val_files": ["val.parquet"]},
            "custom_reward_function": {"path": "reward.py", "name": "compute_score"},
-           "actor_rollout_ref": {"actor": {"plc": {}}, "rollout": {"mode": "sync"}}}
+           "actor_rollout_ref": {"actor": {"plc": {}, "opd": {"enabled": True}},
+                                 "rollout": {"mode": "sync"}}}
     cfg = build_native_config(old, Namespace(train_file="train.parquet"), "/tmp")
+    # method sections reach the engine through actor_rollout_ref.looprl, not the native schema
+    assert "plc" not in cfg.actor_rollout_ref.actor and "opd" not in cfg.actor_rollout_ref.actor
     assert cfg.actor_rollout_ref.rollout.mode == "async"
     assert not cfg.trainer.use_v1
     assert cfg.data.train_files == ["train.parquet"]

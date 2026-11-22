@@ -620,6 +620,52 @@ python -m rltt_baseline.launch --config configs/extrap_grpo_loopcd_1p4b_8gpu.yam
 消融（命令行覆盖，各起一个 `wandb.run_name`）：`extrap.omega=0.3`、`extrap.adaptive=true extrap.omega=1.0`、
 `extrap.margin_alpha=0.5`、`extrap.ref_grad=true`、`extrap.omega=0`。
 
+### OPD：向冻结 base 模型的 LoopCD 分布做 on-policy 蒸馏（`configs/opd_loopcd_1p4b_8gpu.yaml`）
+
+用户 2026-11-22 要求。第 4 轮在自己的 rollout 上，向固定的老师分布做逐 token 反向 KL 蒸馏：
+
+- **老师**：冻结的初始模型（`actor_rollout_ref.model.path`，即 `LOOPRL_MODEL_DIR`）的 LoopCD 分布
+  log π_T = log_softmax((1+w)·log P⁽⁴⁾_base − w·log P⁽¹⁾_base)，也就是 log 空间里的
+  "分布 4 + w·(分布 4 − 分布 1)"，w = `opd.omega`（默认 0.5），参照轮 `opd.ref_loop`（默认 1）。
+  老师整个训练中不变，断点续训也不重新计算。
+- **学生**：当前模型的第 4 轮。rollout 是普通的最后一轮 vLLM，与 GRPO / RLTT / PLC 相同。
+- **loss**，由 `opd.estimator` 选择：
+  - `sampled`（`opd_loopcd_1p4b_8gpu.yaml`）：A_j = sg[log π_T(y_j) − log P⁽⁴⁾_old(y_j)]，loss = −agg[PPO(A_j)]。
+    y ~ P⁽⁴⁾ 时，期望梯度等于每个前缀上 KL(P⁽⁴⁾ ‖ π_T) 的梯度。只支持反向 KL。
+  - `full`：每个回答位置在全词表上精确计算 KL，loss = agg[KL]。`opd.divergence` 为 `reverse`
+    （`opd_full_rkl_loopcd_1p4b_8gpu.yaml`）或 `forward`（`opd_full_fkl_loopcd_1p4b_8gpu.yaml`）。
+    这两份配置都是 100 步、每步 512 条（64 题 × 8）、训练数据不变、top-p 1、温度 1。
+  - 两种都只用当前位置自己这一项，不累加后续 token。
+  - **奖励不进入目标**：driver 照常评分（`reasoning/*`）、计算 GRPO advantage，但 loss 不用。
+- 聚合：`loss_agg: drgrpo, norm_len 16384`。每个 token 权重相同，对应整条回答的反向 KL。
+- 代码：`rltt_baseline/opd.py`（设置、loss、监控），全词表 KL 在 `rltt_per_loop.opd_full_kd`。verl 0.9 路径：
+  - `sampled`：
+    - `verl09_workers.py`：加载 CPU offload 的冻结老师引擎，复用 PLC 锚定项的代码；
+    - `verl09_engine.py`：老师前向加 `return_extrap_log_probs`，输出 `teacher_log_probs`；
+    - driver 把 `teacher_log_probs` 放进 batch。
+  - `full`：
+    - 每个 actor rank 持有一份不分片的 float32 老师（约 5.6 GB / 卡）；
+    - 训练 micro-batch 里先跑老师的 `return_loop_hidden_states`；
+    - 再把第 1、4 轮隐状态和老师 lm_head 传给学生的 `return_opd_kd`，逐块计算 KL 并做 checkpoint。
+  - `verl09_losses.py`：两种 loss 的分支。
+- **只支持 verl 0.9.1**：verl 0.6.1 下，dry-run 照常输出，真正启动时拒绝。
+- **`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**：sampled 需要 `return_extrap_log_probs`，full 需要
+  `return_loop_hidden_states` / `return_opd_kd`。
+- dry-run 的 `reference_policy`：sampled 以 `opd teacher:` 开头，full 以 `opd teacher (full vocabulary)` 开头。
+  每步多一次冻结模型的逐轮前向，耗时不能和 GRPO 直接比较。
+- 监控：
+  - sampled：`opd/reverse_kl_k1`、`opd/reverse_kl_k3`、`opd/teacher_log_prob`、`opd/student_log_prob`、
+    `opd/teacher_prefers_frac`；
+  - full：`opd/reverse_kl`、`opd/forward_kl`、`opd/teacher_entropy`、`opd/top1_agree`；
+  - 两者都看 `rltt/loop_4_entropy`：老师比 P⁽⁴⁾ 更尖，熵会下降。
+- 评测：ω_eval = 0。参照线是 base + 测试时 LoopCD(w)。
+
+```bash
+python -m rltt_baseline.launch --config configs/opd_full_rkl_loopcd_1p4b_8gpu.yaml --dry-run
+```
+
+消融（命令行覆盖，各起一个 `wandb.run_name`）：`opd.omega=0.3`、`opd.omega=0`（老师 = base 第 4 轮，检查代码路径）。
+
 ### LoopCD 跨轮对比解码评测（只用于评测）
 
 Apple 的 LoopCD（Liu et al., arXiv 2610.02185）：以最后一轮 s 为来源轮、较早的第 r 轮为参照轮做外推，

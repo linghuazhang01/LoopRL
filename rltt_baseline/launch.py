@@ -47,6 +47,9 @@ What this adds around the vendor script (whose files are not modified; located b
 16. ``extrap.enabled`` (RLTT trainer, not with PLC) trains the extrapolated LoopCD policy with
     on-policy GRPO (``rltt_baseline.extrap``) through ``ExtrapActorRolloutRefWorker``, and makes
     the vLLM rollout sample from that policy (``config.add_extrap_overrides``).
+17. ``opd.enabled`` (RLTT trainer, not with PLC or extrap) distils the last loop towards the
+    frozen initial model's LoopCD policy on its own rollouts (``rltt_baseline.opd``). Only the
+    verl 0.9.1 engine path implements it: a verl 0.6.1 launch stops after the dry-run.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop
 ``@check_model_inputs``. The launcher therefore refuses a model directory whose
@@ -70,6 +73,7 @@ from rltt_baseline.config import (
     add_audit_overrides,
     add_extrap_overrides,
     add_loss_agg_overrides,
+    add_opd_overrides,
     add_plc_overrides,
     add_rollout_overrides,
     apply_verl_overrides,
@@ -82,7 +86,9 @@ from rltt_baseline.config import (
     extrap_settings,
     load_config,
     load_env_file,
+    looprl_method,
     loss_agg_settings,
+    opd_settings,
     plc_settings,
     policy_violations,
     reference_policy_status,
@@ -266,9 +272,11 @@ def main(argv=None) -> int:
     overrides = add_audit_overrides(cfg, add_rollout_overrides(cfg, verl_overrides(cfg)), args)
     overrides = add_plc_overrides(cfg, overrides, args)
     overrides = add_extrap_overrides(cfg, overrides, args)
+    overrides = add_opd_overrides(cfg, overrides, args)
     overrides = add_loss_agg_overrides(cfg, overrides)
     plc = plc_settings(cfg)
     ext = extrap_settings(cfg)
+    opd = opd_settings(cfg)
     agg = loss_agg_settings(cfg)
     check_kl_not_in_reward(cfg.trainer, overrides)
     check_rollout_token_budget(overrides, args)
@@ -284,11 +292,11 @@ def main(argv=None) -> int:
             raise RuntimeError("verl 0.9.1 requires the pinned LoopRL target runtime tuple")
         from rltt_baseline.verl09_launcher import build_native_config
         legacy = apply_verl_overrides(OmegaConf.create(vendor.build_verl_config(args)), overrides)
-        method = "plc" if plc.enabled else "extrap" if ext.enabled else cfg.trainer
         legacy.actor_rollout_ref.looprl = {
-            "method": method,
+            "method": looprl_method(cfg),
             "plc": OmegaConf.to_container(cfg.get("plc", {}), resolve=True),
             "extrap": OmegaConf.to_container(cfg.get("extrap", {}), resolve=True),
+            "opd": OmegaConf.to_container(cfg.get("opd", {}), resolve=True),
             "loss_agg": OmegaConf.to_container(cfg.get("loss_agg", {}), resolve=True),
             "loop_weighting": getattr(args, "loop_weighting", "uniform"),
             "progressive_alpha": getattr(args, "progressive_alpha", 1.0),
@@ -322,6 +330,9 @@ def main(argv=None) -> int:
         raise SystemExit("refusing to train, project rules broken (AGENTS.md):\n  - "
                          + "\n  - ".join(problems))
     if native_config is None:
+        if opd.enabled:
+            raise SystemExit("opd.enabled is implemented only on the verl 0.9.1 engine path "
+                             f"(installed verl: {runtime['installed']['verl']})")
         require_legacy_trainer(runtime)
     n_gpus = args.n_gpus
     if n_gpus is None:

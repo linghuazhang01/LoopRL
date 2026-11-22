@@ -374,7 +374,10 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
                                   "plc_grpo_loopkd_1p4b_8gpu.yaml",
                                   "plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml",
                                   "plc_grpo_loopkd_rev_1p4b_8gpu.yaml",
-                                  "extrap_grpo_loopcd_1p4b_8gpu.yaml"])
+                                  "extrap_grpo_loopcd_1p4b_8gpu.yaml",
+                                  "opd_loopcd_1p4b_8gpu.yaml",
+                                  "opd_full_rkl_loopcd_1p4b_8gpu.yaml",
+                                  "opd_full_fkl_loopcd_1p4b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
     cfg = rcfg.load_config(str(paths.config_file(name)))
@@ -385,7 +388,7 @@ def test_mini_batch_is_one_accumulated_update(env, name):
 
 # ---------- comparison groups (CLAUDE.md) ----------
 
-# Configs in one group differ only in the method (trainer, loss, plc, extrap and loss_agg
+# Configs in one group differ only in the method (trainer, loss, plc, extrap, opd and loss_agg
 # sections, wandb naming);
 # every other setting must be identical so the runs can be compared.
 MATCHED_GROUPS = {
@@ -397,7 +400,11 @@ MATCHED_GROUPS = {
              # exact ratio, k1 replaced by the anchor to the frozen initial model
              "plc_nocap_refkl": "plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml",
              # on-policy GRPO on the extrapolated LoopCD policy, w = 0.5
-             "extrap": "extrap_grpo_loopcd_1p4b_8gpu.yaml"},
+             "extrap": "extrap_grpo_loopcd_1p4b_8gpu.yaml",
+             # on-policy distillation towards the frozen base model's LoopCD policy, w = 0.5
+             "opd": "opd_loopcd_1p4b_8gpu.yaml",  # sampled-token reverse KL
+             "opd_full_rkl": "opd_full_rkl_loopcd_1p4b_8gpu.yaml",  # full-vocabulary reverse KL
+             "opd_full_fkl": "opd_full_fkl_loopcd_1p4b_8gpu.yaml"},  # full-vocabulary forward KL
     "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},  # no PLC config
 }
 # verl settings the GRPO configs must override because grpo_train.py lacks them; rltt_train.py
@@ -431,6 +438,7 @@ def _method_free_view(name):
     trainer = cfg.pop("trainer")
     cfg.pop("plc", None)
     cfg.pop("extrap", None)  # EP-GRPO (2026-11-19), a method section like plc
+    cfg.pop("opd", None)  # OPD (2026-11-22), a method section like plc
     # loss aggregation is part of the method since 2026-11-14 (user): GRPO group-token-mean,
     # PLC Dr. GRPO, RLTT the vendor token-mean (test_loss_agg.py checks the values)
     cfg.pop("loss_agg", None)

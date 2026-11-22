@@ -281,3 +281,47 @@ def test_extrap_on_the_real_per_loop_outputs(models, adaptive):
                                         torch.tensor([1.0, -1.0]), mask.float(), weights, 0.2)
     loss.backward()
     assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("divergence", ["reverse", "forward"])
+def test_opd_full_kd_on_the_real_per_loop_outputs(models, divergence):
+    """Full-vocabulary OPD: the frozen teacher's ``return_loop_hidden_states`` and the student's
+    ``return_opd_kd`` give KL against log_softmax(1.5 log P4 - 0.5 log P1) of the teacher on the
+    window; gradient reaches the student's backbone, never the teacher."""
+    import copy
+
+    from rltt_baseline import opd
+    from rltt_baseline.ouro_rltt.rltt_per_loop import kd_divergence
+
+    _, shared = models
+    teacher = copy.deepcopy(shared).eval().requires_grad_(False)
+    rltt = copy.deepcopy(shared)  # the student; the module fixture stays untouched
+    torch.manual_seed(2)
+    with torch.no_grad():  # a student that has moved away from the teacher
+        for p in rltt.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    ids, mask, pos, _ = _inputs()
+    settings = opd.OPDSettings(enabled=True, omega=0.5, estimator="full", divergence=divergence)
+    window = ids.shape[1] - 1
+    with torch.no_grad():
+        t_hiddens = teacher(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+                            return_loop_hidden_states=True).loop_hidden_states
+        _, s_hiddens, _ = rltt.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                                     use_cache=False)
+    assert len(t_hiddens) == 4
+    rltt.zero_grad()
+    out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+               opd_teacher_hidden_states=(t_hiddens[0], t_hiddens[-1]),
+               opd_teacher_lm_head=teacher.lm_head, opd_window=window,
+               **settings.student_model_kwargs())
+    kd = out.opd_kd["kd"]
+    assert kd.shape == (2, window)
+    log4 = F.log_softmax(teacher.lm_head(t_hiddens[-1][:, :-1]).float(), -1)
+    log1 = F.log_softmax(teacher.lm_head(t_hiddens[0][:, :-1]).float(), -1)
+    log_q = F.log_softmax(log4 + 0.5 * (log4 - log1), -1)
+    log_p = F.log_softmax(rltt.lm_head(s_hiddens[-1][:, :-1]).float(), -1)
+    torch.testing.assert_close(kd.detach(), kd_divergence(log_p, log_q, divergence))
+    loss, _ = opd.opd_full_loss(kd, mask[:, 1:].float())
+    loss.backward()
+    assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in teacher.parameters())

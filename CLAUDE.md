@@ -37,10 +37,13 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B：同上，reverse KL | — | — | `plc_grpo_loopkd_rev_1p4b_8gpu.yaml` |
 | 1.4B：PLC 精确比率 + 初始模型锚定项 | — | — | `plc_grpo_loopaux_nocap_refkl_1p4b_8gpu.yaml` |
 | 1.4B：EP-GRPO（外推策略上的 GRPO，ω = 0.5） | — | — | `extrap_grpo_loopcd_1p4b_8gpu.yaml`（方法段 `extrap`） |
+| 1.4B：OPD（向冻结 base 的 LoopCD 分布做 on-policy 蒸馏，w = 0.5，采样 token 反向 KL） | — | — | `opd_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
+| 1.4B：OPD，全词表反向 KL | — | — | `opd_full_rkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
+| 1.4B：OPD，全词表前向 KL | — | — | `opd_full_fkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 
 组内**允许**不同的只有：
 
-- `trainer`（`grpo` / `rltt`）、`plc` 段、`extrap` 段、`loss_agg` 段（loss 聚合方式，2026-11-14 起属于方法，见下文）、
+- `trainer`（`grpo` / `rltt`）、`plc` 段、`extrap` 段、`opd` 段、`loss_agg` 段（loss 聚合方式，2026-11-14 起属于方法，见下文）、
   `wandb` 的 `run_name / tags / notes`；
 - 两份原作脚本参数名不同但取值等价的键：GRPO 的 `use_ppo`；RLTT 的 `use_rltt_model`、
   `rltt_model_path`（= GRPO 的 `model_path`，即 `LOOPRL_MODEL_DIR`）、`rltt_logprob_chunk_size`、
@@ -118,6 +121,35 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 - 依赖模型前向的 `return_extrap_log_probs`，**`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
 - verl 的 `old_log_probs` / `actor/entropy` 是 π_ω 的，不是第 4 轮的。
 - 测试：`tests/test_extrap.py`（π_ω 与 vLLM LoopCD 一致、梯度、loss、配置与 launcher）。
+
+## OPD：向冻结 base 的 LoopCD 分布做 on-policy 蒸馏（`opd` 段，用户 2026-11-22 要求）
+
+- `opd_loopcd_1p4b_8gpu.yaml`：老师是**冻结初始模型**的 log π_T = log_softmax((1+w)·log P⁽⁴⁾_base − w·log P⁽¹⁾_base)
+  （"分布 4 + w·(分布 4 − 分布 1)"，按 log 空间理解），w = `opd.omega` = 0.5，参照轮 `opd.ref_loop` = 1。
+  学生是第 4 轮，rollout 是普通的最后一轮 vLLM。**奖励不进入目标**（只记录 `reasoning/*`）。
+  `opd.estimator` 选择两种估计（`rltt_baseline/opd.py`）：
+  - `sampled`（默认）：只支持反向 KL。A_j = sg[log π_T(y_j) − log P⁽⁴⁾_old(y_j)]，loss = −agg[PPO(A_j)]。
+  - `full`：每个回答位置在全词表上精确计算 KL，`opd.divergence` 为 `reverse`（KL(P⁽⁴⁾‖π_T)）或
+    `forward`（KL(π_T‖P⁽⁴⁾)）。loss = agg[KL]。
+  - 用户 2026-11-22 要求存了两份全词表配置（100 步、每步 512 条 = 64 题 × 8、训练数据不变、top-p 1、温度 1）：
+    `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 和 `opd_full_fkl_loopcd_1p4b_8gpu.yaml`。两份只差 `opd.divergence`
+    和 wandb 命名（`tests/test_opd.py` 检查），改一份要同步改另一份。
+- 登记在 `MATCHED_GROUPS` 的 1.4B 组；`_method_free_view` 把 `opd` 当作方法段。`opd` 与 `plc`、`extrap`
+  不能同时打开，只用于 `trainer: rltt`。
+- loss 聚合用 `drgrpo`、`norm_len: 16384`（每个 token 权重相同 = 整条回答的反向 KL）。
+- **只在 verl 0.9.1 路径实现**，verl 0.6.1 下 dry-run 照常输出，真正启动时 launcher 拒绝。老师都是
+  `actor_rollout_ref.model.path` 的冻结 float32 副本，断点续训不重新加载：
+  - `sampled`：actor worker 加载一份 CPU offload 的老师引擎（与 PLC 锚定项同一段代码），在 `compute_log_prob`
+    时输出 `teacher_log_probs`，driver 放进 batch。dry-run 的 `reference_policy` 以 `opd teacher:` 开头。
+  - `full`：每个 actor rank 持有一份不分片的老师（约 5.6 GB / 卡）。每个训练 micro-batch 先跑老师的逐轮前向
+    （`return_loop_hidden_states`），再把它第 1、4 轮的隐状态和 lm_head 传进学生的前向（`return_opd_kd`），
+    逐块计算 KL 并做 checkpoint。dry-run 的 `reference_policy` 以 `opd teacher (full vocabulary)` 开头。
+  - 每步耗时不能和 GRPO / RLTT 直接比较。
+- 依赖模型前向的 `return_extrap_log_probs`（sampled）以及 `return_loop_hidden_states` / `return_opd_kd`（full），
+  **`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
+- 测试：`tests/test_opd.py`（老师公式、sampled 的期望梯度等于反向 KL 的梯度、全词表 KL 的数值与梯度、loss、
+  配置、launcher、verl 0.9 objective）；`tests/test_rltt_baseline_modeling.py` 在真实小模型上测全词表 KL
+  （需要 transformers ≥ 4.56）。GPU 端（引擎前向、worker、driver）只能在训练环境验证。
 
 ## loss 聚合：按方法设置（`loss_agg` 段，用户 2026-11-14 指定）
 

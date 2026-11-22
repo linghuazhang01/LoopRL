@@ -62,15 +62,28 @@ A config file has these top-level keys:
     (``rltt_baseline.vllm_loop_cd`` through ``model.external_lib`` and ``hf_overrides``, no
     torch.compile, CUDA graphs for decode batches; ``rollout.calculate_log_probs`` on unless
     ``rollout.log_probs: false``). Not with ``rollout.kv_layout=decode_last``.
+``opd``
+    OPD (``rltt_baseline.opd``): on-policy distillation of the last loop towards the frozen
+    initial model's LoopCD policy log_softmax((1 + w) log P^(T)_base - w log P^(r)_base),
+    per-token reverse KL on the last loop's own rollouts; the reward is not in the objective.
+    ``trainer: rltt`` only, not with ``plc`` or ``extrap``, verl 0.9.1 engine path only (a
+    verl 0.6.1 launch is refused after the dry-run). Keys and defaults are the fields of
+    ``opd.OPDSettings``: ``enabled`` (false), ``omega`` (0.5), ``ref_loop`` (1), ``estimator``
+    (``sampled``: the sampled-token k1 estimate of the reverse KL; ``full``: the exact
+    full-vocabulary KL) and ``divergence`` (``reverse`` | ``forward``; forward needs ``full``).
+    When enabled the section is passed as ``actor_rollout_ref.actor.opd`` (and to the engine
+    settings). The teacher is a frozen float32 copy of the initial model
+    (``actor_rollout_ref.model.path``): a CPU-offloaded engine for ``sampled``, an unsharded copy
+    on every actor rank for ``full``. The rollout is the ordinary last loop.
 ``loss_agg``
     How each loss term is aggregated over tokens (``rltt_baseline.loss_agg``). ``mode``:
     ``token-mean`` (default: verl's own aggregation, a token mean inside each micro-batch),
     ``drgrpo`` (Dr. GRPO: sum over tokens / (rows * ``norm_len``), ``norm_len`` required) or
     ``seq-mean-token-mean`` (original GRPO: each response's token mean, then mean over responses).
     Both row-normalized modes are independent of the micro-batch split. They are
-    implemented for PLC (``PLCActorRolloutRefWorker``), EP-GRPO (``ExtrapActorRolloutRefWorker``)
-    and GRPO (``RowAggPPOActor`` in ``LoopRLGRPOActorRolloutRefWorker``); the vendor RLTT loss
-    only has ``token-mean``. When not
+    implemented for PLC (``PLCActorRolloutRefWorker``), EP-GRPO (``ExtrapActorRolloutRefWorker``),
+    OPD (verl 0.9.1 engine loss) and GRPO (``RowAggPPOActor`` in
+    ``LoopRLGRPOActorRolloutRefWorker``); the vendor RLTT loss only has ``token-mean``. When not
     ``token-mean`` the section is passed to the workers as ``actor_rollout_ref.loss_agg``.
 
 Overrides use OmegaConf dot-list syntax and win over the file, e.g.
@@ -92,12 +105,13 @@ from omegaconf import DictConfig, OmegaConf
 from rltt_baseline import decode_last, loop_cd
 from rltt_baseline.extrap import ExtrapSettings
 from rltt_baseline.loss_agg import LossAggSettings
+from rltt_baseline.opd import OPDSettings
 from rltt_baseline.plc import PLCSettings
 
 SECTIONS = ("trainer", "args", "wandb", "verl_overrides", "env", "rollout", "model", "audit",
-            "plc", "loss_agg", "extrap")
+            "plc", "loss_agg", "extrap", "opd")
 DICT_SECTIONS = ("args", "wandb", "verl_overrides", "env", "rollout", "model", "audit", "plc",
-                 "loss_agg", "extrap")
+                 "loss_agg", "extrap", "opd")
 TRAINERS = ("rltt", "grpo")
 WANDB_KEYS = {"enabled", "mode", "project", "entity", "run_name", "tags", "notes", "dir"}
 LOOP_WEIGHTINGS = {"uniform", "progressive", "exit_pdf", "learned"}
@@ -144,6 +158,7 @@ def load_config(path: str, overrides: Optional[List[str]] = None) -> DictConfig:
     check_loop_audit(cfg.audit.get("loop_distribution"))
     plc_settings(cfg)  # validates the plc section
     extrap_settings(cfg)  # validates the extrap section
+    opd_settings(cfg)  # validates the opd section
     loss_agg_settings(cfg)  # validates the loss_agg section
     if cfg.rollout.get("kv_layout") is None:
         cfg.rollout.kv_layout = "full"
@@ -573,6 +588,47 @@ def add_extrap_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namesp
                                        "compilation_config": dict(loop_cd.COMPILATION)}}}}})
 
 
+def opd_settings(cfg: DictConfig) -> OPDSettings:
+    """The validated ``opd`` section (all defaults when the section is empty)."""
+    section = cfg.get("opd")
+    values = OmegaConf.to_container(section, resolve=True) if section is not None else {}
+    return OPDSettings.from_mapping(values)
+
+
+def add_opd_overrides(cfg: DictConfig, overrides: dict, args: argparse.Namespace) -> dict:
+    """``overrides`` plus ``actor_rollout_ref.actor.opd`` when OPD is on.
+
+    OPD trains the per-loop model's last loop on its own (ordinary, last-loop) vLLM rollouts, so
+    the rollout settings are left alone; the teacher is a frozen copy of the initial model that
+    the verl 0.9.1 actor worker loads (``verl09_workers``).
+    """
+    settings = opd_settings(cfg)
+    if not settings.enabled:
+        return overrides
+    if cfg.trainer != "rltt":
+        raise ValueError("opd.enabled needs trainer=rltt (the per-loop model)")
+    if plc_settings(cfg).enabled or extrap_settings(cfg).enabled:
+        raise ValueError("opd.enabled, plc.enabled and extrap.enabled are different methods; "
+                         "enable one")
+    if not args.use_rltt_model:
+        raise ValueError("opd.enabled needs args.use_rltt_model=true (per-loop model)")
+    if args.loop_weighting == "learned":
+        raise ValueError("opd.enabled cannot be combined with args.loop_weighting=learned")
+    settings.validate(int(getattr(args, "total_ut_steps", None) or 4))
+    return _deep_merge(overrides, {"actor_rollout_ref": {"actor": {"opd": asdict(settings)}}})
+
+
+def looprl_method(cfg: DictConfig) -> str:
+    """The objective the verl 0.9.1 engine runs: plc, extrap, opd, or the trainer (rltt / grpo)."""
+    if plc_settings(cfg).enabled:
+        return "plc"
+    if extrap_settings(cfg).enabled:
+        return "extrap"
+    if opd_settings(cfg).enabled:
+        return "opd"
+    return cfg.trainer
+
+
 def loss_agg_settings(cfg: DictConfig) -> LossAggSettings:
     """The validated ``loss_agg`` section (``token-mean`` when the section is empty)."""
     section = cfg.get("loss_agg")
@@ -591,10 +647,11 @@ def add_loss_agg_overrides(cfg: DictConfig, overrides: dict) -> dict:
     if not settings.row_normalized:
         return overrides
     if cfg.trainer == "rltt" and not (plc_settings(cfg).enabled
-                                      or extrap_settings(cfg).enabled):
-        raise ValueError(f"loss_agg.mode={settings.mode} is implemented for PLC, EP-GRPO and "
-                         "GRPO only; the vendor RLTT loss (trainer=rltt without plc or extrap) "
-                         "is token-mean")
+                                      or extrap_settings(cfg).enabled
+                                      or opd_settings(cfg).enabled):
+        raise ValueError(f"loss_agg.mode={settings.mode} is implemented for PLC, EP-GRPO, OPD and "
+                         "GRPO only; the vendor RLTT loss (trainer=rltt without plc, extrap or "
+                         "opd) is token-mean")
     actor = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
     if actor.get("loss_agg_mode", "token-mean") != "token-mean":
         raise ValueError(f"loss_agg.mode={settings.mode} replaces verl's loss_agg_mode in the "
@@ -695,7 +752,19 @@ def reference_policy_status(trainer: str, overrides: dict) -> str:
     worker (``PLCActorRolloutRefWorker``), reported here because it costs a forward per step.
     """
     if trainer == "rltt":
-        plc_values = ((overrides.get("actor_rollout_ref") or {}).get("actor") or {}).get("plc")
+        actor_values = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
+        opd_values = actor_values.get("opd")
+        opd_cfg = OPDSettings.from_mapping(opd_values) if opd_values else None
+        if opd_cfg is not None and opd_cfg.enabled and opd_cfg.full_vocab:
+            return ("opd teacher (full vocabulary): no vendor reference worker; every actor rank "
+                    "holds a frozen, unsharded float32 copy of the initial model "
+                    "(actor_rollout_ref.model.path) and runs its per-loop forward in each "
+                    "training micro-batch")
+        if opd_cfg is not None and opd_cfg.enabled:
+            return ("opd teacher: no vendor reference worker; the actor worker loads a frozen, "
+                    "CPU-offloaded float32 copy of the initial model (actor_rollout_ref.model."
+                    "path) as the OPD teacher and runs its per-loop forward once per step")
+        plc_values = actor_values.get("plc")
         if plc_values and PLCSettings.from_mapping(plc_values).uses_init_model:
             return ("plc anchor: no vendor reference worker; the PLC actor worker loads a frozen, "
                     "CPU-offloaded copy of the initial model (actor_rollout_ref.model.path) for "

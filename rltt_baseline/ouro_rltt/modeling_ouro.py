@@ -30,6 +30,15 @@ softmax(((1 + w) log P^(T) - w log P^(r)) / temperature) (``extrap_omega`` = w,
 stop-gradient unless ``extrap_ref_grad``), with the policy's entropy, the per-position strength
 and the last loop's top-2 margin (``rltt_per_loop.extrap_token_stats``).
 
+Full-vocabulary OPD (``rltt_baseline.opd``, estimator ``full``) uses two more switches.
+``return_loop_hidden_states`` (the frozen teacher) adds ``loop_hidden_states``: the T normed
+per-loop hidden states (B, S, H). ``return_opd_kd`` (the trained student) takes the teacher's
+reference- and last-loop hidden states (``opd_teacher_hidden_states``) and its
+``opd_teacher_lm_head`` and adds ``opd_kd``: the full-vocabulary divergence (``opd_divergence``)
+of the student's last loop against the teacher log_softmax((1 + w) log P^(T) - w log P^(r))
+(``opd_omega`` = w) on the last ``opd_window`` predicting positions, with monitoring values
+(``rltt_per_loop.opd_full_kd``).
+
 Model-config keys read here (written by ``prepare_model``):
     rltt_logprob_chunk_size (int | None), rltt_logprob_checkpoint (bool),
     rltt_detach_exit_pdf (bool).
@@ -46,6 +55,7 @@ from .modeling_ouro_base import OuroForCausalLM as _OfficialOuroForCausalLM
 from .rltt_per_loop import (
     exit_pdf_from_gates,
     extrap_token_stats,
+    opd_full_kd,
     per_loop_kd,
     per_loop_token_stats,
 )
@@ -60,6 +70,8 @@ class RLTTCausalLMOutput(CausalLMOutputWithPast):
     loop_kd: Optional[torch.Tensor] = None
     loop_kd_stats: Optional[Dict[str, torch.Tensor]] = None
     extrap: Optional[Dict[str, torch.Tensor]] = None
+    loop_hidden_states: Optional[List[torch.Tensor]] = None
+    opd_kd: Optional[Dict[str, torch.Tensor]] = None
 
 
 class OuroForCausalLM(_OfficialOuroForCausalLM):
@@ -91,10 +103,18 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
         extrap_adaptive: bool = False,
         extrap_delta_cap: Optional[float] = None,
         extrap_ref_grad: bool = False,
+        return_loop_hidden_states: bool = False,
+        return_opd_kd: bool = False,
+        opd_teacher_hidden_states=None,
+        opd_teacher_lm_head: Optional[torch.nn.Module] = None,
+        opd_omega: float = 0.0,
+        opd_divergence: str = "reverse",
+        opd_window: Optional[int] = None,
         **kwargs,
     ):
         if not (return_per_loop_log_probs or return_per_loop_logits or return_exit_pdf
-                or return_loop_kd or return_extrap_log_probs):
+                or return_loop_kd or return_extrap_log_probs or return_loop_hidden_states
+                or return_opd_kd):
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -180,6 +200,33 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
                 chunk_size=getattr(self.config, "rltt_logprob_chunk_size", None),
             )
 
+        opd_kd = None
+        if return_opd_kd:
+            if opd_teacher_hidden_states is None or opd_teacher_lm_head is None:
+                raise ValueError("return_opd_kd=True requires opd_teacher_hidden_states and "
+                                 "opd_teacher_lm_head")
+            teacher_ref, teacher_last = opd_teacher_hidden_states
+            student = hidden_states_list[-1]
+            if opd_window is not None:
+                # position i predicts token i + 1: the last W tokens are predicted by
+                # positions -W - 1 .. -2 (as loop_kd_window)
+                window = int(opd_window)
+                if not 0 < window < student.shape[1]:
+                    raise ValueError(f"opd_window {window} does not fit the sequence")
+                student, teacher_ref, teacher_last = (
+                    h[:, -window - 1:-1] for h in (student, teacher_ref, teacher_last))
+            opd_kd = opd_full_kd(
+                student,
+                teacher_ref,
+                teacher_last,
+                self.lm_head,
+                opd_teacher_lm_head,
+                omega=opd_omega,
+                divergence=opd_divergence,
+                temperature=log_prob_temperature,
+                chunk_size=getattr(self.config, "rltt_logprob_chunk_size", None),
+            )
+
         return RLTTCausalLMOutput(
             loss=None,
             logits=None,
@@ -191,6 +238,8 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
             loop_kd=loop_kd,
             loop_kd_stats=loop_kd_stats,
             extrap=extrap,
+            loop_hidden_states=list(hidden_states_list) if return_loop_hidden_states else None,
+            opd_kd=opd_kd,
         )
 
 
