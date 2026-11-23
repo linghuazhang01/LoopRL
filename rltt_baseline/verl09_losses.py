@@ -47,22 +47,22 @@ def objective(config, settings, output, batch):
     elif method == "opd":
         from rltt_baseline import opd
         cfg = opd.OPDSettings.from_mapping(settings.get("opd"))
-        # the GRPO advantages of the batch are not used: the reward is not part of the objective
+        # the batch's GRPO advantages enter only with opd.rl_coef > 0 (default 0: pure OPD)
+        teacher = batch.get("teacher_log_probs")
+        if cfg.sampled_teacher and teacher is None:
+            raise ValueError(f"OPD estimator={cfg.estimator} needs teacher_log_probs from the "
+                             "frozen teacher engine")
+        if cfg.full_vocab and "opd_kd" not in output:
+            raise ValueError("OPD estimator=full needs opd_kd from the student's forward")
+        loss, metrics = opd.opd_loss(
+            cfg, ell[..., -1], batch["old_log_probs"], mask, advantages=advantages,
+            teacher_log_prob=teacher.float() if cfg.sampled_teacher else None,
+            kd=output.get("opd_kd"), loss_agg_mode=mode, row_div=row_div, **clip)
         if cfg.full_vocab:
-            if "opd_kd" not in output:
-                raise ValueError("OPD estimator=full needs opd_kd from the student's forward")
-            loss, metrics = opd.opd_full_loss(output["opd_kd"], mask, loss_agg_mode=mode,
-                                              row_div=row_div)
             metrics.update(opd.opd_full_stats(output["opd_kd"].detach(), output["opd_kl_other"],
                                               output["opd_teacher_entropy"],
                                               output["opd_top1_agree"], cfg, mask))
         else:
-            teacher = batch.get("teacher_log_probs")
-            if teacher is None:
-                raise ValueError("OPD needs teacher_log_probs from the frozen teacher engine")
-            loss, metrics = opd.opd_policy_loss(ell[..., -1], batch["old_log_probs"],
-                                                teacher.float(), mask, loss_agg_mode=mode,
-                                                row_div=row_div, **clip)
             metrics.update(opd.opd_stats(teacher, batch["old_log_probs"], mask))
     elif method == "grpo":
         loss, metrics = plc.grpo_policy_loss(ell[..., -1], batch["old_log_probs"], advantages,

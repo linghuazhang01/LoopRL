@@ -123,7 +123,7 @@ def run(config):
                 if "old_log_probs_loops" not in result:
                     raise RuntimeError("LoopRL worker did not return per-loop old policy log probabilities")
             opd_cfg = self.config.actor_rollout_ref.looprl.get("opd") or {}
-            sampled = opd_cfg.get("estimator", "sampled") == "sampled"
+            sampled = opd_cfg.get("estimator", "sampled") != "full"  # sampled, k2
             if method == "opd" and sampled and "teacher_log_probs" not in result:
                 raise RuntimeError("OPD needs the frozen teacher's log probabilities "
                                    "(teacher_log_probs)")

@@ -510,7 +510,8 @@ def test_other_configs_have_plc_off(env):
     for name in ("rltt_baseline.yaml", "rltt_baseline_1p4b_8gpu.yaml",
                  "grpo_baseline_1p4b_8gpu.yaml", "grpo_baseline_8gpu.yaml",
                  "extrap_grpo_loopcd_1p4b_8gpu.yaml", "opd_loopcd_1p4b_8gpu.yaml",
-                 "opd_full_rkl_loopcd_1p4b_8gpu.yaml", "opd_full_fkl_loopcd_1p4b_8gpu.yaml"):
+                 "opd_full_rkl_loopcd_1p4b_8gpu.yaml", "opd_full_fkl_loopcd_1p4b_8gpu.yaml",
+                 "grpo_k2_loopcd_1p4b_8gpu.yaml"):
         assert not rcfg.plc_settings(rcfg.load_config(str(paths.config_file(name)))).enabled
 
 

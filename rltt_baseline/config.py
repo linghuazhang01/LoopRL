@@ -69,8 +69,11 @@ A config file has these top-level keys:
     ``trainer: rltt`` only, not with ``plc`` or ``extrap``, verl 0.9.1 engine path only (a
     verl 0.6.1 launch is refused after the dry-run). Keys and defaults are the fields of
     ``opd.OPDSettings``: ``enabled`` (false), ``omega`` (0.5), ``ref_loop`` (1), ``estimator``
-    (``sampled``: the sampled-token k1 estimate of the reverse KL; ``full``: the exact
-    full-vocabulary KL) and ``divergence`` (``reverse`` | ``forward``; forward needs ``full``).
+    (``sampled``: the sampled-token k1 estimate of the reverse KL as a PPO advantage; ``full``:
+    the exact full-vocabulary KL; ``k2``: KDRL's sampled-token (log pi_T - log P4)^2 / 2),
+    ``divergence`` (``reverse`` | ``forward``; forward needs ``full``), ``rl_coef`` (0: GRPO on
+    the outcome advantages is off, the reward is not in the objective) and ``kd_coef`` (1: the
+    weight beta of the divergence); the loss is ``rl_coef * GRPO + kd_coef * divergence``.
     When enabled the section is passed as ``actor_rollout_ref.actor.opd`` (and to the engine
     settings). The teacher is a frozen float32 copy of the initial model
     (``actor_rollout_ref.model.path``): a CPU-offloaded engine for ``sampled``, an unsharded copy

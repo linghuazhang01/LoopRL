@@ -28,6 +28,9 @@ RLTT_CONFIGS = ("rltt_baseline_1p4b_8gpu.yaml", "rltt_baseline.yaml")
 # OPD: Dr. GRPO like PLC (every token weighs the same: the sequence-level reverse KL)
 OPD_CONFIGS = ("opd_loopcd_1p4b_8gpu.yaml", "opd_full_rkl_loopcd_1p4b_8gpu.yaml",
                "opd_full_fkl_loopcd_1p4b_8gpu.yaml")
+# GRPO + k2 (opd section with rl_coef 1): GRPO's aggregation for both terms, so opd.kd_coef=0 is
+# the GRPO config's loss
+GRPO_K2_CONFIGS = ("grpo_k2_loopcd_1p4b_8gpu.yaml",)
 DRGRPO = LossAggSettings(mode="drgrpo", norm_len=16384)
 SEQ = LossAggSettings(mode="seq-mean-token-mean")
 
@@ -295,7 +298,7 @@ def test_rltt_loss_terms_use_the_vendor_scale():
 
 # ---------- configs ----------
 
-@pytest.mark.parametrize("name", GRPO_CONFIGS + EXTRAP_CONFIGS)
+@pytest.mark.parametrize("name", GRPO_CONFIGS + EXTRAP_CONFIGS + GRPO_K2_CONFIGS)
 def test_grpo_configs_use_the_per_response_mean(env, name):
     cfg = rcfg.load_config(str(paths.config_file(name)))
     assert rcfg.loss_agg_settings(cfg) == SEQ
@@ -346,6 +349,7 @@ def test_unknown_loss_agg_key_is_refused(env):
     ("plc_grpo_loopkd_1p4b_8gpu.yaml", {"mode": "drgrpo", "norm_len": 16384}),
     (EXTRAP_CONFIGS[0], {"mode": "seq-mean-token-mean", "norm_len": None}),
     (OPD_CONFIGS[0], {"mode": "drgrpo", "norm_len": 16384}),
+    (GRPO_K2_CONFIGS[0], {"mode": "seq-mean-token-mean", "norm_len": None}),
 ])
 def test_dry_run_passes_loss_agg_to_the_workers(env, capsys, monkeypatch, name, expected):
     from rltt_baseline import launch

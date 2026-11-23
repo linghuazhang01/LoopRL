@@ -25,6 +25,7 @@ ENV = {
 V, H, B, S, T = 11, 6, 2, 5, 4
 SAMPLED_SECTION = {"enabled": True, "omega": 0.5, "ref_loop": 1, "estimator": "sampled",
                    "divergence": "reverse"}
+COEF_DEFAULTS = {"rl_coef": 0.0, "kd_coef": 1.0}  # filled in by the launcher (pure OPD)
 
 
 @pytest.fixture
@@ -172,6 +173,13 @@ def test_settings_defaults_and_conversions():
     ({"estimator": "full", "divergence": "js"}, ValueError, "divergence"),
     ({"divergence": "forward"}, ValueError, "reverse KL only"),
     ({"estimator": 1}, TypeError, "string"),
+    ({"estimator": "k2", "divergence": "forward"}, ValueError, "reverse KL only"),
+    ({"rl_coef": -1.0}, ValueError, "rl_coef"),
+    ({"kd_coef": float("nan")}, ValueError, "kd_coef"),
+    ({"kd_coef": float("inf")}, ValueError, "kd_coef"),
+    ({"rl_coef": "1"}, TypeError, "number"),
+    ({"rl_coef": True}, TypeError, "number"),
+    ({"rl_coef": 0, "kd_coef": 0}, ValueError, "both 0"),
 ])
 def test_settings_validation(values, error, match):
     with pytest.raises(error, match=match):
@@ -216,7 +224,7 @@ def test_overrides_pass_the_section_and_leave_the_rollout_alone(env):
     base = rcfg.verl_overrides(cfg)
     overrides = rcfg.add_opd_overrides(cfg, base, _args())
     ar = overrides["actor_rollout_ref"]
-    assert ar["actor"]["opd"] == SAMPLED_SECTION
+    assert ar["actor"]["opd"] == {**SAMPLED_SECTION, **COEF_DEFAULTS}
     # the rollout is the ordinary last loop: same rollout and model settings as without OPD
     assert ar["rollout"] == base["actor_rollout_ref"]["rollout"]
     assert "external_lib" not in ar["model"]
@@ -253,7 +261,7 @@ def test_dry_run(env, capsys, monkeypatch):
     assert launch.main(["--config", str(CONFIG), "--dry-run"]) == 0
     resolved = json.loads(capsys.readouterr().out)
     ar = resolved["verl_overrides"]["actor_rollout_ref"]
-    assert ar["actor"]["opd"] == SAMPLED_SECTION
+    assert ar["actor"]["opd"] == {**SAMPLED_SECTION, **COEF_DEFAULTS}
     assert ar["loss_agg"] == {"mode": "drgrpo", "norm_len": 16384}
     assert "plc" not in ar["actor"] and "extrap" not in ar["actor"]
     assert "engine_kwargs" not in ar["rollout"]  # no LoopCD rollout
@@ -480,7 +488,7 @@ def test_full_dry_run(env, capsys, monkeypatch):
     resolved = json.loads(capsys.readouterr().out)
     ar = resolved["verl_overrides"]["actor_rollout_ref"]
     assert ar["actor"]["opd"] == {"enabled": True, "omega": 0.5, "ref_loop": 1,
-                                  "estimator": "full", "divergence": "forward"}
+                                  "estimator": "full", "divergence": "forward", **COEF_DEFAULTS}
     assert ar["loss_agg"] == {"mode": "drgrpo", "norm_len": 16384}
     assert resolved["reference_policy"].startswith("opd teacher (full vocabulary)")
     assert resolved["policy_violations"] is not None
@@ -515,3 +523,280 @@ def test_native_objective_full(divergence):
     del output["opd_kd"]
     with pytest.raises(ValueError, match="opd_kd"):
         objective({}, settings, output, batch)
+
+
+# ---------- k2 estimator and the GRPO term (KDRL, arXiv 2506.02208) ----------
+
+K2_SECTION = dict(enabled=True, omega=0.5, estimator="k2", rl_coef=1.0, kd_coef=0.01)
+
+
+def test_k2_value_and_per_sample_gradient():
+    log_prob, _, teacher, mask = _batch()
+    loss, metrics = opd.opd_k2_loss(log_prob, teacher, mask)
+    r = teacher - log_prob.detach()
+    _close(loss, (0.5 * r.square() * mask).sum() / mask.sum())
+    # d(R^2 / 2) / d log p = -R: the REINFORCE step with the per-token reward R
+    _close(torch.autograd.grad(loss, log_prob)[0], -r * mask / mask.sum())
+    assert metrics == {"loss_term/kd": pytest.approx(loss.item()), "loss_term/pg": 0.0}
+
+
+def test_k2_expected_gradient_is_the_reverse_kl_gradient():
+    """sum_y p(y) * grad k2(y) = grad KL(p || t) on the student logits (y ~ p, on-policy)."""
+    g = torch.Generator().manual_seed(42)
+    z = torch.randn(V, generator=g, requires_grad=True)
+    log_t = F.log_softmax(torch.randn(V, generator=g), -1)
+    log_p = F.log_softmax(z, -1)
+    expected = torch.zeros(V)
+    for y in range(V):
+        loss, _ = opd.opd_k2_loss(log_p[y].reshape(1, 1), log_t[y].reshape(1, 1),
+                                  torch.ones(1, 1))
+        grad, = torch.autograd.grad(loss, z, retain_graph=True)
+        expected += log_p[y].detach().exp() * grad
+    kl = (log_p.exp() * (log_p - log_t)).sum()
+    kl_grad, = torch.autograd.grad(kl, z)
+    _close(expected, kl_grad, atol=1e-6)
+
+
+def test_k2_and_sampled_take_the_same_on_policy_step():
+    log_prob, _, teacher, mask = _batch()
+    k2, _ = opd.opd_k2_loss(log_prob, teacher, mask)
+    ppo, _ = opd.opd_policy_loss(log_prob, log_prob.detach(), teacher, mask, 0.2)
+    _close(torch.autograd.grad(k2, log_prob)[0], torch.autograd.grad(ppo, log_prob)[0])
+
+
+def test_k2_teacher_equal_to_student_gives_no_step_and_shapes_are_checked():
+    log_prob = (torch.rand(B, S) * -2).requires_grad_()
+    loss, _ = opd.opd_k2_loss(log_prob, log_prob.detach(), torch.ones(B, S))
+    _close(torch.autograd.grad(loss, log_prob)[0], torch.zeros(B, S))
+    with pytest.raises(ValueError, match="do not match"):
+        opd.opd_k2_loss(log_prob, log_prob.detach()[:, :-1], torch.ones(B, S))
+
+
+def test_k2_settings():
+    s = opd.OPDSettings.from_mapping(K2_SECTION)
+    assert s.sampled_teacher and not s.full_vocab and not s.pure_distillation
+    assert (s.rl_coef, s.kd_coef) == (1.0, 0.01)
+    assert s.teacher_model_kwargs() == opd.OPDSettings().teacher_model_kwargs()
+    assert opd.OPDSettings().pure_distillation and opd.OPDSettings().sampled_teacher
+    assert not opd.OPDSettings(estimator="full").sampled_teacher
+    assert "rl_coef=1.0 kd_coef=0.01" in s.describe()
+
+
+@pytest.mark.parametrize("estimator", ["sampled", "k2", "full"])
+@pytest.mark.parametrize("rl_coef,kd_coef", [(1.0, 0.01), (0.0, 0.5), (2.0, 1.0), (1.0, 0.0)])
+def test_joint_loss_is_rl_coef_grpo_plus_kd_coef_divergence(estimator, rl_coef, kd_coef):
+    log_prob, old, teacher, mask = _batch()
+    adv = torch.tensor([[1.0] * S, [-0.5] * S])
+    kd = torch.rand(B, S) + 0.1
+    row_div = torch.tensor([3.0, 2.0])
+    s = opd.OPDSettings(enabled=True, estimator=estimator, rl_coef=rl_coef, kd_coef=kd_coef)
+    loss, metrics = opd.opd_loss(s, log_prob, old, mask, 0.2, advantages=adv,
+                                 teacher_log_prob=teacher, kd=kd, row_div=row_div)
+    if estimator == "sampled":
+        div, _ = opd.opd_policy_loss(log_prob, old, teacher, mask, 0.2, row_div=row_div)
+    elif estimator == "k2":
+        div, _ = opd.opd_k2_loss(log_prob, teacher, mask, row_div=row_div)
+    else:
+        div, _ = opd.opd_full_loss(kd, mask, row_div=row_div)
+    grpo, _ = plc.grpo_policy_loss(log_prob, old, adv, mask, 0.2, row_div=row_div)
+    _close(loss, rl_coef * grpo + kd_coef * div)
+    assert metrics["loss_term/pg"] == pytest.approx(rl_coef * grpo.item())
+    assert metrics["loss_term/kd"] == pytest.approx(kd_coef * div.item())
+    assert ("actor/pg_clipfrac" in metrics) == (rl_coef > 0)
+
+
+@pytest.mark.parametrize("estimator", ["sampled", "k2"])
+def test_default_coefficients_leave_the_estimator_alone(estimator):
+    log_prob, old, teacher, mask = _batch()
+    s = opd.OPDSettings(enabled=True, estimator=estimator)
+    loss, metrics = opd.opd_loss(s, log_prob, old, mask, 0.2, teacher_log_prob=teacher)
+    if estimator == "sampled":
+        ref, ref_metrics = opd.opd_policy_loss(log_prob, old, teacher, mask, 0.2)
+    else:
+        ref, ref_metrics = opd.opd_k2_loss(log_prob, teacher, mask)
+    assert torch.equal(loss, ref) and metrics == ref_metrics
+
+
+def test_joint_loss_needs_its_inputs():
+    log_prob, old, teacher, mask = _batch()
+    s = opd.OPDSettings(enabled=True, estimator="k2", rl_coef=1.0, kd_coef=0.01)
+    with pytest.raises(ValueError, match="advantages"):
+        opd.opd_loss(s, log_prob, old, mask, 0.2, teacher_log_prob=teacher)
+    with pytest.raises(ValueError, match="teacher_log_probs"):
+        opd.opd_loss(s, log_prob, old, mask, 0.2, advantages=torch.ones(B, S))
+    with pytest.raises(ValueError, match="opd_kd"):
+        opd.opd_loss(opd.OPDSettings(enabled=True, estimator="full"), log_prob, old, mask, 0.2)
+
+
+def test_native_objective_k2_uses_the_reward():
+    from rltt_baseline import loss_agg
+    from rltt_baseline.verl09_losses import objective
+
+    log_prob, old, teacher, mask = _batch()
+    ell = torch.cat([(torch.rand(B, S, T - 1) * -2), log_prob.detach().unsqueeze(-1)], -1)
+    ell.requires_grad_()
+    output = dict(log_probs=ell[..., -1], entropy=torch.zeros(B, S), per_loop_log_probs=ell,
+                  per_loop_entropies=torch.zeros(B, S, T))
+    adv = torch.tensor([[1.0] * S, [-0.5] * S])
+    batch = dict(old_log_probs=old, response_mask=mask, teacher_log_probs=teacher, advantages=adv)
+    settings = dict(method="opd", opd=K2_SECTION, loss_agg=dict(mode="seq-mean-token-mean"))
+    actual, metrics = objective(dict(clip_ratio=0.2), settings, output, batch)
+    row_div = loss_agg.row_divisors(loss_agg.LossAggSettings(mode="seq-mean-token-mean"), mask)
+    grpo, _ = plc.grpo_policy_loss(ell[..., -1], old, adv, mask, 0.2, row_div=row_div)
+    k2, _ = opd.opd_k2_loss(ell[..., -1], teacher, mask, row_div=row_div)
+    expected = grpo + 0.01 * k2
+    _close(actual, expected)
+    _close(torch.autograd.grad(actual, ell, retain_graph=True)[0],
+           torch.autograd.grad(expected, ell)[0])
+    assert metrics["loss_term/kd"] == pytest.approx(0.01 * k2.item())
+    assert metrics["loss_term/pg"] == pytest.approx(grpo.item())
+    assert "actor/pg_clipfrac" in metrics
+    assert metrics["opd/reverse_kl_k1"] == pytest.approx(
+        float(((old - teacher) * mask).sum() / mask.sum()))
+    # the reward enters the objective: flipping the advantages changes the loss
+    batch["advantages"] = -adv
+    again, _ = objective(dict(clip_ratio=0.2), settings, output, batch)
+    assert not torch.allclose(again, actual)
+    del batch["teacher_log_probs"]
+    with pytest.raises(ValueError, match="teacher_log_probs"):
+        objective({}, settings, output, batch)
+
+
+def test_k2_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    _clean_launch_env(monkeypatch)
+    assert launch.main(["--config", str(CONFIG), "--dry-run", "opd.estimator=k2",
+                        "opd.rl_coef=1", "opd.kd_coef=0.002"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    ar = resolved["verl_overrides"]["actor_rollout_ref"]
+    assert ar["actor"]["opd"] == {**SAMPLED_SECTION, "estimator": "k2", "rl_coef": 1.0,
+                                  "kd_coef": 0.002}
+    assert resolved["reference_policy"].startswith("opd teacher: ")
+
+
+# ---------- GRPO + k2 under seq-mean-token-mean: both terms are per-response means ----------
+
+SEQ_MEAN = dict(mode="seq-mean-token-mean")
+
+
+def _ragged_batch(lengths=(5, 3, 1, 4, 2, 5)):
+    """Responses of different lengths: the per-response mean differs from the token mean."""
+    g = torch.Generator().manual_seed(42)
+    rows, width = len(lengths), max(lengths)
+    mask = (torch.arange(width)[None] < torch.tensor(lengths)[:, None]).float()
+    ell = (torch.rand(rows, width, T, generator=g) * -2).requires_grad_()
+    old = ell.detach()[..., -1] - 0.05 * torch.rand(rows, width, generator=g)
+    teacher = old + torch.randn(rows, width, generator=g) * 0.5
+    adv = torch.randn(rows, generator=g)[:, None].expand(rows, width).contiguous()
+    output = dict(log_probs=ell[..., -1], entropy=torch.zeros(rows, width),
+                  per_loop_log_probs=ell, per_loop_entropies=torch.zeros(rows, width, T))
+    batch = dict(old_log_probs=old, response_mask=mask, teacher_log_probs=teacher,
+                 advantages=adv)
+    return ell, output, batch
+
+
+def _rows(output, batch, idx):
+    pick = lambda d: {k: v[idx] for k, v in d.items()}  # noqa: E731
+    return pick(output), pick(batch)
+
+
+def test_joint_k2_seq_mean_is_the_per_response_mean_of_both_terms():
+    """loss = (1/N) sum_i (1/L_i) sum_t [ -rl_coef PPO_it(A_i) + kd_coef (R_it^2 / 2) ]."""
+    from rltt_baseline.verl09_losses import objective
+
+    ell, output, batch = _ragged_batch()
+    settings = dict(method="opd", opd=K2_SECTION, loss_agg=SEQ_MEAN)
+    actual, _ = objective(dict(clip_ratio=0.2), settings, output, batch)
+    logp, old, mask = ell[..., -1], batch["old_log_probs"], batch["response_mask"]
+    ppo, _ = plc.ppo_objective(logp, old, batch["advantages"], 0.2)
+    k2 = 0.5 * (batch["teacher_log_probs"] - logp).square()
+    per_token = -K2_SECTION["rl_coef"] * ppo + K2_SECTION["kd_coef"] * k2
+    lengths = mask.sum(-1)
+    expected = sum((per_token[i] * mask[i]).sum() / lengths[i] for i in range(len(lengths)))
+    expected = expected / len(lengths)
+    _close(actual, expected)
+    # every response weighs 1/N in total, whatever its length, in both terms
+    grad, = torch.autograd.grad(actual, ell)
+    per_token_grad = grad[..., -1]
+    assert torch.equal(per_token_grad[mask == 0], torch.zeros_like(per_token_grad[mask == 0]))
+
+
+def test_joint_kd_coef_zero_is_the_grpo_objective():
+    """With kd_coef = 0 the joint loss is exactly the GRPO objective (same aggregation)."""
+    from rltt_baseline.verl09_losses import objective
+
+    _, output, batch = _ragged_batch()
+    joint = dict(method="opd", opd={**K2_SECTION, "kd_coef": 0.0}, loss_agg=SEQ_MEAN)
+    grpo = dict(method="grpo", loss_agg=SEQ_MEAN)
+    a, _ = objective(dict(clip_ratio=0.2), joint, output, batch)
+    b, _ = objective(dict(clip_ratio=0.2), grpo, output, batch)
+    assert torch.equal(a, b)
+
+
+def test_joint_k2_seq_mean_does_not_depend_on_the_micro_batch_split():
+    """Micro-batches scaled by B_micro / B (as looprl_loss does) give the whole-batch loss and
+    gradient: each micro-batch takes both terms' divisors L_i from its own rows."""
+    from rltt_baseline.verl09_losses import objective
+
+    ell, output, batch = _ragged_batch()
+    settings = dict(method="opd", opd=K2_SECTION, loss_agg=SEQ_MEAN)
+    whole, _ = objective(dict(clip_ratio=0.2), settings, output, batch)
+    whole_grad, = torch.autograd.grad(whole, ell)
+    rows = batch["response_mask"].shape[0]
+    for split in ([0, 1, 2, 3, 4, 5], [[4, 0], [2, 5, 1], [3]], [[1], [0, 2, 3, 4, 5]]):
+        groups = [[i] for i in split] if isinstance(split[0], int) else split
+        total = 0.0
+        for idx in groups:
+            out, bat = _rows(output, batch, torch.tensor(idx))
+            micro, _ = objective(dict(clip_ratio=0.2), settings, out, bat)
+            total = total + micro * len(idx) / rows
+        _close(total, whole)
+        _close(torch.autograd.grad(total, ell)[0], whole_grad)
+
+
+# ---------- the GRPO + k2 config (user, 2026-11-23) ----------
+
+GRPO_K2_CONFIG = paths.config_file("grpo_k2_loopcd_1p4b_8gpu.yaml")
+GRPO_K2_SECTION = {**SAMPLED_SECTION, "estimator": "k2", "rl_coef": 1.0, "kd_coef": 0.01}
+
+
+def test_grpo_k2_config(env):
+    cfg = rcfg.load_config(str(GRPO_K2_CONFIG))
+    assert rcfg.opd_settings(cfg) == opd.OPDSettings(**GRPO_K2_SECTION)
+    assert rcfg.looprl_method(cfg) == "opd" and cfg.trainer == "rltt"
+    assert rcfg.loss_agg_settings(cfg).mode == "seq-mean-token-mean"
+    assert cfg.args.max_steps == 100
+    assert cfg.args.num_prompts_per_batch * cfg.args.num_generations == 512
+    assert cfg.args.seed == 42 and cfg.args.train_file == ENV["LOOPRL_TRAIN_FILE"]
+    overrides = rcfg.add_opd_overrides(cfg, rcfg.verl_overrides(cfg), _args())
+    assert overrides["actor_rollout_ref"]["actor"]["opd"] == GRPO_K2_SECTION
+    assert rcfg.reference_policy_status("rltt", overrides).startswith("opd teacher: ")
+
+
+def test_grpo_k2_config_differs_from_opd_only_in_the_method(env):
+    """Same as opd_loopcd_1p4b_8gpu.yaml except the opd estimator / coefficients, loss_agg and the
+    wandb naming."""
+    k2 = OmegaConf.to_container(rcfg.load_config(str(GRPO_K2_CONFIG)))
+    base = OmegaConf.to_container(rcfg.load_config(str(CONFIG)))
+    assert k2.pop("opd") == GRPO_K2_SECTION and base.pop("opd") == SAMPLED_SECTION
+    assert k2.pop("loss_agg") == {"mode": "seq-mean-token-mean"}
+    assert base.pop("loss_agg") == {"mode": "drgrpo", "norm_len": 16384}
+    for cfg in (k2, base):
+        cfg["wandb"].pop("run_name")
+        cfg["wandb"].pop("tags")
+    assert k2 == base
+
+
+def test_grpo_k2_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    _clean_launch_env(monkeypatch)
+    assert launch.main(["--config", str(GRPO_K2_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    ar = resolved["verl_overrides"]["actor_rollout_ref"]
+    assert ar["actor"]["opd"] == GRPO_K2_SECTION
+    assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
+    assert "engine_kwargs" not in ar["rollout"]  # ordinary last-loop rollout
+    assert resolved["reference_policy"].startswith("opd teacher: ")
+    assert resolved["config"]["wandb"]["run_name"] == "grpo-k2-loopcd-w0.5-beta0.01-1p4b"

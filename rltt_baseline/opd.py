@@ -18,7 +18,7 @@ re-extrapolating the student every step.
 Student and rollouts. The student is the trained model's last loop P^(4) (the loop evaluated with
 w_eval = 0); vLLM samples the rollouts from it, as in GRPO / RLTT / PLC (on-policy).
 
-Two estimators of the per-position divergence (``estimator``):
+Three estimators of the per-position divergence (``estimator``):
 
 - ``sampled`` (reverse KL only): on every response token y_j,
 
@@ -37,9 +37,28 @@ Two estimators of the per-position divergence (``estimator``):
   computed inside the student's training forward (``rltt_per_loop.opd_full_kd``) from the hidden
   states of a frozen teacher model that every actor rank holds (``verl09_workers``).
 
-Both use the token's own term only (no reward-to-go over later tokens) on the student's own
-trajectories. The verifiable reward is not part of the objective: the driver still scores the
-rollouts (``reasoning/*`` metrics) and computes GRPO advantages, which this loss ignores.
+- ``k2`` (reverse KL only; KDRL, Xu et al., arXiv 2506.02208, Eq. 6): on every response token,
+
+      R_j = log pi_T(y_j) - log P^(4)(y_j),   loss = agg_j[ R_j^2 / 2 ]
+
+  The gradient flows through the student's log-prob only: grad = -R_j grad log P^(4)(y_j), the
+  REINFORCE step with the per-token reward R_j, whose expectation over y ~ P^(4) is the gradient
+  of KL(P^(4)(.|s) || pi_T(.|s)) (the value of R^2 / 2 is a biased KL estimate, its gradient is
+  not). Same teacher engine as ``sampled``; no PPO ratio or clip (one update per step).
+
+All three use the token's own term only (no reward-to-go over later tokens) on the student's own
+trajectories.
+
+Reward. ``rl_coef`` (default 0) adds GRPO on the batch's outcome advantages, the same element-wise
+PPO term as ``trainer: grpo`` (``plc.grpo_policy_loss``), and ``kd_coef`` (beta, default 1) scales
+the divergence:
+
+    loss = rl_coef * GRPO(A_outcome) + kd_coef * D
+
+With the defaults the verifiable reward is not part of the objective (pure OPD, the loss is
+unchanged): the driver still scores the rollouts (``reasoning/*`` metrics) and computes GRPO
+advantages, which the loss then ignores. ``estimator: k2, rl_coef: 1, kd_coef: beta`` is KDRL's
+joint objective J_GRPO - beta * k2 with the base model's LoopCD policy as the teacher.
 """
 
 from dataclasses import asdict, dataclass, fields
@@ -49,7 +68,8 @@ import torch
 
 from rltt_baseline import plc
 
-ESTIMATORS = ("sampled", "full")
+ESTIMATORS = ("sampled", "full", "k2")
+SAMPLED_TOKEN_ESTIMATORS = ("sampled", "k2")   # need the teacher's sampled-token log-probs
 DIVERGENCES = ("reverse", "forward")
 
 
@@ -60,8 +80,10 @@ class OPDSettings:
     enabled: bool = False
     omega: float = 0.5   # w: teacher log pi_T = (1 + w) l_4 - w l_r of the base; 0 = base P^(4)
     ref_loop: int = 1    # reference loop r of the teacher (1-based); the source is the last loop
-    estimator: str = "sampled"   # sampled-token k1 (reverse only) | full-vocabulary KL
+    estimator: str = "sampled"   # sampled-token k1 PPO | full-vocabulary KL | sampled-token k2
     divergence: str = "reverse"  # reverse KL(P4 || pi_T) | forward KL(pi_T || P4) (full only)
+    rl_coef: float = 0.0  # weight of GRPO on the outcome advantages (0: the reward is not used)
+    kd_coef: float = 1.0  # beta: weight of the divergence term
 
     @classmethod
     def from_mapping(cls, values: Optional[Mapping]) -> "OPDSettings":
@@ -76,10 +98,11 @@ class OPDSettings:
         for name in ("estimator", "divergence"):
             if not isinstance(merged[name], str):
                 raise TypeError(f"opd.{name} must be a string, got {merged[name]!r}")
-        omega = merged["omega"]
-        if isinstance(omega, bool) or not isinstance(omega, (int, float)):
-            raise TypeError(f"opd.omega must be a number, got {omega!r}")
-        merged["omega"] = float(omega)
+        for name in ("omega", "rl_coef", "kd_coef"):
+            value = merged[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"opd.{name} must be a number, got {value!r}")
+            merged[name] = float(value)
         ref = merged["ref_loop"]
         if isinstance(ref, bool) or not isinstance(ref, int):
             raise TypeError(f"opd.ref_loop must be an integer, got {ref!r}")
@@ -100,13 +123,31 @@ class OPDSettings:
         if self.divergence not in DIVERGENCES:
             raise ValueError(f"opd.divergence must be one of {DIVERGENCES}, got "
                              f"{self.divergence!r}")
-        if self.estimator == "sampled" and self.divergence != "reverse":
-            raise ValueError("opd.estimator=sampled estimates the reverse KL only (the student "
-                             "samples the tokens); use opd.estimator=full for the forward KL")
+        if self.estimator in SAMPLED_TOKEN_ESTIMATORS and self.divergence != "reverse":
+            raise ValueError(f"opd.estimator={self.estimator} estimates the reverse KL only (the "
+                             "student samples the tokens); use opd.estimator=full for the forward "
+                             "KL")
+        for name in ("rl_coef", "kd_coef"):
+            value = getattr(self, name)
+            if not value >= 0 or value == float("inf"):
+                raise ValueError(f"opd.{name} must be a finite number >= 0, got {value!r}")
+        if self.rl_coef == 0 and self.kd_coef == 0:
+            raise ValueError("opd.rl_coef and opd.kd_coef are both 0: the loss would be empty")
 
     @property
     def full_vocab(self) -> bool:
         return self.estimator == "full"
+
+    @property
+    def sampled_teacher(self) -> bool:
+        """The teacher's sampled-token log-probs come from the frozen engine (``teacher_log_probs``
+        in the ``compute_log_prob`` pass): estimators ``sampled`` and ``k2``."""
+        return self.estimator in SAMPLED_TOKEN_ESTIMATORS
+
+    @property
+    def pure_distillation(self) -> bool:
+        """``rl_coef = 0, kd_coef = 1``: the original OPD loss, unchanged."""
+        return self.rl_coef == 0 and self.kd_coef == 1
 
     def student_model_kwargs(self) -> dict:
         """Keyword arguments of the student's per-loop forward for the full-vocabulary loss; the
@@ -123,7 +164,8 @@ class OPDSettings:
 
     def describe(self) -> str:
         return (f"omega={self.omega} ref_loop={self.ref_loop} estimator={self.estimator} "
-                f"divergence={self.divergence} (teacher: frozen initial model)")
+                f"divergence={self.divergence} rl_coef={self.rl_coef} kd_coef={self.kd_coef} "
+                "(teacher: frozen initial model)")
 
 
 def opd_full_loss(kd: torch.Tensor, response_mask: torch.Tensor, loss_agg_mode: str = "token-mean",
@@ -177,6 +219,73 @@ def opd_policy_loss(log_prob: torch.Tensor, old_log_prob: torch.Tensor,
                                 loss_agg_mode=loss_agg_mode, clip_ratio_low=clip_ratio_low,
                                 clip_ratio_high=clip_ratio_high, clip_ratio_c=clip_ratio_c,
                                 row_div=row_div)
+
+
+def opd_k2_loss(log_prob: torch.Tensor, teacher_log_prob: torch.Tensor,
+                response_mask: torch.Tensor, loss_agg_mode: str = "token-mean",
+                row_div: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """KDRL's k2 term ``agg[(log pi_T(y) - log P^(4)(y))^2 / 2]`` on the sampled tokens of the last
+    loop's ``[B, L]`` log-probs (gradient through the student only: ``-R grad log P^(4)``)."""
+    if teacher_log_prob.shape != log_prob.shape:
+        raise ValueError(f"teacher log-probs {tuple(teacher_log_prob.shape)} do not match the "
+                         f"student's {tuple(log_prob.shape)}")
+    log_ratio = teacher_log_prob.detach().to(log_prob.dtype) - log_prob
+    loss = plc.agg_term(0.5 * log_ratio.square(), response_mask, loss_agg_mode, row_div)
+    return loss, {"loss_term/kd": loss.detach().item(), "loss_term/pg": 0.0}
+
+
+def opd_loss(settings: "OPDSettings", log_prob: torch.Tensor, old_log_prob: torch.Tensor,
+             response_mask: torch.Tensor, clip_ratio: float, *,
+             advantages: Optional[torch.Tensor] = None,
+             teacher_log_prob: Optional[torch.Tensor] = None, kd: Optional[torch.Tensor] = None,
+             loss_agg_mode: str = "token-mean", clip_ratio_low: Optional[float] = None,
+             clip_ratio_high: Optional[float] = None, clip_ratio_c: float = 3.0,
+             row_div: Optional[torch.Tensor] = None
+             ) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """``rl_coef * GRPO(advantages) + kd_coef * D`` on the last loop.
+
+    ``D`` is the estimator's divergence term: ``opd_policy_loss`` (``sampled``, needs
+    ``teacher_log_prob``), ``opd_full_loss`` (``full``, needs the student forward's ``kd``) or
+    ``opd_k2_loss`` (``k2``, needs ``teacher_log_prob``). With ``rl_coef = 0, kd_coef = 1`` the
+    loss and metrics are exactly those of the estimator alone (the original OPD). Otherwise the
+    metrics report ``loss_term/pg`` (the weighted GRPO term) and ``loss_term/kd`` (the weighted
+    divergence) and keep verl's clip statistics for the GRPO term only.
+    """
+    clip = dict(clip_ratio_low=clip_ratio_low, clip_ratio_high=clip_ratio_high,
+                clip_ratio_c=clip_ratio_c)
+    if settings.sampled_teacher and teacher_log_prob is None:
+        raise ValueError(f"OPD estimator={settings.estimator} needs teacher_log_probs from the "
+                         "frozen teacher engine")
+    if settings.full_vocab:
+        if kd is None:
+            raise ValueError("OPD estimator=full needs opd_kd from the student's forward")
+        kd_loss, kd_metrics = opd_full_loss(kd, response_mask, loss_agg_mode, row_div)
+    elif settings.estimator == "k2":
+        kd_loss, kd_metrics = opd_k2_loss(log_prob, teacher_log_prob, response_mask,
+                                          loss_agg_mode, row_div)
+    else:
+        kd_loss, kd_metrics = opd_policy_loss(log_prob, old_log_prob, teacher_log_prob,
+                                              response_mask, clip_ratio, loss_agg_mode,
+                                              row_div=row_div, **clip)
+    if settings.pure_distillation:
+        return kd_loss, kd_metrics
+    metrics: Dict[str, object] = {}
+    loss = settings.kd_coef * kd_loss
+    if settings.rl_coef > 0:
+        if advantages is None:
+            raise ValueError("opd.rl_coef > 0 needs the batch's outcome advantages")
+        pg_loss, pg_metrics = plc.grpo_policy_loss(log_prob, old_log_prob, advantages,
+                                                   response_mask, clip_ratio,
+                                                   loss_agg_mode=loss_agg_mode, row_div=row_div,
+                                                   **clip)
+        metrics.update({k: v for k, v in pg_metrics.items() if not k.startswith("loss_term/")})
+        loss = settings.rl_coef * pg_loss + loss
+        metrics["loss_term/pg"] = settings.rl_coef * pg_loss.detach().item()
+    else:
+        metrics["loss_term/pg"] = 0.0
+    metrics["loss_term/kd"] = settings.kd_coef * kd_loss.detach().item()
+    return loss, metrics
 
 
 @torch.no_grad()

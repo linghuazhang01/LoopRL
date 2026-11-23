@@ -636,8 +636,15 @@ python -m rltt_baseline.launch --config configs/extrap_grpo_loopcd_1p4b_8gpu.yam
     （`opd_full_rkl_loopcd_1p4b_8gpu.yaml`）或 `forward`（`opd_full_fkl_loopcd_1p4b_8gpu.yaml`）。
     这两份配置都是 100 步、每步 512 条（64 题 × 8）、训练数据不变、top-p 1、温度 1。
   - 两种都只用当前位置自己这一项，不累加后续 token。
-  - **奖励不进入目标**：driver 照常评分（`reasoning/*`）、计算 GRPO advantage，但 loss 不用。
-- 聚合：`loss_agg: drgrpo, norm_len 16384`。每个 token 权重相同，对应整条回答的反向 KL。
+  - `k2`（用户 2026-11-23 要求，KDRL 的估计）：R_j = log π_T(y_j) − log P⁽⁴⁾(y_j)，loss = agg[½R_j²]。
+    梯度 −R_j·∇log P⁽⁴⁾(y_j)，期望等于反向 KL 的梯度；没有 PPO 比率和截断，老师引擎与 `sampled` 相同。
+  - 默认**奖励不进入目标**：driver 照常评分（`reasoning/*`）、计算 GRPO advantage，但 loss 不用。
+- **GRPO 项**：`opd.rl_coef`（默认 0）和 `opd.kd_coef`（β，默认 1），loss = rl_coef·GRPO(结果 advantage) + kd_coef·散度项。
+  默认值下 loss 与原 OPD 逐位相同。`grpo_k2_loopcd_1p4b_8gpu.yaml`（用户 2026-11-23 要求）：`estimator: k2`、
+  `rl_coef: 1`、`kd_coef: 0.01`，即 KDRL（arXiv 2506.02208）的 J_GRPO − β·k2，老师换成 base 的 LoopCD；
+  β 为常数，没有实现 KDRL 的退火。
+- 聚合：三份 OPD 配置用 `loss_agg: drgrpo, norm_len 16384`，每个 token 权重相同，对应整条回答的反向 KL。
+  GRPO + k2 配置用 GRPO 的 `seq-mean-token-mean`，两项都先在每条回答内平均、再对回答平均。
 - 代码：`rltt_baseline/opd.py`（设置、loss、监控），全词表 KL 在 `rltt_per_loop.opd_full_kd`。verl 0.9 路径：
   - `sampled`：
     - `verl09_workers.py`：加载 CPU offload 的冻结老师引擎，复用 PLC 锚定项的代码；

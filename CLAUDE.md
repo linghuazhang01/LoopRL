@@ -40,6 +40,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B：OPD（向冻结 base 的 LoopCD 分布做 on-policy 蒸馏，w = 0.5，采样 token 反向 KL） | — | — | `opd_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：OPD，全词表反向 KL | — | — | `opd_full_rkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：OPD，全词表前向 KL | — | — | `opd_full_fkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
+| 1.4B：GRPO + k2（KDRL 形式，老师同 OPD，β = 0.01） | — | — | `grpo_k2_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 
 组内**允许**不同的只有：
 
@@ -126,17 +127,28 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
 
 - `opd_loopcd_1p4b_8gpu.yaml`：老师是**冻结初始模型**的 log π_T = log_softmax((1+w)·log P⁽⁴⁾_base − w·log P⁽¹⁾_base)
   （"分布 4 + w·(分布 4 − 分布 1)"，按 log 空间理解），w = `opd.omega` = 0.5，参照轮 `opd.ref_loop` = 1。
-  学生是第 4 轮，rollout 是普通的最后一轮 vLLM。**奖励不进入目标**（只记录 `reasoning/*`）。
-  `opd.estimator` 选择两种估计（`rltt_baseline/opd.py`）：
+  学生是第 4 轮，rollout 是普通的最后一轮 vLLM。默认**奖励不进入目标**（只记录 `reasoning/*`）。
+  `opd.estimator` 选择三种估计（`rltt_baseline/opd.py`）：
   - `sampled`（默认）：只支持反向 KL。A_j = sg[log π_T(y_j) − log P⁽⁴⁾_old(y_j)]，loss = −agg[PPO(A_j)]。
   - `full`：每个回答位置在全词表上精确计算 KL，`opd.divergence` 为 `reverse`（KL(P⁽⁴⁾‖π_T)）或
     `forward`（KL(π_T‖P⁽⁴⁾)）。loss = agg[KL]。
+  - `k2`（用户 2026-11-23 要求，KDRL arXiv 2506.02208 的估计）：只支持反向 KL。R_j = log π_T(y_j) − log P⁽⁴⁾(y_j)，
+    loss = agg[½R_j²]，梯度 −R_j·∇log P⁽⁴⁾(y_j)，期望等于反向 KL 的梯度；没有 PPO 比率和截断。老师引擎与 `sampled` 相同。
+- GRPO 项（用户 2026-11-23 要求）：`opd.rl_coef`（默认 0）和 `opd.kd_coef`（β，默认 1），
+  loss = rl_coef·GRPO(结果 advantage) + kd_coef·散度项。GRPO 项与 `trainer: grpo` 同一个逐元素 PPO 目标
+  （`plc.grpo_policy_loss`），advantage 是 driver 照常算的 GRPO advantage。默认值下 loss 和指标与原 OPD 逐位相同。
+  `estimator: k2, rl_coef: 1, kd_coef: β` 就是 KDRL 的 J_GRPO − β·k2（老师换成 base 的 LoopCD）。β 只能是常数
+  （KDRL 的线性退火没有实现）。`rl_coef > 0` 时 wandb 的 `loss/pg` 是 GRPO 项、`loss/kd` 是散度项（都已乘系数）。
+  - `grpo_k2_loopcd_1p4b_8gpu.yaml`（用户 2026-11-23 要求存）：`estimator: k2`、`rl_coef: 1`、`kd_coef: 0.01`，
+    `loss_agg: seq-mean-token-mean`（两项都先在每条回答内平均、再对回答平均，`kd_coef=0` 等于 GRPO 配置的 loss）。
+    `tests/test_opd.py` 检查它与 `opd_loopcd_1p4b_8gpu.yaml` 只差 `opd` 段、`loss_agg` 和 wandb 命名。
   - 用户 2026-11-22 要求存了两份全词表配置（100 步、每步 512 条 = 64 题 × 8、训练数据不变、top-p 1、温度 1）：
     `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 和 `opd_full_fkl_loopcd_1p4b_8gpu.yaml`。两份只差 `opd.divergence`
     和 wandb 命名（`tests/test_opd.py` 检查），改一份要同步改另一份。
 - 登记在 `MATCHED_GROUPS` 的 1.4B 组；`_method_free_view` 把 `opd` 当作方法段。`opd` 与 `plc`、`extrap`
   不能同时打开，只用于 `trainer: rltt`。
-- loss 聚合用 `drgrpo`、`norm_len: 16384`（每个 token 权重相同 = 整条回答的反向 KL）。
+- 三份 OPD 配置的 loss 聚合用 `drgrpo`、`norm_len: 16384`（每个 token 权重相同 = 整条回答的反向 KL）；
+  GRPO + k2 配置用 GRPO 的 `seq-mean-token-mean`。
 - **只在 verl 0.9.1 路径实现**，verl 0.6.1 下 dry-run 照常输出，真正启动时 launcher 拒绝。老师都是
   `actor_rollout_ref.model.path` 的冻结 float32 副本，断点续训不重新加载：
   - `sampled`：actor worker 加载一份 CPU offload 的老师引擎（与 PLC 锚定项同一段代码），在 `compute_log_prob`
