@@ -25,7 +25,8 @@ ENV = {
 V, H, B, S, T = 11, 6, 2, 5, 4
 SAMPLED_SECTION = {"enabled": True, "omega": 0.5, "ref_loop": 1, "estimator": "sampled",
                    "divergence": "reverse"}
-COEF_DEFAULTS = {"rl_coef": 0.0, "kd_coef": 1.0}  # filled in by the launcher (pure OPD)
+# filled in by the launcher (pure OPD, frozen teacher)
+COEF_DEFAULTS = {"rl_coef": 0.0, "kd_coef": 1.0, "teacher": "frozen"}
 
 
 @pytest.fixture
@@ -341,6 +342,7 @@ def test_config_differs_from_extrap_only_in_the_method(env):
 
 FULL_CONFIGS = {"reverse": paths.config_file("opd_full_rkl_loopcd_1p4b_8gpu.yaml"),
                 "forward": paths.config_file("opd_full_fkl_loopcd_1p4b_8gpu.yaml")}
+ELPO_CONFIG = paths.config_file("elpo_online_rkl_loopcd_1p4b_8gpu.yaml")
 
 
 def _student_teacher(requires_grad=True):
@@ -450,7 +452,9 @@ def test_full_configs(env, divergence):
     assert rcfg.opd_settings(cfg) == opd.OPDSettings(enabled=True, omega=0.5, ref_loop=1,
                                                      estimator="full", divergence=divergence)
     assert rcfg.looprl_method(cfg) == "opd" and cfg.trainer == "rltt"
-    assert rcfg.loss_agg_settings(cfg).mode == "drgrpo" and cfg.loss_agg.norm_len == 16384
+    # LoopOPD's normalisation (user, 2026-11-23): per-response token mean, then mean over responses
+    assert rcfg.loss_agg_settings(cfg).mode == "seq-mean-token-mean"
+    assert "norm_len" not in cfg.loss_agg
     # the user's settings (2026-11-22): 100 steps, 512 rollouts per step, top-p 1, temperature 1
     assert cfg.args.max_steps == 100
     assert cfg.args.num_prompts_per_batch * cfg.args.num_generations == 512
@@ -474,6 +478,9 @@ def test_full_configs_differ_only_in_the_divergence(env):
     sampled = OmegaConf.to_container(rcfg.load_config(str(CONFIG)))
     assert sampled["opd"].pop("estimator") == "sampled" and rkl["opd"].pop("estimator") == "full"
     sampled["opd"].pop("divergence")
+    # the full-vocabulary configs follow LoopOPD's per-response normalisation (user, 2026-11-23)
+    assert sampled.pop("loss_agg") == {"mode": "drgrpo", "norm_len": 16384}
+    assert rkl.pop("loss_agg") == {"mode": "seq-mean-token-mean"}
     for cfg in (sampled,):
         cfg["wandb"].pop("run_name")
         cfg["wandb"].pop("tags")
@@ -489,7 +496,7 @@ def test_full_dry_run(env, capsys, monkeypatch):
     ar = resolved["verl_overrides"]["actor_rollout_ref"]
     assert ar["actor"]["opd"] == {"enabled": True, "omega": 0.5, "ref_loop": 1,
                                   "estimator": "full", "divergence": "forward", **COEF_DEFAULTS}
-    assert ar["loss_agg"] == {"mode": "drgrpo", "norm_len": 16384}
+    assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
     assert resolved["reference_policy"].startswith("opd teacher (full vocabulary)")
     assert resolved["policy_violations"] is not None
 
@@ -671,7 +678,7 @@ def test_k2_dry_run(env, capsys, monkeypatch):
     resolved = json.loads(capsys.readouterr().out)
     ar = resolved["verl_overrides"]["actor_rollout_ref"]
     assert ar["actor"]["opd"] == {**SAMPLED_SECTION, "estimator": "k2", "rl_coef": 1.0,
-                                  "kd_coef": 0.002}
+                                  "kd_coef": 0.002, "teacher": "frozen"}
     assert resolved["reference_policy"].startswith("opd teacher: ")
 
 
@@ -770,7 +777,8 @@ def test_grpo_k2_config(env):
     assert cfg.args.num_prompts_per_batch * cfg.args.num_generations == 512
     assert cfg.args.seed == 42 and cfg.args.train_file == ENV["LOOPRL_TRAIN_FILE"]
     overrides = rcfg.add_opd_overrides(cfg, rcfg.verl_overrides(cfg), _args())
-    assert overrides["actor_rollout_ref"]["actor"]["opd"] == GRPO_K2_SECTION
+    assert overrides["actor_rollout_ref"]["actor"]["opd"] == {**GRPO_K2_SECTION,
+                                                             "teacher": "frozen"}
     assert rcfg.reference_policy_status("rltt", overrides).startswith("opd teacher: ")
 
 
@@ -795,8 +803,88 @@ def test_grpo_k2_dry_run(env, capsys, monkeypatch):
     assert launch.main(["--config", str(GRPO_K2_CONFIG), "--dry-run"]) == 0
     resolved = json.loads(capsys.readouterr().out)
     ar = resolved["verl_overrides"]["actor_rollout_ref"]
-    assert ar["actor"]["opd"] == GRPO_K2_SECTION
+    assert ar["actor"]["opd"] == {**GRPO_K2_SECTION, "teacher": "frozen"}
     assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
     assert "engine_kwargs" not in ar["rollout"]  # ordinary last-loop rollout
     assert resolved["reference_policy"].startswith("opd teacher: ")
     assert resolved["config"]["wandb"]["run_name"] == "grpo-k2-loopcd-w0.5-beta0.01-1p4b"
+
+
+# ---------- ELPO: the online teacher (the current model's LoopCD policy, stop-gradient) ----------
+
+def test_online_teacher_settings():
+    s = opd.OPDSettings.from_mapping({"enabled": True, "estimator": "full", "teacher": "online"})
+    assert s.online_teacher and s.full_vocab and not s.frozen_teacher_model
+    assert s.student_model_kwargs() == {"return_opd_kd": True, "opd_omega": 0.5,
+                                        "opd_divergence": "reverse", "opd_online_teacher": True,
+                                        "opd_ref_loop": 1}
+    assert "teacher=online" in s.describe()
+    frozen = opd.OPDSettings.from_mapping({"enabled": True, "estimator": "full"})
+    assert frozen.teacher == "frozen" and frozen.frozen_teacher_model
+    assert "opd_online_teacher" not in frozen.student_model_kwargs()
+
+
+@pytest.mark.parametrize("values, match", [
+    ({"estimator": "sampled", "teacher": "online"}, "estimator=full only"),
+    ({"estimator": "k2", "teacher": "online"}, "estimator=full only"),
+    ({"estimator": "full", "teacher": "online", "omega": 0}, "omega=0"),
+    ({"estimator": "full", "teacher": "current"}, "opd.teacher must be one of"),
+])
+def test_online_teacher_refusals(values, match):
+    with pytest.raises(ValueError, match=match):
+        opd.OPDSettings.from_mapping({"enabled": True, **values})
+
+
+@pytest.mark.parametrize("divergence", ["reverse", "forward"])
+def test_online_teacher_kd_gradient_skips_the_teacher(divergence):
+    """With the teacher read from the student's own loops (same lm_head, same hidden tensors) the
+    gradient is that of KL against the detached LoopCD distribution: nothing flows through the
+    teacher's loop-1 / loop-4 hidden states or its lm_head call."""
+    from rltt_baseline.ouro_rltt.rltt_per_loop import opd_full_kd
+
+    s_head, _, _, _, _ = _student_teacher(requires_grad=False)
+    g = torch.Generator().manual_seed(7)
+    h1 = torch.randn(B, S, H, generator=g, requires_grad=True)
+    h4 = torch.randn(B, S, H, generator=g, requires_grad=True)
+    out = opd_full_kd(h4, h1, h4, s_head, s_head, 0.5, divergence, chunk_size=2)
+    grads = torch.autograd.grad(out["kd"].sum(), [h4, h1, s_head.weight], allow_unused=True)
+    kd, _, _ = _manual_kl(s_head, s_head, h4, h1.detach(), h4.detach(), 0.5, divergence)
+    ref = torch.autograd.grad(kd.sum(), [h4, s_head.weight])
+    _close(out["kd"].detach(), kd.detach())
+    _close(grads[0], ref[0])
+    assert grads[1] is None  # loop 1 only enters the teacher
+    _close(grads[2], ref[1])
+    # the student starts away from its own extrapolation: the loss is not zero at w > 0
+    assert float(out["kd"].mean()) > 0
+
+
+def test_elpo_config_is_the_full_rkl_config_with_the_online_teacher(env):
+    # saved at the user's request (2026-11-26): opd_full_rkl + opd.teacher online, new wandb naming
+    elpo = OmegaConf.to_container(rcfg.load_config(str(ELPO_CONFIG)))
+    rkl = OmegaConf.to_container(rcfg.load_config(str(FULL_CONFIGS["reverse"])))
+    assert elpo["opd"].pop("teacher") == "online" and "teacher" not in rkl["opd"]
+    assert elpo["wandb"].pop("run_name") == "elpo-online-rkl-loopcd-w0.5-1p4b"
+    assert "online-teacher" in elpo["wandb"].pop("tags")
+    rkl["wandb"].pop("run_name")
+    rkl["wandb"].pop("tags")
+    assert elpo == rkl
+    cfg = rcfg.load_config(str(ELPO_CONFIG))
+    assert rcfg.opd_settings(cfg) == opd.OPDSettings(enabled=True, omega=0.5, ref_loop=1,
+                                                     estimator="full", divergence="reverse",
+                                                     teacher="online")
+    assert rcfg.looprl_method(cfg) == "opd" and cfg.trainer == "rltt"
+
+
+def test_elpo_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    _clean_launch_env(monkeypatch)
+    assert launch.main(["--config", str(ELPO_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    ar = resolved["verl_overrides"]["actor_rollout_ref"]
+    assert ar["actor"]["opd"] == {"enabled": True, "omega": 0.5, "ref_loop": 1,
+                                  "estimator": "full", "divergence": "reverse",
+                                  **COEF_DEFAULTS, "teacher": "online"}
+    assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
+    assert resolved["reference_policy"].startswith("opd teacher (online, full vocabulary)")
+    assert resolved["config"]["wandb"]["mode"] == "online"

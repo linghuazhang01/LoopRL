@@ -643,8 +643,10 @@ python -m rltt_baseline.launch --config configs/extrap_grpo_loopcd_1p4b_8gpu.yam
   默认值下 loss 与原 OPD 逐位相同。`grpo_k2_loopcd_1p4b_8gpu.yaml`（用户 2026-11-23 要求）：`estimator: k2`、
   `rl_coef: 1`、`kd_coef: 0.01`，即 KDRL（arXiv 2506.02208）的 J_GRPO − β·k2，老师换成 base 的 LoopCD；
   β 为常数，没有实现 KDRL 的退火。
-- 聚合：三份 OPD 配置用 `loss_agg: drgrpo, norm_len 16384`，每个 token 权重相同，对应整条回答的反向 KL。
-  GRPO + k2 配置用 GRPO 的 `seq-mean-token-mean`，两项都先在每条回答内平均、再对回答平均。
+- 聚合：`opd_loopcd_1p4b_8gpu.yaml`（sampled）用 `loss_agg: drgrpo, norm_len 16384`，每个 token 权重相同，
+  对应整条回答的反向 KL。两份全词表配置用 `seq-mean-token-mean`（2026-11-23 起；LoopOPD 的归一化，
+  每条回答先在自己的 token 上平均、再对回答平均；此前是 `drgrpo`）。GRPO + k2 配置也用
+  `seq-mean-token-mean`，两项都先在每条回答内平均、再对回答平均。
 - 代码：`rltt_baseline/opd.py`（设置、loss、监控），全词表 KL 在 `rltt_per_loop.opd_full_kd`。verl 0.9 路径：
   - `sampled`：
     - `verl09_workers.py`：加载 CPU offload 的冻结老师引擎，复用 PLC 锚定项的代码；
@@ -672,6 +674,28 @@ python -m rltt_baseline.launch --config configs/opd_full_rkl_loopcd_1p4b_8gpu.ya
 ```
 
 消融（命令行覆盖，各起一个 `wandb.run_name`）：`opd.omega=0.3`、`opd.omega=0`（老师 = base 第 4 轮，检查代码路径）。
+
+#### ELPO：实时外推老师（`configs/elpo_online_rkl_loopcd_1p4b_8gpu.yaml`，`opd.teacher: online`）
+
+用户 2026-11-26 要求。和 `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 只差 `opd.teacher: online` 和 wandb 命名
+（`tests/test_opd.py` 检查），改一份要同步改另一份：
+
+- **老师**：**当前模型**的 LoopCD 分布，stop-gradient：
+  log π_T = sg[log_softmax((1+w)·log P⁽⁴⁾_θ − w·log P⁽¹⁾_θ)]，取自学生训练前向自己的第 1、4 轮隐状态
+  （隐状态 detach，老师那次 lm_head 在 no_grad 下算），梯度只经过学生的 log P⁽⁴⁾。每步一次更新，
+  训练前向的参数就是 rollout 参数，所以老师是每一步 rollout 策略的外推分布。
+- loss 与全词表反向 KL 配置相同：mean_i mean_j[KL(P⁽⁴⁾ ‖ π_T)]，`seq-mean-token-mean`，奖励不进入目标。
+- 不加载冻结老师、不多跑前向（比 frozen 老师省约 5.6 GB / 卡和一次逐轮前向）；老师的 logits 来自 bf16
+  autocast 的前向（frozen 老师是 float32 副本）。dry-run 的 `reference_policy` 以
+  `opd teacher (online, full vocabulary)` 开头。
+- 目标随学生移动，没有固定点；ELPD 草稿（`paper_elpd`，fact d）的理想化论证预测 log P⁽⁴⁾ − log P⁽¹⁾
+  会持续增大。重点看 `rltt/loop_4_entropy`、`opd/teacher_entropy`、`opd/reverse_kl`、`reasoning/accuracy`。
+- 只支持 `estimator: full`；`opd.omega=0` 时老师就是学生自己（loss 恒为 0），launcher 拒绝。
+- 需要模型前向的 `opd_online_teacher`，**`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
+
+```bash
+python -m rltt_baseline.launch --config configs/elpo_online_rkl_loopcd_1p4b_8gpu.yaml --dry-run
+```
 
 ### LoopCD 跨轮对比解码评测（只用于评测）
 

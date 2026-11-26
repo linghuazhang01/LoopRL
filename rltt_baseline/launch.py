@@ -48,7 +48,8 @@ What this adds around the vendor script (whose files are not modified; located b
     on-policy GRPO (``rltt_baseline.extrap``) through ``ExtrapActorRolloutRefWorker``, and makes
     the vLLM rollout sample from that policy (``config.add_extrap_overrides``).
 17. ``opd.enabled`` (RLTT trainer, not with PLC or extrap) distils the last loop towards the
-    frozen initial model's LoopCD policy on its own rollouts (``rltt_baseline.opd``). Only the
+    frozen initial model's LoopCD policy (``opd.teacher=online``: the current model's own,
+    stop-gradient) on its own rollouts (``rltt_baseline.opd``). Only the
     verl 0.9.1 engine path implements it: a verl 0.6.1 launch stops after the dry-run.
 
 GRPO safety: the vendor ``grpo_train.py`` edits ``<model>/modeling_ouro.py`` in place to drop

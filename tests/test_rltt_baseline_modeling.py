@@ -325,3 +325,37 @@ def test_opd_full_kd_on_the_real_per_loop_outputs(models, divergence):
     loss.backward()
     assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in teacher.parameters())
+
+
+def test_opd_online_teacher_on_the_real_per_loop_outputs(models):
+    """ELPO: ``opd_online_teacher`` takes the teacher from the student's own loop 1 and loop 4
+    (stop-gradient) and needs no teacher model; gradient still reaches the backbone."""
+    import copy
+
+    from rltt_baseline import opd
+    from rltt_baseline.ouro_rltt.rltt_per_loop import kd_divergence
+
+    _, shared = models
+    rltt = copy.deepcopy(shared)
+    ids, mask, pos, _ = _inputs()
+    settings = opd.OPDSettings(enabled=True, omega=0.5, estimator="full", teacher="online")
+    window = ids.shape[1] - 1
+    with torch.no_grad():
+        _, hiddens, _ = rltt.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                                   use_cache=False)
+    rltt.zero_grad()
+    out = rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+               opd_window=window, **settings.student_model_kwargs())
+    kd = out.opd_kd["kd"]
+    log4 = F.log_softmax(rltt.lm_head(hiddens[-1][:, :-1]).float(), -1)
+    log1 = F.log_softmax(rltt.lm_head(hiddens[0][:, :-1]).float(), -1)
+    log_q = F.log_softmax(log4 + 0.5 * (log4 - log1), -1)
+    torch.testing.assert_close(kd.detach(), kd_divergence(log4, log_q, "reverse"))
+    loss, _ = opd.opd_full_loss(kd, mask[:, 1:].float())
+    loss.backward()
+    assert rltt.model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+    with pytest.raises(ValueError, match="own loops"):
+        rltt(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
+             opd_teacher_hidden_states=(hiddens[0], hiddens[-1]),
+             opd_teacher_lm_head=rltt.lm_head, opd_window=window,
+             **settings.student_model_kwargs())

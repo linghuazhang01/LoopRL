@@ -11,9 +11,21 @@ extrapolation strength w (``omega``):
     log pi_T = log_softmax( ((1 + w) l_4 - w l_r) / temperature ),  r = ``ref_loop`` (1)
 
 i.e. "distribution 4 + w (distribution 4 - distribution 1)" in log space, which is LoopCD-Logits
-(Liu et al., arXiv 2610.02185, ``rltt_baseline.loop_cd``) of the base model. The teacher is fixed
-for the whole run (it is never the current model), so distillation has a fixed point instead of
-re-extrapolating the student every step.
+(Liu et al., arXiv 2610.02185, ``rltt_baseline.loop_cd``) of the base model. With the default
+``teacher: frozen`` the teacher is fixed for the whole run (it is never the current model), so
+distillation has a fixed point instead of re-extrapolating the student every step.
+
+``teacher: online`` (ELPO, user 2026-11-26; ``full`` estimator only) instead computes the same
+formula from the CURRENT model, with a stop-gradient:
+
+    log pi_T = sg[ log_softmax( ((1 + w) log P^(4)_theta - w log P^(r)_theta) / temperature ) ]
+
+taken from the loop-r and last-loop hidden states of the student's own training forward (no
+teacher copy, no extra forward). With one optimiser update per step the training forward runs at
+the rollout parameters, so the teacher is the rollout policy's LoopCD distribution, refreshed every
+step. The fixed point of distillation then moves with the student (the idealised argument of the
+ELPD draft predicts the contrast log P^(4) - log P^(r) to keep growing); this is the "refreshed
+teacher" ablation of the frozen teacher.
 
 Student and rollouts. The student is the trained model's last loop P^(4) (the loop evaluated with
 w_eval = 0); vLLM samples the rollouts from it, as in GRPO / RLTT / PLC (on-policy).
@@ -69,6 +81,7 @@ import torch
 from rltt_baseline import plc
 
 ESTIMATORS = ("sampled", "full", "k2")
+TEACHERS = ("frozen", "online")  # frozen initial model | the current model (stop-gradient)
 SAMPLED_TOKEN_ESTIMATORS = ("sampled", "k2")   # need the teacher's sampled-token log-probs
 DIVERGENCES = ("reverse", "forward")
 
@@ -84,6 +97,7 @@ class OPDSettings:
     divergence: str = "reverse"  # reverse KL(P4 || pi_T) | forward KL(pi_T || P4) (full only)
     rl_coef: float = 0.0  # weight of GRPO on the outcome advantages (0: the reward is not used)
     kd_coef: float = 1.0  # beta: weight of the divergence term
+    teacher: str = "frozen"  # frozen initial model | online: the current model (sg, full only)
 
     @classmethod
     def from_mapping(cls, values: Optional[Mapping]) -> "OPDSettings":
@@ -95,7 +109,7 @@ class OPDSettings:
         merged = {**asdict(cls()), **values}
         if not isinstance(merged["enabled"], bool):
             raise TypeError(f"opd.enabled must be a bool, got {merged['enabled']!r}")
-        for name in ("estimator", "divergence"):
+        for name in ("estimator", "divergence", "teacher"):
             if not isinstance(merged[name], str):
                 raise TypeError(f"opd.{name} must be a string, got {merged[name]!r}")
         for name in ("omega", "rl_coef", "kd_coef"):
@@ -133,10 +147,30 @@ class OPDSettings:
                 raise ValueError(f"opd.{name} must be a finite number >= 0, got {value!r}")
         if self.rl_coef == 0 and self.kd_coef == 0:
             raise ValueError("opd.rl_coef and opd.kd_coef are both 0: the loss would be empty")
+        if self.teacher not in TEACHERS:
+            raise ValueError(f"opd.teacher must be one of {TEACHERS}, got {self.teacher!r}")
+        if self.online_teacher:
+            if self.estimator != "full":
+                raise ValueError("opd.teacher=online is implemented for opd.estimator=full only "
+                                 "(the teacher comes from the student's own training forward)")
+            if self.omega == 0:
+                raise ValueError("opd.teacher=online with opd.omega=0 makes the teacher the "
+                                 "student itself: the loss and its gradient are zero")
 
     @property
     def full_vocab(self) -> bool:
         return self.estimator == "full"
+
+    @property
+    def online_teacher(self) -> bool:
+        """The teacher is the current model's LoopCD distribution (stop-gradient), computed from
+        the student's own training forward; no frozen copy is loaded."""
+        return self.teacher == "online"
+
+    @property
+    def frozen_teacher_model(self) -> bool:
+        """Every actor rank holds a frozen copy of the initial model (``full``, frozen teacher)."""
+        return self.full_vocab and not self.online_teacher
 
     @property
     def sampled_teacher(self) -> bool:
@@ -151,8 +185,13 @@ class OPDSettings:
 
     def student_model_kwargs(self) -> dict:
         """Keyword arguments of the student's per-loop forward for the full-vocabulary loss; the
-        caller adds ``opd_teacher_hidden_states``, ``opd_teacher_lm_head`` and ``opd_window``."""
-        return {"return_opd_kd": True, "opd_omega": self.omega, "opd_divergence": self.divergence}
+        caller adds ``opd_window`` and, for the frozen teacher, ``opd_teacher_hidden_states`` and
+        ``opd_teacher_lm_head``. The online teacher reads the student's own loops instead."""
+        kwargs = {"return_opd_kd": True, "opd_omega": self.omega,
+                  "opd_divergence": self.divergence}
+        if self.online_teacher:
+            kwargs.update(opd_online_teacher=True, opd_ref_loop=self.ref_loop)
+        return kwargs
 
     def teacher_model_kwargs(self) -> dict:
         """Keyword arguments of the per-loop forward (``modeling_ouro.py``) that give the
@@ -165,7 +204,9 @@ class OPDSettings:
     def describe(self) -> str:
         return (f"omega={self.omega} ref_loop={self.ref_loop} estimator={self.estimator} "
                 f"divergence={self.divergence} rl_coef={self.rl_coef} kd_coef={self.kd_coef} "
-                "(teacher: frozen initial model)")
+                f"teacher={self.teacher} ("
+                + ("teacher: the current model, stop-gradient" if self.online_teacher
+                   else "teacher: frozen initial model") + ")")
 
 
 def opd_full_loss(kd: torch.Tensor, response_mask: torch.Tensor, loss_agg_mode: str = "token-mean",

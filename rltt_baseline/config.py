@@ -73,9 +73,11 @@ A config file has these top-level keys:
     the exact full-vocabulary KL; ``k2``: KDRL's sampled-token (log pi_T - log P4)^2 / 2),
     ``divergence`` (``reverse`` | ``forward``; forward needs ``full``), ``rl_coef`` (0: GRPO on
     the outcome advantages is off, the reward is not in the objective) and ``kd_coef`` (1: the
-    weight beta of the divergence); the loss is ``rl_coef * GRPO + kd_coef * divergence``.
+    weight beta of the divergence); the loss is ``rl_coef * GRPO + kd_coef * divergence``;
+    ``teacher`` (``frozen``: the initial model; ``online``: ELPO, the current model's own LoopCD
+    distribution with a stop-gradient, ``full`` only, no teacher copy).
     When enabled the section is passed as ``actor_rollout_ref.actor.opd`` (and to the engine
-    settings). The teacher is a frozen float32 copy of the initial model
+    settings). The frozen teacher is a float32 copy of the initial model
     (``actor_rollout_ref.model.path``): a CPU-offloaded engine for ``sampled``, an unsharded copy
     on every actor rank for ``full``. The rollout is the ordinary last loop.
 ``loss_agg``
@@ -758,6 +760,11 @@ def reference_policy_status(trainer: str, overrides: dict) -> str:
         actor_values = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
         opd_values = actor_values.get("opd")
         opd_cfg = OPDSettings.from_mapping(opd_values) if opd_values else None
+        if opd_cfg is not None and opd_cfg.enabled and opd_cfg.online_teacher:
+            return ("opd teacher (online, full vocabulary): no vendor reference worker and no "
+                    "teacher copy; the teacher is the current model's own LoopCD distribution "
+                    "(loop opd.ref_loop and the last loop of the student's training forward, "
+                    "stop-gradient)")
         if opd_cfg is not None and opd_cfg.enabled and opd_cfg.full_vocab:
             return ("opd teacher (full vocabulary): no vendor reference worker; every actor rank "
                     "holds a frozen, unsharded float32 copy of the initial model "

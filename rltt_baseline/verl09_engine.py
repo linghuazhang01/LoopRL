@@ -62,28 +62,31 @@ class OuroFSDPEngine(FSDPEngineWithLMHead):
             from rltt_baseline.opd import OPDSettings
             kwargs.update(OPDSettings.from_mapping(settings.get("opd")).teacher_model_kwargs())
         # OPD full: the student's training forward computes the full-vocabulary KL against the
-        # frozen teacher model this rank holds (verl09_workers)
+        # frozen teacher model this rank holds (verl09_workers), or, with opd.teacher=online
+        # (ELPO), against its own loops' LoopCD distribution (stop-gradient, no teacher model)
         opd_full = None
         if settings.get("method") == "opd" and not forward_only:
             from rltt_baseline.opd import OPDSettings
             opd_cfg = OPDSettings.from_mapping(settings.get("opd"))
             if opd_cfg.full_vocab:
                 opd_full = opd_cfg
-                if getattr(self, "looprl_opd_teacher_model", None) is None:
+                if (opd_cfg.frozen_teacher_model
+                        and getattr(self, "looprl_opd_teacher_model", None) is None):
                     raise ValueError("OPD estimator=full needs the frozen teacher model")
         dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         precision = nullcontext() if dtype == torch.float32 else torch.autocast("cuda", dtype=dtype)
         with precision:
             if opd_full is not None:
+                kwargs.update(opd_full.student_model_kwargs())
+                kwargs.update(opd_window=ids.shape[1] - 1)
+            if opd_full is not None and opd_full.frozen_teacher_model:
                 teacher_model = self.looprl_opd_teacher_model
                 with torch.no_grad():
                     hiddens = teacher_model(**inputs, return_loop_hidden_states=True,
                                             use_cache=False).loop_hidden_states
-                kwargs.update(opd_full.student_model_kwargs())
                 kwargs.update(opd_teacher_hidden_states=(hiddens[opd_full.ref_loop - 1],
                                                          hiddens[-1]),
-                              opd_teacher_lm_head=teacher_model.lm_head,
-                              opd_window=ids.shape[1] - 1)
+                              opd_teacher_lm_head=teacher_model.lm_head)
                 del hiddens
             audit = getattr(self, "looprl_audit", None)
             handle = audit.hook(micro_batch, inputs) if audit is not None else None

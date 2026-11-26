@@ -55,8 +55,13 @@ class LoopRLActorRolloutRefWorker(ActorRolloutRefWorker):
             self.loss_fn = partial(looprl_loss, config=self.config.actor, settings=self.looprl_settings)
             self.actor.set_loss_fn(self.loss_fn)
             opd = self.looprl_settings.get("method") == "opd"
-            opd_full = opd and self.looprl_settings.get("opd", {}).get("estimator") == "full"
-            if opd_full:
+            opd_values = self.looprl_settings.get("opd", {})
+            opd_full = opd and opd_values.get("estimator") == "full"
+            if opd_full and opd_values.get("teacher", "frozen") == "online":
+                # ELPO: the teacher is the student's own LoopCD distribution (stop-gradient) from
+                # its training forward; no frozen copy and no teacher engine
+                pass
+            elif opd_full:
                 # Full-vocabulary OPD: the student's training forward needs the teacher's hidden
                 # states and lm_head in the same micro-batch, so every actor rank holds a frozen,
                 # unsharded float32 copy of the initial model (model.path, never a checkpoint).

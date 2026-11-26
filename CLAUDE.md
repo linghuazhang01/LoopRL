@@ -40,6 +40,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B：OPD（向冻结 base 的 LoopCD 分布做 on-policy 蒸馏，w = 0.5，采样 token 反向 KL） | — | — | `opd_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：OPD，全词表反向 KL | — | — | `opd_full_rkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：OPD，全词表前向 KL | — | — | `opd_full_fkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
+| 1.4B：ELPO（实时外推老师：当前模型的 LoopCD 分布，stop-gradient，全词表反向 KL） | — | — | `elpo_online_rkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：GRPO + k2（KDRL 形式，老师同 OPD，β = 0.01） | — | — | `grpo_k2_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 
 组内**允许**不同的只有：
@@ -145,19 +146,30 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
   - 用户 2026-11-22 要求存了两份全词表配置（100 步、每步 512 条 = 64 题 × 8、训练数据不变、top-p 1、温度 1）：
     `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 和 `opd_full_fkl_loopcd_1p4b_8gpu.yaml`。两份只差 `opd.divergence`
     和 wandb 命名（`tests/test_opd.py` 检查），改一份要同步改另一份。
+  - `opd.teacher`（用户 2026-11-26 要求，ELPO）：`frozen`（默认，上面的冻结 base 老师）或 `online`
+    （**当前模型**的 LoopCD 分布，stop-gradient：log π_T = sg[log_softmax((1+w)·log P⁽⁴⁾_θ − w·log P⁽¹⁾_θ)]，
+    取自学生训练前向自己的第 1、4 轮隐状态，不加载老师副本、不多跑前向；每步一次更新，所以老师是每步
+    rollout 策略的外推分布）。`online` 只支持 `estimator: full`，`omega` 不能为 0。默认值下 loss 逐位不变
+    （dry-run 的 `opd` 段多一个 `teacher: frozen`）。`elpo_online_rkl_loopcd_1p4b_8gpu.yaml`（用户 2026-11-26
+    要求存）= `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 加 `teacher: online`、换 wandb 命名（`tests/test_opd.py`
+    检查），改全词表反向 KL 配置时要同步改它。目标随学生移动、没有固定点（ELPD 草稿 fact d 预测外推方向
+    持续放大），dry-run 的 `reference_policy` 以 `opd teacher (online, full vocabulary)` 开头。
 - 登记在 `MATCHED_GROUPS` 的 1.4B 组；`_method_free_view` 把 `opd` 当作方法段。`opd` 与 `plc`、`extrap`
   不能同时打开，只用于 `trainer: rltt`。
-- 三份 OPD 配置的 loss 聚合用 `drgrpo`、`norm_len: 16384`（每个 token 权重相同 = 整条回答的反向 KL）；
-  GRPO + k2 配置用 GRPO 的 `seq-mean-token-mean`。
-- **只在 verl 0.9.1 路径实现**，verl 0.6.1 下 dry-run 照常输出，真正启动时 launcher 拒绝。老师都是
-  `actor_rollout_ref.model.path` 的冻结 float32 副本，断点续训不重新加载：
+- loss 聚合：`opd_loopcd_1p4b_8gpu.yaml`（sampled）用 `drgrpo`、`norm_len: 16384`（每个 token 权重相同 =
+  整条回答的反向 KL）。两份全词表配置和 GRPO + k2 配置用 `seq-mean-token-mean`（每条回答先在自己的 token
+  上平均、再对回答平均）。全词表配置是用户 2026-11-23 改的：它们是论文的 OPSD 基线，按 LoopOPD
+  （arXiv 2610.10623，式 9）的归一化；此前是 `drgrpo`，那之前的全词表 OPD 结果是旧聚合方式。
+- **只在 verl 0.9.1 路径实现**，verl 0.6.1 下 dry-run 照常输出，真正启动时 launcher 拒绝。frozen 老师都是
+  `actor_rollout_ref.model.path` 的冻结 float32 副本，断点续训不重新加载（online 老师没有副本）：
   - `sampled`：actor worker 加载一份 CPU offload 的老师引擎（与 PLC 锚定项同一段代码），在 `compute_log_prob`
     时输出 `teacher_log_probs`，driver 放进 batch。dry-run 的 `reference_policy` 以 `opd teacher:` 开头。
   - `full`：每个 actor rank 持有一份不分片的老师（约 5.6 GB / 卡）。每个训练 micro-batch 先跑老师的逐轮前向
     （`return_loop_hidden_states`），再把它第 1、4 轮的隐状态和 lm_head 传进学生的前向（`return_opd_kd`），
     逐块计算 KL 并做 checkpoint。dry-run 的 `reference_policy` 以 `opd teacher (full vocabulary)` 开头。
   - 每步耗时不能和 GRPO / RLTT 直接比较。
-- 依赖模型前向的 `return_extrap_log_probs`（sampled）以及 `return_loop_hidden_states` / `return_opd_kd`（full），
+- 依赖模型前向的 `return_extrap_log_probs`（sampled）以及 `return_loop_hidden_states` / `return_opd_kd`（full；
+  online 老师另需 `opd_online_teacher`），
   **`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
 - 测试：`tests/test_opd.py`（老师公式、sampled 的期望梯度等于反向 KL 的梯度、全词表 KL 的数值与梯度、loss、
   配置、launcher、verl 0.9 objective）；`tests/test_rltt_baseline_modeling.py` 在真实小模型上测全词表 KL

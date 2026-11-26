@@ -38,6 +38,9 @@ reference- and last-loop hidden states (``opd_teacher_hidden_states``) and its
 of the student's last loop against the teacher log_softmax((1 + w) log P^(T) - w log P^(r))
 (``opd_omega`` = w) on the last ``opd_window`` predicting positions, with monitoring values
 (``rltt_per_loop.opd_full_kd``).
+``opd_online_teacher`` (ELPO) takes the teacher from the model's own loop ``opd_ref_loop`` and
+last loop of the same forward instead (stop-gradient: detached hidden states, lm_head under
+no_grad), so no teacher model is passed.
 
 Model-config keys read here (written by ``prepare_model``):
     rltt_logprob_chunk_size (int | None), rltt_logprob_checkpoint (bool),
@@ -110,6 +113,8 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
         opd_omega: float = 0.0,
         opd_divergence: str = "reverse",
         opd_window: Optional[int] = None,
+        opd_online_teacher: bool = False,
+        opd_ref_loop: int = 1,
         **kwargs,
     ):
         if not (return_per_loop_log_probs or return_per_loop_logits or return_exit_pdf
@@ -202,10 +207,26 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
 
         opd_kd = None
         if return_opd_kd:
-            if opd_teacher_hidden_states is None or opd_teacher_lm_head is None:
-                raise ValueError("return_opd_kd=True requires opd_teacher_hidden_states and "
-                                 "opd_teacher_lm_head")
-            teacher_ref, teacher_last = opd_teacher_hidden_states
+            if opd_online_teacher:
+                # ELPO: the teacher is this forward's own LoopCD distribution (loop r and the
+                # last loop); opd_full_kd detaches the hidden states and runs the teacher's
+                # lm_head under no_grad, so no gradient flows through the teacher
+                if opd_teacher_hidden_states is not None or opd_teacher_lm_head is not None:
+                    raise ValueError("opd_online_teacher=True takes the teacher from the model's "
+                                     "own loops; do not pass opd_teacher_hidden_states / "
+                                     "opd_teacher_lm_head")
+                if not 1 <= int(opd_ref_loop) < len(hidden_states_list):
+                    raise ValueError(f"opd_ref_loop {opd_ref_loop} must be in "
+                                     f"[1, {len(hidden_states_list) - 1}]")
+                teacher_ref = hidden_states_list[int(opd_ref_loop) - 1]
+                teacher_last = hidden_states_list[-1]
+                teacher_lm_head = self.lm_head
+            else:
+                if opd_teacher_hidden_states is None or opd_teacher_lm_head is None:
+                    raise ValueError("return_opd_kd=True requires opd_teacher_hidden_states and "
+                                     "opd_teacher_lm_head (or opd_online_teacher=True)")
+                teacher_ref, teacher_last = opd_teacher_hidden_states
+                teacher_lm_head = opd_teacher_lm_head
             student = hidden_states_list[-1]
             if opd_window is not None:
                 # position i predicts token i + 1: the last W tokens are predicted by
@@ -220,7 +241,7 @@ class OuroForCausalLM(_OfficialOuroForCausalLM):
                 teacher_ref,
                 teacher_last,
                 self.lm_head,
-                opd_teacher_lm_head,
+                teacher_lm_head,
                 omega=opd_omega,
                 divergence=opd_divergence,
                 temperature=log_prob_temperature,

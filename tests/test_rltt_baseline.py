@@ -378,6 +378,7 @@ def test_grpo_1p4b_config_matches_2p6b_except_model(env):
                                   "opd_loopcd_1p4b_8gpu.yaml",
                                   "opd_full_rkl_loopcd_1p4b_8gpu.yaml",
                                   "opd_full_fkl_loopcd_1p4b_8gpu.yaml",
+                                  "elpo_online_rkl_loopcd_1p4b_8gpu.yaml",
                                   "grpo_k2_loopcd_1p4b_8gpu.yaml"])
 def test_mini_batch_is_one_accumulated_update(env, name):
     # verl's mini-batch must hold exactly the prompts of the accumulated steps: one update each
@@ -406,6 +407,8 @@ MATCHED_GROUPS = {
              "opd": "opd_loopcd_1p4b_8gpu.yaml",  # sampled-token reverse KL
              "opd_full_rkl": "opd_full_rkl_loopcd_1p4b_8gpu.yaml",  # full-vocabulary reverse KL
              "opd_full_fkl": "opd_full_fkl_loopcd_1p4b_8gpu.yaml",  # full-vocabulary forward KL
+             # ELPO: full-vocabulary reverse KL towards the CURRENT model's LoopCD policy (sg)
+             "elpo_online": "elpo_online_rkl_loopcd_1p4b_8gpu.yaml",
              # GRPO + KDRL's k2 term towards the same teacher, beta = 0.01
              "grpo_k2": "grpo_k2_loopcd_1p4b_8gpu.yaml"},
     "2.6B": {"grpo": "grpo_baseline_8gpu.yaml", "rltt": "rltt_baseline.yaml"},  # no PLC config

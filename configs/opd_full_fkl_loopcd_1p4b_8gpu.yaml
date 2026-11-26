@@ -12,11 +12,13 @@
 #            = "distribution 4 + w (distribution 4 - distribution 1)" in log space, w = opd.omega,
 #            computed by a FROZEN copy of the initial model (never the current model)
 #   student  the trained model's last loop P^(4); vLLM samples the rollouts from it (on-policy)
-#   loss     drgrpo_j[ KL(pi_T || P^(4)) ]  over the full vocabulary at every response position j
+#   loss     mean_i mean_j[ KL(pi_T || P^(4)) ]  over the full vocabulary at every response position j
 # Only the position's own divergence is used (no reward-to-go). The verifiable reward is NOT in the
 # objective: rollouts are still scored (reasoning/* metrics), the loss ignores the GRPO advantages.
-# Aggregation: Dr. GRPO with M = 16384 (sum of token terms / (rows * 16384)): every token counts the
-# same, i.e. the sequence-level KL.
+# Aggregation (user, 2026-11-23): seq-mean-token-mean, each response's token mean, then the mean over
+# responses. This is LoopOPD's normalisation (arXiv 2610.10623, Eq. 9 and App.: token weight
+# 1 / (responses * response length)) and the aggregation of the GRPO and GRPO + k2 configs.
+# Before 2026-11-23 these two configs used drgrpo with M = 16384 (every token the same weight).
 #
 # What the worker adds (not visible here; verl 0.9.1 engine path only, a verl 0.6.1 launch stops
 # after the dry-run): every actor rank holds a frozen, unsharded float32 copy of the initial model
@@ -106,10 +108,9 @@ opd:
   divergence: forward           # KL(pi_T || P^(4)), mass-covering
 
 loss_agg:
-  # Dr. GRPO (sum of token terms / (rows * M)): every token weighs the same, the sequence-level
-  # reverse KL; M = max_completion_length as in the PLC configs
-  mode: drgrpo
-  norm_len: 16384
+  # per-response token mean, then mean over responses (LoopOPD's normalisation; same as the GRPO and
+  # GRPO + k2 configs)
+  mode: seq-mean-token-mean
 
 wandb:
   enabled: true
