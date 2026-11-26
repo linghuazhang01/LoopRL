@@ -57,9 +57,10 @@ class LoopRLActorRolloutRefWorker(ActorRolloutRefWorker):
             opd = self.looprl_settings.get("method") == "opd"
             opd_values = self.looprl_settings.get("opd", {})
             opd_full = opd and opd_values.get("estimator") == "full"
-            if opd_full and opd_values.get("teacher", "frozen") == "online":
-                # ELPO: the teacher is the student's own LoopCD distribution (stop-gradient) from
-                # its training forward; no frozen copy and no teacher engine
+            if opd and opd_values.get("teacher", "frozen") == "online":
+                # ELPO: the teacher is the current model's own LoopCD distribution (stop-gradient):
+                # full reads it in the training forward, sampled / k2 get teacher_log_probs from
+                # the actor's compute_log_prob pass (verl09_engine); no frozen copy, no engine
                 pass
             elif opd_full:
                 # Full-vocabulary OPD: the student's training forward needs the teacher's hidden

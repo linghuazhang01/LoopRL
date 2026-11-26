@@ -75,7 +75,7 @@ A config file has these top-level keys:
     the outcome advantages is off, the reward is not in the objective) and ``kd_coef`` (1: the
     weight beta of the divergence); the loss is ``rl_coef * GRPO + kd_coef * divergence``;
     ``teacher`` (``frozen``: the initial model; ``online``: ELPO, the current model's own LoopCD
-    distribution with a stop-gradient, ``full`` only, no teacher copy).
+    distribution with a stop-gradient, no teacher copy).
     When enabled the section is passed as ``actor_rollout_ref.actor.opd`` (and to the engine
     settings). The frozen teacher is a float32 copy of the initial model
     (``actor_rollout_ref.model.path``): a CPU-offloaded engine for ``sampled``, an unsharded copy
@@ -760,6 +760,10 @@ def reference_policy_status(trainer: str, overrides: dict) -> str:
         actor_values = (overrides.get("actor_rollout_ref") or {}).get("actor") or {}
         opd_values = actor_values.get("opd")
         opd_cfg = OPDSettings.from_mapping(opd_values) if opd_values else None
+        if opd_cfg is not None and opd_cfg.enabled and opd_cfg.actor_teacher_log_probs:
+            return ("opd teacher (online): no vendor reference worker and no teacher copy; the "
+                    "actor's compute_log_prob pass gives the current model's LoopCD log-probs on "
+                    "the sampled tokens (loop opd.ref_loop and the last loop, stop-gradient)")
         if opd_cfg is not None and opd_cfg.enabled and opd_cfg.online_teacher:
             return ("opd teacher (online, full vocabulary): no vendor reference worker and no "
                     "teacher copy; the teacher is the current model's own LoopCD distribution "

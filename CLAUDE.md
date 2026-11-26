@@ -42,6 +42,7 @@ launcher 会强制检查 `AGENTS.md` 的规则 1、2、4（训练文件 SHA256 �
 | 1.4B：OPD，全词表前向 KL | — | — | `opd_full_fkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：ELPO（实时外推老师：当前模型的 LoopCD 分布，stop-gradient，全词表反向 KL） | — | — | `elpo_online_rkl_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 | 1.4B：GRPO + k2（KDRL 形式，老师同 OPD，β = 0.01） | — | — | `grpo_k2_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
+| 1.4B：GRPO + k2，实时老师（当前模型的 LoopCD 分布，stop-gradient，β = 0.05） | — | — | `grpo_k2_online_loopcd_1p4b_8gpu.yaml`（方法段 `opd`） |
 
 组内**允许**不同的只有：
 
@@ -148,9 +149,13 @@ betas、weight decay、梯度裁剪、KL 系数、temperature、seed、vLLM 参�
     和 wandb 命名（`tests/test_opd.py` 检查），改一份要同步改另一份。
   - `opd.teacher`（用户 2026-11-26 要求，ELPO）：`frozen`（默认，上面的冻结 base 老师）或 `online`
     （**当前模型**的 LoopCD 分布，stop-gradient：log π_T = sg[log_softmax((1+w)·log P⁽⁴⁾_θ − w·log P⁽¹⁾_θ)]，
-    取自学生训练前向自己的第 1、4 轮隐状态，不加载老师副本、不多跑前向；每步一次更新，所以老师是每步
-    rollout 策略的外推分布）。`online` 只支持 `estimator: full`，`omega` 不能为 0。默认值下 loss 逐位不变
-    （dry-run 的 `opd` 段多一个 `teacher: frozen`）。`elpo_online_rkl_loopcd_1p4b_8gpu.yaml`（用户 2026-11-26
+    不加载老师副本；每步一次更新，所以老师是每步 rollout 策略的外推分布）。`full` 从学生训练前向自己的
+    第 1、4 轮隐状态算老师；`sampled` / `k2` 由 actor 自己的 `compute_log_prob`（rollout 参数下）多输出
+    `teacher_log_probs`，不多跑前向，dry-run 的 `reference_policy` 以 `opd teacher (online)` 开头。`omega`
+    不能为 0。默认值下 loss 逐位不变（dry-run 的 `opd` 段多一个 `teacher: frozen`）。
+    `grpo_k2_online_loopcd_1p4b_8gpu.yaml`（用户 2026-11-26 要求存）= `grpo_k2_loopcd_1p4b_8gpu.yaml` 改
+    `teacher: online`、`kd_coef: 0.05`（β 是用户指定的，与 grpo_k2 的 0.01 不同）、换 wandb 命名
+    （`tests/test_opd.py` 检查），改 grpo_k2 配置时要同步改它。`elpo_online_rkl_loopcd_1p4b_8gpu.yaml`（用户 2026-11-26
     要求存）= `opd_full_rkl_loopcd_1p4b_8gpu.yaml` 加 `teacher: online`、换 wandb 命名（`tests/test_opd.py`
     检查），改全词表反向 KL 配置时要同步改它。目标随学生移动、没有固定点（ELPD 草稿 fact d 预测外推方向
     持续放大），dry-run 的 `reference_policy` 以 `opd teacher (online, full vocabulary)` 开头。

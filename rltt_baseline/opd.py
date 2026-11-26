@@ -15,17 +15,18 @@ i.e. "distribution 4 + w (distribution 4 - distribution 1)" in log space, which 
 ``teacher: frozen`` the teacher is fixed for the whole run (it is never the current model), so
 distillation has a fixed point instead of re-extrapolating the student every step.
 
-``teacher: online`` (ELPO, user 2026-11-26; ``full`` estimator only) instead computes the same
-formula from the CURRENT model, with a stop-gradient:
+``teacher: online`` (ELPO, user 2026-11-26) instead computes the same formula from the CURRENT
+model, with a stop-gradient:
 
     log pi_T = sg[ log_softmax( ((1 + w) log P^(4)_theta - w log P^(r)_theta) / temperature ) ]
 
-taken from the loop-r and last-loop hidden states of the student's own training forward (no
-teacher copy, no extra forward). With one optimiser update per step the training forward runs at
-the rollout parameters, so the teacher is the rollout policy's LoopCD distribution, refreshed every
-step. The fixed point of distillation then moves with the student (the idealised argument of the
-ELPD draft predicts the contrast log P^(4) - log P^(r) to keep growing); this is the "refreshed
-teacher" ablation of the frozen teacher.
+No teacher copy is loaded. ``full`` reads it from the loop-r and last-loop hidden states of the
+student's own training forward; ``sampled`` / ``k2`` take its sampled-token log-probs from the
+actor's own ``compute_log_prob`` pass (``teacher_log_probs`` at the rollout parameters, no extra
+forward). With one optimiser update per step both are the rollout policy's LoopCD distribution,
+refreshed every step. The fixed point of distillation then moves with the student (the idealised
+argument of the ELPD draft predicts the contrast log P^(4) - log P^(r) to keep growing); this is
+the "refreshed teacher" ablation of the frozen teacher.
 
 Student and rollouts. The student is the trained model's last loop P^(4) (the loop evaluated with
 w_eval = 0); vLLM samples the rollouts from it, as in GRPO / RLTT / PLC (on-policy).
@@ -97,7 +98,7 @@ class OPDSettings:
     divergence: str = "reverse"  # reverse KL(P4 || pi_T) | forward KL(pi_T || P4) (full only)
     rl_coef: float = 0.0  # weight of GRPO on the outcome advantages (0: the reward is not used)
     kd_coef: float = 1.0  # beta: weight of the divergence term
-    teacher: str = "frozen"  # frozen initial model | online: the current model (sg, full only)
+    teacher: str = "frozen"  # frozen initial model | online: the current model (stop-gradient)
 
     @classmethod
     def from_mapping(cls, values: Optional[Mapping]) -> "OPDSettings":
@@ -150,9 +151,6 @@ class OPDSettings:
         if self.teacher not in TEACHERS:
             raise ValueError(f"opd.teacher must be one of {TEACHERS}, got {self.teacher!r}")
         if self.online_teacher:
-            if self.estimator != "full":
-                raise ValueError("opd.teacher=online is implemented for opd.estimator=full only "
-                                 "(the teacher comes from the student's own training forward)")
             if self.omega == 0:
                 raise ValueError("opd.teacher=online with opd.omega=0 makes the teacher the "
                                  "student itself: the loss and its gradient are zero")
@@ -168,14 +166,21 @@ class OPDSettings:
         return self.teacher == "online"
 
     @property
+    def actor_teacher_log_probs(self) -> bool:
+        """The actor's own ``compute_log_prob`` pass gives ``teacher_log_probs`` (online teacher
+        with a sampled-token estimator); no teacher engine is loaded."""
+        return self.online_teacher and self.sampled_teacher
+
+    @property
     def frozen_teacher_model(self) -> bool:
         """Every actor rank holds a frozen copy of the initial model (``full``, frozen teacher)."""
         return self.full_vocab and not self.online_teacher
 
     @property
     def sampled_teacher(self) -> bool:
-        """The teacher's sampled-token log-probs come from the frozen engine (``teacher_log_probs``
-        in the ``compute_log_prob`` pass): estimators ``sampled`` and ``k2``."""
+        """The loss needs the teacher's sampled-token log-probs (``teacher_log_probs`` from the
+        ``compute_log_prob`` pass: the frozen engine, or the actor itself with the online
+        teacher): estimators ``sampled`` and ``k2``."""
         return self.estimator in SAMPLED_TOKEN_ESTIMATORS
 
     @property

@@ -690,11 +690,28 @@ python -m rltt_baseline.launch --config configs/opd_full_rkl_loopcd_1p4b_8gpu.ya
   `opd teacher (online, full vocabulary)` 开头。
 - 目标随学生移动，没有固定点；ELPD 草稿（`paper_elpd`，fact d）的理想化论证预测 log P⁽⁴⁾ − log P⁽¹⁾
   会持续增大。重点看 `rltt/loop_4_entropy`、`opd/teacher_entropy`、`opd/reverse_kl`、`reasoning/accuracy`。
-- 只支持 `estimator: full`；`opd.omega=0` 时老师就是学生自己（loss 恒为 0），launcher 拒绝。
+- `opd.omega=0` 时老师就是学生自己（loss 恒为 0），launcher 拒绝。
 - 需要模型前向的 `opd_online_teacher`，**`LOOPRL_MODEL_DIR` 要用 `prepare_model` 重建**。
 
 ```bash
 python -m rltt_baseline.launch --config configs/elpo_online_rkl_loopcd_1p4b_8gpu.yaml --dry-run
+```
+
+#### GRPO + k2，实时老师（`configs/grpo_k2_online_loopcd_1p4b_8gpu.yaml`）
+
+用户 2026-11-26 要求。和 `grpo_k2_loopcd_1p4b_8gpu.yaml` 只差 `opd.teacher: online`、`opd.kd_coef: 0.05`
+（grpo_k2 是 0.01）和 wandb 命名（`tests/test_opd.py` 检查）：
+
+- loss = GRPO(结果 advantage) + 0.05 · mean_i mean_j[½R_ij²]，R_ij = log π_T(y_ij) − log P⁽⁴⁾_θ(y_ij)，
+  两项都是 `seq-mean-token-mean`。
+- 老师 log π_T = sg[log_softmax(1.5·log P⁽⁴⁾_old − 0.5·log P⁽¹⁾_old)]：rollout 参数下当前模型的 LoopCD
+  分布，由 actor 自己的 `compute_log_prob` 多输出 `teacher_log_probs`（`return_extrap_log_probs`），不加载
+  冻结老师。每步一次更新，θ_old 就是更新时的 θ。θ = θ_old 时 R_j = 0.5·(log P⁽⁴⁾ − log P⁽¹⁾)(y_j) − log Z。
+- 老师的 log-prob 来自 bf16 的 actor 前向（grpo_k2 的冻结老师是 float32）。dry-run 的 `reference_policy`
+  以 `opd teacher (online)` 开头。
+
+```bash
+python -m rltt_baseline.launch --config configs/grpo_k2_online_loopcd_1p4b_8gpu.yaml --dry-run
 ```
 
 ### LoopCD 跨轮对比解码评测（只用于评测）

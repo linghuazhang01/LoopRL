@@ -1,0 +1,193 @@
+# GRPO + k2 with the ONLINE teacher on Ouro-1.4B-Thinking: GRPO on the outcome reward plus KDRL's
+# sampled-token k2 term towards the CURRENT model's LoopCD policy (recomputed every step,
+# stop-gradient), w = 0.5, beta = 0.05. Saved at the user's request (2026-11-26: "like the GRPO + OPD
+# run, but with the teacher in real time", beta 0.05). It differs from grpo_k2_loopcd_1p4b_8gpu.yaml
+# only in opd.teacher (frozen -> online), opd.kd_coef (0.01 -> 0.05) and the wandb naming
+# (tests/test_opd.py checks this). The 1.4B comparison group: it differs from the other 1.4B configs
+# only in the method (trainer, opd, loss_agg sections, wandb naming; tests/test_rltt_baseline.py).
+# No 2.6B copy.
+#
+# Objective (rltt_baseline.opd, estimator k2, rl_coef 1, kd_coef beta, teacher online):
+#   teacher  log pi_T = sg[ log_softmax((1 + w) log P^(4)_old - w log P^(1)_old) ]   (temperature 1)
+#            = "distribution 4 + w (distribution 4 - distribution 1)" in log space of the model at the
+#            rollout parameters (the actor's own compute_log_prob pass, teacher_log_probs), not the
+#            frozen base. With one update per step theta_old = theta at the update, so the teacher is
+#            the current model's LoopCD policy, refreshed every step.
+#   student  the trained model's last loop P^(4); vLLM samples the rollouts from it (on-policy)
+#   loss     L = GRPO(A_outcome) + 0.05 * mean_i mean_j[ R_ij^2 / 2 ],
+#            R_ij = log pi_T(y_ij) - log P^(4)_theta(y_ij)
+# GRPO is the same element-wise PPO term as grpo_baseline_1p4b_8gpu.yaml on the driver's GRPO
+# advantages. The k2 gradient is -R_j grad log P^(4)(y_j) (through the student only): REINFORCE with
+# the per-token reward R_j, whose expectation is the gradient of the per-token reverse
+# KL(P^(4) || pi_T). At theta = theta_old, R_j = w (log P^(4)(y_j) - log P^(1)(y_j)) - log Z(s_j), so
+# the dense term rewards tokens loop 4 prefers over loop 1. No PPO ratio or clip on the k2 term.
+# Aggregation: GRPO's seq-mean-token-mean for both terms (opd.kd_coef=0 is the GRPO config's loss).
+# Constant beta.
+#
+# Difference from the frozen teacher: the target moves with the student (no fixed point); the ELPD
+# draft's idealised argument predicts the loop-4 / loop-1 contrast keeps growing. Watch
+# rltt/loop_4_entropy, opd/reverse_kl_k3 and reasoning/accuracy against grpo_k2 and GRPO.
+#
+# What the worker does (not visible here; verl 0.9.1 engine path only, a verl 0.6.1 launch stops after
+# the dry-run): no teacher copy and no teacher engine. The actor's compute_log_prob pass adds
+# return_extrap_log_probs (LoopCD-Logits, w, ref loop 1) and returns teacher_log_probs next to
+# old_log_probs, so the per-step cost is about that of GRPO + one extra full-vocabulary lm_head per
+# response token (loop 1). The teacher's log-probs come from the bf16 actor forward (the frozen
+# teacher of grpo_k2 is a float32 copy). dry-run reference_policy starts with "opd teacher (online)".
+#
+# LOOPRL_MODEL_DIR must be built with rltt_baseline.prepare_model (return_extrap_log_probs, the same
+# requirement as grpo_k2 / EP-GRPO / OPD); off by default, the other methods are unaffected.
+# Monitor: loss/pg (GRPO term) against loss/kd (beta * k2 term), opd/reverse_kl_k1, opd/reverse_kl_k3,
+# opd/teacher_prefers_frac, rltt/loop_4_entropy, rltt/loop_1_entropy, reasoning/accuracy.
+#
+# Data, lengths, optimisation, rollout, audit: identical to the other 1.4B configs (64 prompts x 8
+# rollouts, accumulation 1, 100 steps, lr 1e-6 constant + 10% warmup, betas (0.9, 0.99), weight
+# decay 0.1, grad clip 0.1, KL off, seed 42, temperature 1, top-p 1).
+# Launch: python -m rltt_baseline.launch --config <this file> [dot-list overrides]
+# Ablations by override (give each its own wandb.run_name):
+#   opd.kd_coef=0.01         the beta of grpo_k2_loopcd_1p4b_8gpu.yaml (only the teacher differs)
+#   opd.kd_coef=0            GRPO (code-path check)
+
+trainer: rltt
+
+args:  # keys = dest names of the vendor rltt_train.py argparse options
+  model_path: ${oc.env:LOOPRL_OURO_DIR}
+  use_rltt_model: true
+  rltt_model_path: ${oc.env:LOOPRL_MODEL_DIR}        # built by rltt_baseline.prepare_model (1.4B)
+  rltt_logprob_chunk_size: 2048
+  total_ut_steps: 4
+  no_lora: true
+  no_sft_checkpoint: true
+  no_gradient_checkpointing: false
+  ref_offload: true
+
+  train_file: ${oc.env:LOOPRL_TRAIN_FILE}
+  math500_test_file: ${oc.env:LOOPRL_MATH500_JSONL}
+  max_prompt_length: 2048
+  max_completion_length: 16384
+
+  # vendor loop weighting is replaced by the opd section below; this value only keeps the
+  # vendor's run name consistent with the PLC configs
+  loop_weighting: uniform
+  progressive_alpha: 1.0
+  beta: 0.0                     # KL off (verl_overrides: use_kl_loss false, kl_loss_coef 0)
+  num_generations: 8
+  num_prompts_per_batch: 64
+  temperature: 1.0
+
+  learning_rate: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: constant
+  gradient_accumulation_steps: 1  # one optimizer update per 64-prompt step
+  num_train_epochs: 5
+  max_steps: 100
+  seed: 42
+
+  ppo_max_token_len: 32768      # >= prompt + generation (18,432)
+  log_prob_max_token_len: 32768
+  dataloader_num_workers: 4
+  use_vllm: true
+  no_vllm: false
+  vllm_gpu_memory_utilization: 0.5
+  vllm_tensor_parallel_size: 1
+  vllm_enforce_eager: false
+
+  n_gpus: 8
+  nnodes: 1
+  output_dir: ${oc.env:LOOPRL_OUTPUT_DIR}
+  save_steps: 1
+  logging_steps: 1
+
+  no_validation: true
+  skip_initial_validation: true
+  eval_steps: 5
+  val_batch_size: 64
+  val_max_new_tokens: 16384
+
+opd:
+  enabled: true
+  omega: 0.5                    # w: pi_T = sg[(1 + w) log P^(4) - w log P^(1)] of the current model
+  ref_loop: 1                   # reference loop of the teacher (LoopCD: the first loop works best)
+  estimator: k2                 # KDRL: R^2 / 2 on the sampled tokens, R = log pi_T - log P^(4)
+  divergence: reverse           # KL(P^(4) || pi_T)
+  rl_coef: 1.0                  # GRPO on the outcome advantages
+  kd_coef: 0.05                 # beta (user, 2026-11-26; grpo_k2: 0.01, KDRL: 2e-3)
+  teacher: online               # the current model's LoopCD policy, stop-gradient (not the base)
+
+loss_agg:
+  # GRPO's aggregation for both terms (user 2026-11-23): each response averaged over its own tokens,
+  # then mean over all responses; opd.kd_coef=0 is then the GRPO config's loss
+  mode: seq-mean-token-mean
+
+wandb:
+  enabled: true
+  mode: online                  # required (AGENTS.md); WANDB_API_KEY comes from env.local
+  project: looprl-ouro            # one wandb project for every method and size
+  entity: null
+  run_name: grpo-k2-online-loopcd-w0.5-beta0.05-1p4b
+  tags: [grpo-k2, kdrl, opd, loopcd-teacher, online-teacher, omega-0.5, beta-0.05,
+         ouro-1.4b-thinking, deepmath-level6]
+  notes: null
+  dir: ${args.output_dir}
+
+verl_overrides:
+  data:
+    seed: ${args.seed}          # dataloader shuffle seed; verl default null ignores args.seed
+    train_batch_size: 64        # prompts per rollout batch -> 64 x 8 = 512 rollouts
+  actor_rollout_ref:
+    model:
+      override_config:
+        # HF actor forward = the last loop, the loop vLLM samples from. With the Ouro config's
+        # early_exit_threshold 1.0, the official forward takes per token the first loop whose
+        # cumulative exit probability reaches 1.0, an earlier loop when bf16 rounds it to 1.
+        # Read only by the official forward (GRPO log-probs, RLTT's old_log_probs); the
+        # per-loop RLTT / PLC forward and vLLM never use it.
+        early_exit_threshold: null
+    rollout:
+      max_num_batched_tokens: 32768  # vLLM tokens per scheduler step; verl default 8192 is
+                                     # below max_model_len 18,432, which verl refuses with
+                                     # chunked prefill on (both vendor scripts turn it on)
+      # sampling and engine settings written out (verl 0.6.1 defaults, same for every method)
+      top_p: 1.0                     # no nucleus truncation
+      top_k: -1                      # no top-k truncation
+      do_sample: true                # sample at args.temperature, not greedy
+      ignore_eos: false              # stop at EOS
+      max_num_seqs: 1024             # vLLM concurrent sequences cap
+      dtype: bfloat16                # vLLM weights / activations
+    actor:
+      ppo_mini_batch_size: 64   # = the 64 prompts of one step -> one update per step
+      use_kl_loss: false        # KL loss disabled in every config of the comparison groups
+      kl_loss_coef: 0.0
+      optim:
+        betas: [0.9, 0.99]
+      checkpoint:
+        save_contents: [model, optimizer, extra, hf_model]
+  trainer:
+    logger: [wandb, console]
+    max_actor_ckpt_to_keep: 2  # save every step; retain the two latest actor checkpoints
+
+rollout:
+  kv_layout: full
+
+env:
+  TOKENIZERS_PARALLELISM: "false"
+
+model:
+  num_hidden_layers: 24         # Ouro-1.4B-Thinking (2.6B: 48); checked against config.json
+
+audit:
+  # Per-loop token distributions on every response token (rltt_baseline.loop_audit), written to
+  # <output_dir>/audit/step_<step>/. On in every config of the comparison groups (shared key):
+  # read-only, no extra forward (hooks the compute_log_prob pass), so the loss is unchanged; it
+  # costs an lm_head call per loop on the response tokens and about 220 bytes per token on disk
+  # before compression.
+  loop_distribution:
+    enabled: true
+    every_n_steps: 1    # audited steps: 1, 1 + n, 1 + 2n, ...
+    top_k: 5
+    save_tokens: true   # false keeps summary.json and responses.jsonl, not the per-token arrays
+    chunk_tokens: 512   # response tokens per lm_head call; lower it if the audit runs out of memory
+    loop_weights: true  # also per-token exit_pdf (n, T) and, in PLC runs, the PLC loop weights
+                        # plc_weight (n, T); 16 bytes per token each

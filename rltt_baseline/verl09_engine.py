@@ -54,11 +54,18 @@ class OuroFSDPEngine(FSDPEngineWithLMHead):
         if extrap:
             from rltt_baseline.extrap import ExtrapSettings
             kwargs.update(ExtrapSettings.from_mapping(settings.get("extrap")).model_kwargs())
-        # OPD sampled: only the frozen teacher engine computes the base model's LoopCD log-probs
-        teacher = settings.get("method") == "opd" and getattr(self, "looprl_opd_teacher", False)
+        # OPD sampled / k2: the frozen teacher engine computes the base model's LoopCD log-probs;
+        # with opd.teacher=online the actor's own compute_log_prob pass (forward-only, at the
+        # rollout parameters) computes the current model's instead
+        frozen_teacher = (settings.get("method") == "opd"
+                          and getattr(self, "looprl_opd_teacher", False))
+        if frozen_teacher and not forward_only:
+            raise ValueError("the OPD teacher engine is forward-only")
+        teacher = frozen_teacher
+        if settings.get("method") == "opd" and forward_only and not frozen_teacher:
+            from rltt_baseline.opd import OPDSettings
+            teacher = OPDSettings.from_mapping(settings.get("opd")).actor_teacher_log_probs
         if teacher:
-            if not forward_only:
-                raise ValueError("the OPD teacher engine is forward-only")
             from rltt_baseline.opd import OPDSettings
             kwargs.update(OPDSettings.from_mapping(settings.get("opd")).teacher_model_kwargs())
         # OPD full: the student's training forward computes the full-vocabulary KL against the

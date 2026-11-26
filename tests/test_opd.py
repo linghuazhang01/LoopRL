@@ -824,10 +824,22 @@ def test_online_teacher_settings():
     assert "opd_online_teacher" not in frozen.student_model_kwargs()
 
 
+@pytest.mark.parametrize("estimator", ["sampled", "k2"])
+def test_online_teacher_sampled_estimators_use_the_actor_pass(estimator):
+    s = opd.OPDSettings.from_mapping({"enabled": True, "estimator": estimator,
+                                      "teacher": "online"})
+    assert s.actor_teacher_log_probs and s.sampled_teacher and not s.frozen_teacher_model
+    # the actor's compute_log_prob pass gets the frozen engine's LoopCD switches
+    assert s.teacher_model_kwargs()["return_extrap_log_probs"] is True
+    assert not opd.OPDSettings.from_mapping({"enabled": True,
+                                             "estimator": estimator}).actor_teacher_log_probs
+    assert not opd.OPDSettings.from_mapping({"enabled": True, "estimator": "full",
+                                             "teacher": "online"}).actor_teacher_log_probs
+
+
 @pytest.mark.parametrize("values, match", [
-    ({"estimator": "sampled", "teacher": "online"}, "estimator=full only"),
-    ({"estimator": "k2", "teacher": "online"}, "estimator=full only"),
     ({"estimator": "full", "teacher": "online", "omega": 0}, "omega=0"),
+    ({"estimator": "k2", "teacher": "online", "omega": 0, "rl_coef": 1.0}, "omega=0"),
     ({"estimator": "full", "teacher": "current"}, "opd.teacher must be one of"),
 ])
 def test_online_teacher_refusals(values, match):
@@ -887,4 +899,38 @@ def test_elpo_dry_run(env, capsys, monkeypatch):
                                   **COEF_DEFAULTS, "teacher": "online"}
     assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
     assert resolved["reference_policy"].startswith("opd teacher (online, full vocabulary)")
+    assert resolved["config"]["wandb"]["mode"] == "online"
+
+
+GRPO_K2_ONLINE_CONFIG = paths.config_file("grpo_k2_online_loopcd_1p4b_8gpu.yaml")
+
+
+def test_grpo_k2_online_config_is_grpo_k2_with_the_online_teacher(env):
+    # saved at the user's request (2026-11-26): grpo_k2 with the online teacher and beta 0.05
+    online = OmegaConf.to_container(rcfg.load_config(str(GRPO_K2_ONLINE_CONFIG)))
+    frozen = OmegaConf.to_container(rcfg.load_config(str(GRPO_K2_CONFIG)))
+    assert online["opd"].pop("teacher") == "online" and "teacher" not in frozen["opd"]
+    assert online["opd"].pop("kd_coef") == 0.05 and frozen["opd"].pop("kd_coef") == 0.01
+    assert online["wandb"].pop("run_name") == "grpo-k2-online-loopcd-w0.5-beta0.05-1p4b"
+    assert "online-teacher" in online["wandb"].pop("tags")
+    frozen["wandb"].pop("run_name")
+    frozen["wandb"].pop("tags")
+    assert online == frozen
+    cfg = rcfg.load_config(str(GRPO_K2_ONLINE_CONFIG))
+    assert rcfg.opd_settings(cfg) == opd.OPDSettings(
+        **{**GRPO_K2_SECTION, "kd_coef": 0.05, "teacher": "online"})
+    assert rcfg.loss_agg_settings(cfg).mode == "seq-mean-token-mean"
+
+
+def test_grpo_k2_online_dry_run(env, capsys, monkeypatch):
+    from rltt_baseline import launch
+
+    _clean_launch_env(monkeypatch)
+    assert launch.main(["--config", str(GRPO_K2_ONLINE_CONFIG), "--dry-run"]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    ar = resolved["verl_overrides"]["actor_rollout_ref"]
+    assert ar["actor"]["opd"] == {**GRPO_K2_SECTION, "kd_coef": 0.05, "teacher": "online"}
+    assert ar["loss_agg"] == {"mode": "seq-mean-token-mean", "norm_len": None}
+    assert "engine_kwargs" not in ar["rollout"]  # ordinary last-loop rollout
+    assert resolved["reference_policy"].startswith("opd teacher (online): ")
     assert resolved["config"]["wandb"]["mode"] == "online"

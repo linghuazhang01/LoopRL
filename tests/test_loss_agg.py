@@ -32,7 +32,7 @@ OPD_FULL_CONFIGS = ("opd_full_rkl_loopcd_1p4b_8gpu.yaml", "opd_full_fkl_loopcd_1
                     "elpo_online_rkl_loopcd_1p4b_8gpu.yaml")
 # GRPO + k2 (opd section with rl_coef 1): GRPO's aggregation for both terms, so opd.kd_coef=0 is
 # the GRPO config's loss
-GRPO_K2_CONFIGS = ("grpo_k2_loopcd_1p4b_8gpu.yaml",)
+GRPO_K2_CONFIGS = ("grpo_k2_loopcd_1p4b_8gpu.yaml", "grpo_k2_online_loopcd_1p4b_8gpu.yaml")
 DRGRPO = LossAggSettings(mode="drgrpo", norm_len=16384)
 SEQ = LossAggSettings(mode="seq-mean-token-mean")
 
